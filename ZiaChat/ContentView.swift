@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var store = CoreChannelsStore()
     @StateObject private var voiceStore = CoreVoiceRoomStore()
+    @StateObject private var pushService = PushNotificationService.shared
     @State private var showingSettings = false
     @State private var showingNewChannel = false
     @State private var navigationPath: [CoreChannel.ID] = []
@@ -48,13 +49,38 @@ struct ContentView: View {
             if !isUsable {
                 navigationPath.removeAll()
                 Task { await voiceStore.leave() }
+            } else {
+                Task {
+                    await pushService.requestAuthorizationAndRegister()
+                    await pushService.registerCurrentToken(configuration: store.configuration)
+                }
             }
+        }
+        .onChange(of: pushService.deviceToken) { _, token in
+            guard token != nil else { return }
+            Task { await pushService.registerCurrentToken(configuration: store.configuration) }
+        }
+        .onChange(of: pushService.pendingChannelId) { _, channelId in
+            openPushChannel(channelId)
+        }
+        .onChange(of: store.channels) { _, _ in
+            openPushChannel(pushService.pendingChannelId)
         }
         .task {
             if store.configuration.isUsable {
                 await store.refresh()
+                await pushService.requestAuthorizationAndRegister()
+                await pushService.registerCurrentToken(configuration: store.configuration)
+                openPushChannel(pushService.pendingChannelId)
             }
         }
+    }
+
+    private func openPushChannel(_ channelId: String?) {
+        guard let channelId, store.channel(with: channelId) != nil else { return }
+        store.selectedChannelId = channelId
+        navigationPath = [channelId]
+        pushService.pendingChannelId = nil
     }
 }
 

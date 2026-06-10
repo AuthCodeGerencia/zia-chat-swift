@@ -1,0 +1,4 @@
+project_id = "zia-chat"
+
+[functions.zia-chat-apns]
+verify_jwt = false

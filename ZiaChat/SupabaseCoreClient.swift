@@ -196,6 +196,26 @@ final class SupabaseCoreClient {
             .execute()
     }
 
+    func registerPushToken(token: String, deviceName: String) async throws {
+        guard let empresaId = configuration.empresaId else {
+            throw SupabaseCoreError.notConfigured
+        }
+
+        let row = PushTokenUpsert(
+            empresaId: empresaId,
+            userId: configuration.userId,
+            platform: "zia_chat_apns",
+            token: token,
+            deviceName: deviceName,
+            lastSeenAt: Date()
+        )
+
+        try await client
+            .from("core_push_tokens")
+            .upsert(row, onConflict: "token")
+            .execute()
+    }
+
     private func ensureMembership(conversationId: String, channelId: String?) async throws {
         let conversationMember = ConversationMemberUpsert(
             conversationId: conversationId,
@@ -449,6 +469,24 @@ private struct MessageReadUpsert: Encodable {
         case userId = "user_id"
         case lastReadMessageId = "last_read_message_id"
         case lastReadAt = "last_read_at"
+    }
+}
+
+private struct PushTokenUpsert: Encodable {
+    var empresaId: Int
+    var userId: String
+    var platform: String
+    var token: String
+    var deviceName: String
+    var lastSeenAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case empresaId = "empresa_id"
+        case userId = "user_id"
+        case platform
+        case token
+        case deviceName = "device_name"
+        case lastSeenAt = "last_seen_at"
     }
 }
 

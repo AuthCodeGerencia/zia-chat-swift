@@ -9,6 +9,8 @@ import SwiftUI
 
 @main
 struct ZiaChatApp: App {
+    @UIApplicationDelegateAdaptor(ZiaChatAppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup {
             ContentView()
