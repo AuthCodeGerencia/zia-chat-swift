@@ -167,6 +167,11 @@ Deno.serve(async (request) => {
     return Response.json({ sent: results.length - invalidTokens.length });
   } catch (error) {
     console.error("[zia-chat-apns]", error);
-    return Response.json({ error: error instanceof Error ? error.message : "Unknown error" }, { status: 500 });
+    const message = error instanceof Error
+      ? error.message
+      : typeof error === "object" && error && "message" in error
+        ? String(error.message)
+        : String(error);
+    return Response.json({ error: message }, { status: 500 });
   }
 });

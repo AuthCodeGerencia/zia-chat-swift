@@ -49,4 +49,4 @@ select vault.create_secret(
 select vault.create_secret('SAME_RANDOM_SECRET', 'zia_chat_push_webhook_secret');
 ```
 
-6. Apply `supabase/migrations/20260610090000_zia_chat_apns.sql`.
+6. Apply the migrations in `supabase/migrations`.

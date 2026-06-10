@@ -279,6 +279,39 @@ extension Array where Element == CoreReaction {
     }
 }
 
+struct CoreChannelSearchHit: Identifiable, Hashable {
+    var channel: CoreChannel
+    var incidenceCount: Int
+    var previewSnippet: String?
+
+    var id: String { channel.id }
+
+    static func snippet(from content: String, keyword: String, maxLength: Int = 96) -> String {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
+        let loweredContent = trimmed.lowercased()
+        let loweredKeyword = keyword.lowercased()
+        guard let range = loweredContent.range(of: loweredKeyword) else {
+            return trimmed.count <= maxLength ? trimmed : String(trimmed.prefix(maxLength - 1)) + "…"
+        }
+
+        let matchStart = trimmed.distance(from: trimmed.startIndex, to: range.lowerBound)
+        let contextStart = max(0, matchStart - 24)
+        let startIndex = trimmed.index(trimmed.startIndex, offsetBy: contextStart)
+        let endIndex = trimmed.index(
+            startIndex,
+            offsetBy: min(maxLength, trimmed.distance(from: startIndex, to: trimmed.endIndex)),
+            limitedBy: trimmed.endIndex
+        ) ?? trimmed.endIndex
+
+        var snippet = String(trimmed[startIndex..<endIndex])
+        if contextStart > 0 { snippet = "…" + snippet }
+        if endIndex < trimmed.endIndex { snippet += "…" }
+        return snippet
+    }
+}
+
 enum CoreFormat {
     static func badgeCount(_ value: Int) -> String {
         value > 99 ? "99+" : String(value)

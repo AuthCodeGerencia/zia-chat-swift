@@ -92,6 +92,28 @@ final class SupabaseCoreClient {
         )
     }
 
+    func searchChannelMessages(keyword: String, channelIds: [String]) async throws -> [CoreMessage] {
+        let trimmed = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !channelIds.isEmpty, let empresaId = configuration.empresaId else {
+            return []
+        }
+
+        let pattern = "%\(Self.escapeIlike(trimmed))%"
+        let loaded: [CoreMessage] = try await client
+            .from("core_messages")
+            .select("id,empresa_id,conversation_id,channel_id,content,created_at")
+            .eq("empresa_id", value: empresaId)
+            .in("channel_id", values: channelIds)
+            .is("deleted_at", value: nil)
+            .ilike("content", pattern: pattern)
+            .order("created_at", ascending: false)
+            .limit(150)
+            .execute()
+            .value
+
+        return loaded
+    }
+
     func listMessages(conversationId: String) async throws -> [CoreMessage] {
         let displayOrder = try await listMessagePage(conversationId: conversationId)
         return try await enrichMessages(displayOrder)
@@ -344,6 +366,13 @@ final class SupabaseCoreClient {
             .replacingOccurrences(of: "users/", with: "")
         copy.avatarURLString = "\(base)/storage/v1/object/public/avatars/users/\(clean)"
         return copy
+    }
+
+    nonisolated private static func escapeIlike(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
     }
 
     nonisolated private static func decodeDate(_ decoder: Decoder) throws -> Date {

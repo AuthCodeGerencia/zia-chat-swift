@@ -154,6 +154,11 @@ private struct ChannelListView: View {
     @Binding var showingSettings: Bool
     @Binding var showingNewChannel: Bool
     @Binding var navigationPath: [CoreChannel.ID]
+    @State private var searchText = ""
+
+    private var isSearching: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     var body: some View {
         List {
@@ -164,32 +169,10 @@ private struct ChannelListView: View {
                 .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
             }
 
-            Section {
-                ForEach(store.favoriteChannels) { channel in
-                    ChannelNavigationRow(store: store, channel: channel, navigationPath: $navigationPath)
-                }
-            } header: {
-                if !store.favoriteChannels.isEmpty {
-                    Label("Favorites", systemImage: "star.fill")
-                }
-            }
-
-            Section {
-                ForEach(store.textChannels) { channel in
-                    ChannelNavigationRow(store: store, channel: channel, navigationPath: $navigationPath)
-                }
-            } header: {
-                Label("Channels", systemImage: "number")
-            }
-
-            if !store.voiceChannels.isEmpty {
-                Section {
-                    ForEach(store.voiceChannels) { channel in
-                        ChannelNavigationRow(store: store, channel: channel, navigationPath: $navigationPath)
-                    }
-                } header: {
-                    Label("Voice", systemImage: "speaker.wave.2.fill")
-                }
+            if isSearching {
+                channelSearchContent
+            } else {
+                defaultChannelContent
             }
         }
         .overlay {
@@ -205,6 +188,14 @@ private struct ChannelListView: View {
         }
         .refreshable {
             await store.refresh()
+        }
+        .searchable(
+            text: $searchText,
+            placement: .navigationBarDrawer(displayMode: .always),
+            prompt: "Buscar palabras clave en canales"
+        )
+        .onChange(of: searchText) { _, newValue in
+            store.updateChannelSearch(newValue)
         }
         .navigationTitle("ZiaChat")
         .toolbar {
@@ -251,6 +242,131 @@ private struct ChannelListView: View {
                 SyncStatusBar(store: store)
             }
         }
+    }
+
+    @ViewBuilder
+    private var defaultChannelContent: some View {
+        Section {
+            ForEach(store.favoriteChannels) { channel in
+                ChannelNavigationRow(store: store, channel: channel, navigationPath: $navigationPath)
+            }
+        } header: {
+            if !store.favoriteChannels.isEmpty {
+                Label("Favorites", systemImage: "star.fill")
+            }
+        }
+
+        Section {
+            ForEach(store.textChannels) { channel in
+                ChannelNavigationRow(store: store, channel: channel, navigationPath: $navigationPath)
+            }
+        } header: {
+            Label("Channels", systemImage: "number")
+        }
+
+        if !store.voiceChannels.isEmpty {
+            Section {
+                ForEach(store.voiceChannels) { channel in
+                    ChannelNavigationRow(store: store, channel: channel, navigationPath: $navigationPath)
+                }
+            } header: {
+                Label("Voice", systemImage: "speaker.wave.2.fill")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var channelSearchContent: some View {
+        if store.isSearchingChannels {
+            Section {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text("Buscando incidencias…")
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } else if store.channelSearchResults.isEmpty {
+            Section {
+                ContentUnavailableView(
+                    "Sin resultados",
+                    systemImage: "magnifyingglass",
+                    description: Text("No hay incidencias de \"\(searchText)\" en tus canales.")
+                )
+                .listRowInsets(EdgeInsets())
+                .listRowBackground(Color.clear)
+            }
+        } else {
+            Section {
+                ForEach(store.channelSearchResults) { hit in
+                    ChannelSearchResultRow(hit: hit) {
+                        store.selectedChannelId = hit.channel.id
+                        navigationPath = [hit.channel.id]
+                        searchText = ""
+                        store.clearChannelSearch()
+                    }
+                }
+            } header: {
+                Label("\(store.channelSearchResults.count) canales con incidencias", systemImage: "text.magnifyingglass")
+            }
+        }
+    }
+}
+
+private struct ChannelSearchResultRow: View {
+    let hit: CoreChannelSearchHit
+    let onOpen: () -> Void
+
+    private var incidenceLabel: String {
+        hit.incidenceCount == 1 ? "1 incidencia" : "\(hit.incidenceCount) incidencias"
+    }
+
+    var body: some View {
+        Button(action: onOpen) {
+            HStack(spacing: 12) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(hit.channel.tint.gradient)
+                    Image(systemName: hit.channel.symbolName)
+                        .foregroundStyle(.white)
+                        .font(.headline)
+                }
+                .frame(width: 42, height: 42)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text(hit.channel.displayName)
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+
+                        if hit.channel.visibility == .private {
+                            Image(systemName: "lock.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if let preview = hit.previewSnippet, !preview.isEmpty {
+                        Text(preview)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+
+                Spacer(minLength: 8)
+
+                Text(incidenceLabel)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Color.accentColor)
+                    .clipShape(Capsule())
+            }
+            .padding(.vertical, 4)
+        }
+        .buttonStyle(.plain)
     }
 }
 

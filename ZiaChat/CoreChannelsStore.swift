@@ -13,9 +13,13 @@ final class CoreChannelsStore: ObservableObject {
     @Published var isCreatingChannel = false
     @Published var isLoggingIn = false
     @Published var isLoadingMessages: [String: Bool] = [:]
+    @Published var channelSearchQuery = ""
+    @Published var channelSearchResults: [CoreChannelSearchHit] = []
+    @Published var isSearchingChannels = false
     @Published var lastError: String?
 
     private var realtimeService: CoreRealtimeService?
+    private var channelSearchTask: Task<Void, Never>?
     private var realtimeConversationId: String?
     private var reactionRefreshTask: Task<Void, Never>?
     private let optimisticMessagePrefix = "local-pending-"
@@ -90,6 +94,34 @@ final class CoreChannelsStore: ObservableObject {
         } else {
             favoriteChannelIds.insert(channelId)
         }
+    }
+
+    func updateChannelSearch(_ query: String) {
+        channelSearchQuery = query
+        channelSearchTask?.cancel()
+
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            channelSearchResults = []
+            isSearchingChannels = false
+            return
+        }
+
+        channelSearchTask = Task {
+            isSearchingChannels = true
+            try? await Task.sleep(for: .milliseconds(280))
+            guard !Task.isCancelled else { return }
+            await performChannelSearch(trimmed)
+            guard !Task.isCancelled else { return }
+            isSearchingChannels = false
+        }
+    }
+
+    func clearChannelSearch() {
+        channelSearchTask?.cancel()
+        channelSearchQuery = ""
+        channelSearchResults = []
+        isSearchingChannels = false
     }
 
     func refresh() async {
@@ -224,6 +256,86 @@ final class CoreChannelsStore: ObservableObject {
             }
         } catch {
             lastError = error.localizedDescription
+        }
+    }
+
+    private func performChannelSearch(_ keyword: String) async {
+        let loweredKeyword = keyword.lowercased()
+        let searchableChannels = channels.filter { !$0.isVoice }
+
+        var metadataMatches = Set<CoreChannel.ID>()
+        for channel in searchableChannels {
+            let haystack = [
+                channel.displayName,
+                channel.slug,
+                channel.description ?? ""
+            ]
+            .joined(separator: " ")
+            .lowercased()
+
+            if haystack.contains(loweredKeyword) {
+                metadataMatches.insert(channel.id)
+            }
+        }
+
+        var messageMatches: [CoreMessage] = []
+        if configuration.isUsable {
+            let channelIds = searchableChannels.map(\.id)
+            if let client = try? SupabaseCoreClient(configuration: configuration),
+               let matches = try? await client.searchChannelMessages(keyword: keyword, channelIds: channelIds) {
+                messageMatches = matches
+            }
+        } else {
+            messageMatches = searchableChannels.flatMap { channel in
+                guard let conversationId = channel.conversationId else { return [CoreMessage]() }
+                return (messages[conversationId] ?? []).filter {
+                    $0.content.lowercased().contains(loweredKeyword)
+                }
+            }
+        }
+
+        var groupedMessages: [CoreChannel.ID: [CoreMessage]] = [:]
+        for message in messageMatches {
+            if let channelId = message.channelId {
+                groupedMessages[channelId, default: []].append(message)
+            } else if let channel = searchableChannels.first(where: { $0.conversationId == message.conversationId }) {
+                groupedMessages[channel.id, default: []].append(message)
+            }
+        }
+
+        var hits: [CoreChannelSearchHit] = []
+        let candidateIds = metadataMatches.union(groupedMessages.keys)
+        for channelId in candidateIds {
+            guard let channel = channel(with: channelId) else { continue }
+            let channelMessages = groupedMessages[channelId] ?? []
+            let messageCount = channelMessages.count
+            let metadataMatch = metadataMatches.contains(channelId)
+            let incidenceCount = messageCount > 0 ? messageCount : (metadataMatch ? 1 : 0)
+            guard incidenceCount > 0 else { continue }
+
+            let previewSnippet: String?
+            if let latestMessage = channelMessages.max(by: { $0.createdAt < $1.createdAt }) {
+                previewSnippet = CoreChannelSearchHit.snippet(from: latestMessage.content, keyword: keyword)
+            } else if metadataMatch {
+                previewSnippet = channel.description?.isEmpty == false ? channel.description : channel.displayName
+            } else {
+                previewSnippet = nil
+            }
+
+            hits.append(
+                CoreChannelSearchHit(
+                    channel: channel,
+                    incidenceCount: incidenceCount,
+                    previewSnippet: previewSnippet
+                )
+            )
+        }
+
+        channelSearchResults = hits.sorted {
+            if $0.incidenceCount != $1.incidenceCount {
+                return $0.incidenceCount > $1.incidenceCount
+            }
+            return $0.channel.displayName.localizedCaseInsensitiveCompare($1.channel.displayName) == .orderedAscending
         }
     }
 
