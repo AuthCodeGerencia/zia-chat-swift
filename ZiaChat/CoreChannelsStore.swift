@@ -22,10 +22,17 @@ final class CoreChannelsStore: ObservableObject {
     private var channelSearchTask: Task<Void, Never>?
     private var realtimeConversationId: String?
     private var reactionRefreshTask: Task<Void, Never>?
+    private var refreshTask: Task<Void, Never>?
+    private var sessionRefreshTask: Task<CoreAppConfiguration, Error>?
     private let optimisticMessagePrefix = "local-pending-"
 
     init(configuration: CoreAppConfiguration) {
         self.configuration = configuration
+        if configuration.isUsable,
+           let cachedChannels = CoreChannelCache.load(userId: configuration.userId),
+           !cachedChannels.isEmpty {
+            self.channels = cachedChannels
+        }
         self.selectedChannelId = channels.first?.id
     }
 
@@ -79,6 +86,10 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     func signOut() {
+        refreshTask?.cancel()
+        refreshTask = nil
+        sessionRefreshTask?.cancel()
+        sessionRefreshTask = nil
         stopRealtime()
         var next = configuration
         next.clearSession()
@@ -86,6 +97,56 @@ final class CoreChannelsStore: ObservableObject {
         channels = CorePreviewData.channels
         messages = CorePreviewData.messages
         selectedChannelId = channels.first?.id
+    }
+
+    @discardableResult
+    func ensureFreshSession(force: Bool = false) async throws -> CoreAppConfiguration {
+        guard configuration.isUsable else {
+            throw CoreAuthError.missingRefreshToken
+        }
+        guard force || configuration.accessTokenExpires() else {
+            return configuration
+        }
+        if let sessionRefreshTask {
+            return try await sessionRefreshTask.value
+        }
+
+        let originalConfiguration = configuration
+        let task = Task {
+            let service = try CoreAuthService(configuration: originalConfiguration)
+            return try await service.refreshSession()
+        }
+        sessionRefreshTask = task
+
+        do {
+            let refreshedConfiguration = try await task.value
+            sessionRefreshTask = nil
+            guard configuration.userId == originalConfiguration.userId else {
+                return configuration
+            }
+
+            let activeChannel = realtimeConversationId == nil ? nil : selectedChannel
+            save(configuration: refreshedConfiguration)
+            if let activeChannel {
+                stopRealtime()
+                startRealtime(for: activeChannel)
+            }
+            return refreshedConfiguration
+        } catch {
+            sessionRefreshTask = nil
+            throw error
+        }
+    }
+
+    func maintainSession() async {
+        while !Task.isCancelled, configuration.isUsable {
+            do {
+                _ = try await ensureFreshSession()
+            } catch {
+                lastError = error.localizedDescription
+            }
+            try? await Task.sleep(for: .seconds(120))
+        }
     }
 
     func toggleFavorite(_ channelId: CoreChannel.ID) {
@@ -133,22 +194,63 @@ final class CoreChannelsStore: ObservableObject {
             return
         }
 
-        isLoading = true
-        lastError = nil
-        do {
-            let client = try SupabaseCoreClient(configuration: configuration)
-            channels = try await client.listChannels()
-            selectedChannelId = selectedChannelId.flatMap(channel(with:))?.id ?? channels.first?.id
-        } catch {
-            lastError = error.localizedDescription
+        if let refreshTask {
+            await refreshTask.value
+            return
         }
-        isLoading = false
+
+        let task = Task { @MainActor in
+            isLoading = true
+            lastError = nil
+            defer {
+                isLoading = false
+                refreshTask = nil
+            }
+
+            do {
+                let activeConfiguration = try await ensureFreshSession()
+                let client = try SupabaseCoreClient(configuration: activeConfiguration)
+                let fastChannels: [CoreChannel]
+                do {
+                    fastChannels = try await client.listChannelsFast()
+                } catch {
+                    fastChannels = try await client.listChannels()
+                }
+                applyChannels(fastChannels)
+
+                Task { @MainActor [weak self] in
+                    guard let self, self.configuration.isUsable else { return }
+                    do {
+                        let enrichedChannels = try await client.listChannels()
+                        self.applyChannels(enrichedChannels)
+                    } catch {
+                        // Fast channel data is already visible; stale counters are preferable to blocking the list.
+                    }
+                }
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+        refreshTask = task
+        await task.value
+    }
+
+    private func applyChannels(_ loadedChannels: [CoreChannel]) {
+        channels = loadedChannels
+        selectedChannelId = selectedChannelId.flatMap(channel(with:))?.id ?? channels.first?.id
+        CoreChannelCache.save(loadedChannels, userId: configuration.userId)
     }
 
     func open(_ channel: CoreChannel, force: Bool = false) async {
         guard let conversationId = channel.conversationId else { return }
         selectedChannelId = channel.id
         guard configuration.isUsable else { return }
+        do {
+            _ = try await ensureFreshSession()
+        } catch {
+            lastError = error.localizedDescription
+            return
+        }
         startRealtime(for: channel)
         if !force, messages[conversationId]?.isEmpty == false {
             Task {
@@ -203,7 +305,8 @@ final class CoreChannelsStore: ObservableObject {
         isSending = true
         lastError = nil
         do {
-            let client = try SupabaseCoreClient(configuration: configuration)
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
             var message = try await client.sendMessage(
                 empresaId: channel.empresaId,
                 conversationId: conversationId,
@@ -229,7 +332,8 @@ final class CoreChannelsStore: ObservableObject {
         isCreatingChannel = true
         lastError = nil
         do {
-            let client = try SupabaseCoreClient(configuration: configuration)
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
             let channel = try await client.createChannel(name: name, description: description, visibility: visibility)
             channels.append(channel)
             channels.sort { $0.slug < $1.slug }
@@ -244,7 +348,8 @@ final class CoreChannelsStore: ObservableObject {
         guard configuration.isUsable else { return }
         lastError = nil
         do {
-            let client = try SupabaseCoreClient(configuration: configuration)
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
             try await client.react(
                 empresaId: message.empresaId,
                 conversationId: message.conversationId,
@@ -281,7 +386,9 @@ final class CoreChannelsStore: ObservableObject {
         var messageMatches: [CoreMessage] = []
         if configuration.isUsable {
             let channelIds = searchableChannels.map(\.id)
-            if let client = try? SupabaseCoreClient(configuration: configuration),
+            let activeConfiguration = try? await ensureFreshSession()
+            if let activeConfiguration,
+               let client = try? SupabaseCoreClient(configuration: activeConfiguration),
                let matches = try? await client.searchChannelMessages(keyword: keyword, channelIds: channelIds) {
                 messageMatches = matches
             }
@@ -537,6 +644,23 @@ final class CoreChannelsStore: ObservableObject {
     private func clearUnreadForActiveConversation(_ conversationId: String) {
         guard let channel = channels.first(where: { $0.conversationId == conversationId }) else { return }
         clearUnread(for: channel.id)
+    }
+}
+
+private enum CoreChannelCache {
+    private static let keyPrefix = "zia-chat.channels."
+
+    static func load(userId: String) -> [CoreChannel]? {
+        guard !userId.isEmpty,
+              let data = UserDefaults.standard.data(forKey: keyPrefix + userId) else {
+            return nil
+        }
+        return try? JSONDecoder().decode([CoreChannel].self, from: data)
+    }
+
+    static func save(_ channels: [CoreChannel], userId: String) {
+        guard !userId.isEmpty, let data = try? JSONEncoder().encode(channels) else { return }
+        UserDefaults.standard.set(data, forKey: keyPrefix + userId)
     }
 }
 

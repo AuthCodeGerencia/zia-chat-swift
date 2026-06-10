@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var store = CoreChannelsStore()
     @StateObject private var voiceStore = CoreVoiceRoomStore()
     @StateObject private var pushService = PushNotificationService.shared
@@ -23,9 +24,9 @@ struct ContentView: View {
                         if let channel = store.channel(with: channelId) {
                             if channel.isVoice {
                                 VoiceChannelView(
+                                    store: store,
                                     voiceStore: voiceStore,
-                                    channel: channel,
-                                    configuration: store.configuration
+                                    channel: channel
                                 )
                             } else {
                                 ChatDetailView(store: store, channel: channel)
@@ -66,8 +67,22 @@ struct ContentView: View {
         .onChange(of: store.channels) { _, _ in
             openPushChannel(pushService.pendingChannelId)
         }
+        .onChange(of: store.configuration.accessToken) { _, _ in
+            Task { await pushService.registerCurrentToken(configuration: store.configuration) }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active, store.configuration.isUsable else { return }
+            Task {
+                _ = try? await store.ensureFreshSession()
+            }
+        }
+        .task(id: store.configuration.userId) {
+            guard store.configuration.isUsable else { return }
+            await store.maintainSession()
+        }
         .task {
             if store.configuration.isUsable {
+                _ = try? await store.ensureFreshSession()
                 await store.refresh()
                 await pushService.requestAuthorizationAndRegister()
                 await pushService.registerCurrentToken(configuration: store.configuration)
@@ -609,9 +624,9 @@ private struct ChannelHeader: View {
 }
 
 private struct VoiceChannelView: View {
+    @ObservedObject var store: CoreChannelsStore
     @ObservedObject var voiceStore: CoreVoiceRoomStore
     let channel: CoreChannel
-    let configuration: CoreAppConfiguration
 
     var body: some View {
         VStack(spacing: 0) {
@@ -639,9 +654,7 @@ private struct VoiceChannelView: View {
                         Text(voiceStore.lastError ?? "Join this channel to start talking.")
                     } actions: {
                         Button("Try Again") {
-                            Task {
-                                await voiceStore.join(channel: channel, configuration: configuration)
-                            }
+                            Task { await joinVoiceChannel() }
                         }
                         .buttonStyle(.borderedProminent)
                     }
@@ -655,7 +668,16 @@ private struct VoiceChannelView: View {
         .navigationTitle(channel.displayName)
         .navigationBarTitleDisplayMode(.inline)
         .task(id: channel.id) {
+            await joinVoiceChannel()
+        }
+    }
+
+    private func joinVoiceChannel() async {
+        do {
+            let configuration = try await store.ensureFreshSession()
             await voiceStore.join(channel: channel, configuration: configuration)
+        } catch {
+            store.lastError = error.localizedDescription
         }
     }
 

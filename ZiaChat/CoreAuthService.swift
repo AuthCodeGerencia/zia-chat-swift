@@ -5,6 +5,7 @@ enum CoreAuthError: LocalizedError {
     case missingSupabaseEnvironment
     case invalidSupabaseURL
     case missingProfile
+    case missingRefreshToken
 
     var errorDescription: String? {
         switch self {
@@ -14,6 +15,8 @@ enum CoreAuthError: LocalizedError {
             return "Invalid Supabase project URL."
         case .missingProfile:
             return "This user does not have an Azank profile."
+        case .missingRefreshToken:
+            return "The saved session cannot be refreshed. Please sign in again."
         }
     }
 }
@@ -90,6 +93,19 @@ final class CoreAuthService {
         next.empresaId = profile.empresaId
         next.displayName = profile.fullName ?? session.user.email ?? ""
         return CoreLoginResult(configuration: next, profile: profile)
+    }
+
+    func refreshSession() async throws -> CoreAppConfiguration {
+        let refreshToken = configuration.refreshToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !refreshToken.isEmpty else {
+            throw CoreAuthError.missingRefreshToken
+        }
+
+        let session = try await client.auth.refreshSession(refreshToken: refreshToken)
+        var next = configuration
+        next.accessToken = session.accessToken
+        next.refreshToken = session.refreshToken
+        return next
     }
 
     nonisolated private static func decodeDate(_ decoder: Decoder) throws -> Date {

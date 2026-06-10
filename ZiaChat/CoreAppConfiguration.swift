@@ -48,12 +48,34 @@ struct CoreAppConfiguration: Codable, Equatable {
         set { empresaId = Int(newValue.trimmingCharacters(in: .whitespacesAndNewlines)) }
     }
 
+    func accessTokenExpires(within interval: TimeInterval = 300) -> Bool {
+        guard let expirationDate = accessTokenExpirationDate else { return true }
+        return expirationDate.timeIntervalSinceNow <= interval
+    }
+
     mutating func clearSession() {
         accessToken = ""
         refreshToken = ""
         userId = ""
         empresaId = nil
         displayName = ""
+    }
+
+    private var accessTokenExpirationDate: Date? {
+        let parts = accessToken.split(separator: ".")
+        guard parts.count > 1 else { return nil }
+
+        var payload = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        payload.append(String(repeating: "=", count: (4 - payload.count % 4) % 4))
+
+        guard let data = Data(base64Encoded: payload),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let expiration = object["exp"] as? NSNumber else {
+            return nil
+        }
+        return Date(timeIntervalSince1970: expiration.doubleValue)
     }
 }
 

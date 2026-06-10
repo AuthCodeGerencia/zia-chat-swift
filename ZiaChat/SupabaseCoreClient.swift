@@ -67,6 +67,16 @@ final class SupabaseCoreClient {
         return channels.filter { $0.empresaId == empresaId }
     }
 
+    func listChannelsFast() async throws -> [CoreChannel] {
+        let channels: [CoreChannel] = try await client
+            .rpc("core_list_zia_channels")
+            .execute()
+            .value
+
+        guard let empresaId = configuration.empresaId else { return channels }
+        return channels.filter { $0.empresaId == empresaId }
+    }
+
     func createChannel(name: String, description: String, visibility: CoreChannelVisibility) async throws -> CoreChannel {
         let rows: [CoreChannelCreateResponse] = try await client
             .rpc(
