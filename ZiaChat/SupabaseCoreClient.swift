@@ -130,16 +130,30 @@ final class SupabaseCoreClient {
     }
 
     func listMessagePage(conversationId: String) async throws -> [CoreMessage] {
-        let loaded: [CoreMessage] = try await client
-            .from("core_messages")
-            .select()
-            .eq("conversation_id", value: conversationId)
-            .is("deleted_at", value: nil)
-            .is("parent_message_id", value: nil)
-            .order("created_at", ascending: false)
-            .limit(21)
-            .execute()
-            .value
+        let loaded: [CoreMessage]
+        do {
+            loaded = try await client
+                .rpc(
+                    "core_list_zia_messages",
+                    params: ListMessagesParams(
+                        conversationId: conversationId,
+                        limit: 21
+                    )
+                )
+                .execute()
+                .value
+        } catch {
+            loaded = try await client
+                .from("core_messages")
+                .select(Self.messageColumns)
+                .eq("conversation_id", value: conversationId)
+                .is("deleted_at", value: nil)
+                .is("parent_message_id", value: nil)
+                .order("created_at", ascending: false)
+                .limit(21)
+                .execute()
+                .value
+        }
 
         return Array(loaded.reversed())
     }
@@ -293,7 +307,9 @@ final class SupabaseCoreClient {
         let userMap = (try? await usersTask) ?? [:]
         let reactionMap = Dictionary(grouping: ((try? await reactionsTask) ?? []), by: \.messageId)
         let attachmentMap = Dictionary(grouping: ((try? await attachmentsTask) ?? []), by: { $0.messageId ?? "" })
-        let parentMap = Dictionary(uniqueKeysWithValues: ((try? await parentsTask) ?? []).map { ($0.id, $0) })
+        let parentMap = ((try? await parentsTask) ?? []).reduce(into: [String: CoreMessageQuote]()) {
+            $0[$1.id] = $1
+        }
 
         return messages.map { message in
             var copy = message
@@ -317,7 +333,9 @@ final class SupabaseCoreClient {
             .execute()
             .value
 
-        return Dictionary(uniqueKeysWithValues: users.map { ($0.id, normalizedAvatarUser($0)) })
+        return users.reduce(into: [String: CoreUserLite]()) {
+            $0[$1.id] = normalizedAvatarUser($1)
+        }
     }
 
     private func fetchReactions(messageIds: [String]) async throws -> [CoreReaction] {
@@ -347,7 +365,7 @@ final class SupabaseCoreClient {
 
         let parents: [CoreMessage] = try await client
             .from("core_messages")
-            .select()
+            .select(Self.messageColumns)
             .in("id", values: ids)
             .execute()
             .value
@@ -385,6 +403,10 @@ final class SupabaseCoreClient {
             .replacingOccurrences(of: "_", with: "\\_")
     }
 
+    nonisolated private static let messageColumns = """
+        id,empresa_id,conversation_id,channel_id,parent_message_id,user_id,content,edited_at,deleted_at,created_at
+        """
+
     nonisolated private static func decodeDate(_ decoder: Decoder) throws -> Date {
         let container = try decoder.singleValueContainer()
         let value = try container.decode(String.self)
@@ -394,6 +416,16 @@ final class SupabaseCoreClient {
         formatter.formatOptions = [.withInternetDateTime]
         if let date = formatter.date(from: value) { return date }
         throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid date: \(value)")
+    }
+}
+
+private struct ListMessagesParams: Encodable {
+    var conversationId: String
+    var limit: Int
+
+    enum CodingKeys: String, CodingKey {
+        case conversationId = "p_conversation_id"
+        case limit = "p_limit"
     }
 }
 

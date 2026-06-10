@@ -8,6 +8,7 @@ struct ContentView: View {
     @State private var showingSettings = false
     @State private var showingNewChannel = false
     @State private var navigationPath: [CoreChannel.ID] = []
+    @State private var pushNavigationTask: Task<Void, Never>?
 
     var body: some View {
         Group {
@@ -54,6 +55,7 @@ struct ContentView: View {
                 Task {
                     await pushService.requestAuthorizationAndRegister()
                     await pushService.registerCurrentToken(configuration: store.configuration)
+                    schedulePendingPushNavigation()
                 }
             }
         }
@@ -61,11 +63,12 @@ struct ContentView: View {
             guard token != nil else { return }
             Task { await pushService.registerCurrentToken(configuration: store.configuration) }
         }
-        .onChange(of: pushService.pendingChannelId) { _, channelId in
-            openPushChannel(channelId)
+        .onChange(of: pushService.pendingDestination) { _, destination in
+            guard destination != nil else { return }
+            schedulePendingPushNavigation()
         }
         .onChange(of: store.channels) { _, _ in
-            openPushChannel(pushService.pendingChannelId)
+            schedulePendingPushNavigation()
         }
         .onChange(of: store.configuration.accessToken) { _, _ in
             Task { await pushService.registerCurrentToken(configuration: store.configuration) }
@@ -86,16 +89,55 @@ struct ContentView: View {
                 await store.refresh()
                 await pushService.requestAuthorizationAndRegister()
                 await pushService.registerCurrentToken(configuration: store.configuration)
-                openPushChannel(pushService.pendingChannelId)
+                schedulePendingPushNavigation()
             }
         }
     }
 
-    private func openPushChannel(_ channelId: String?) {
-        guard let channelId, store.channel(with: channelId) != nil else { return }
-        store.selectedChannelId = channelId
-        navigationPath = [channelId]
-        pushService.pendingChannelId = nil
+    private func schedulePendingPushNavigation() {
+        guard pushService.pendingDestination != nil, pushNavigationTask == nil else { return }
+        pushNavigationTask = Task {
+            await openPendingPushDestination()
+            pushNavigationTask = nil
+        }
+    }
+
+    private func openPendingPushDestination() async {
+        guard let destination = pushService.pendingDestination,
+              store.configuration.isUsable else {
+            return
+        }
+
+        do {
+            _ = try await store.ensureFreshSession()
+            if resolveChannel(for: destination) == nil {
+                await store.refresh()
+            }
+        } catch {
+            pushService.lastError = error.localizedDescription
+            return
+        }
+
+        guard !Task.isCancelled else { return }
+        guard let channel = resolveChannel(for: destination) else {
+            pushService.lastError = "The chat from this notification is not available for this account."
+            return
+        }
+
+        store.selectedChannelId = channel.id
+        navigationPath = [channel.id]
+        pushService.consume(destination)
+    }
+
+    private func resolveChannel(for destination: PushNotificationDestination) -> CoreChannel? {
+        if let channelId = destination.channelId,
+           let channel = store.channel(with: channelId) {
+            return channel
+        }
+        if let conversationId = destination.conversationId {
+            return store.channels.first { $0.conversationId == conversationId }
+        }
+        return nil
     }
 }
 
@@ -483,6 +525,7 @@ private struct ChatDetailView: View {
     let channel: CoreChannel
     @State private var draft = ""
     @State private var replyTarget: CoreMessage?
+    @FocusState private var isComposerFocused: Bool
     private let bottomID = "chat-bottom-anchor"
 
     var messages: [CoreMessage] {
@@ -534,6 +577,11 @@ private struct ChatDetailView: View {
                         .frame(minHeight: 260)
                     }
                     .scaleEffect(y: -1)
+                    .scrollDismissesKeyboard(.interactively)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        isComposerFocused = false
+                    }
                     .overlay {
                         if messages.isEmpty && store.isLoadingMessages[channel.conversationId ?? ""] != true {
                             ContentUnavailableView(
@@ -558,6 +606,7 @@ private struct ChatDetailView: View {
                 draft: $draft,
                 replyTarget: $replyTarget,
                 isSending: store.isSending,
+                isFocused: $isComposerFocused,
                 onSend: {
                     let text = draft
                     let parentId = replyTarget?.id
@@ -968,6 +1017,7 @@ private struct ComposerView: View {
     @Binding var draft: String
     @Binding var replyTarget: CoreMessage?
     let isSending: Bool
+    var isFocused: FocusState<Bool>.Binding
     let onSend: () -> Void
     @State private var showEmojiPicker = false
     private let emojis = [
@@ -1037,6 +1087,7 @@ private struct ComposerView: View {
 
                 TextField("Message #\(channel.displayName)", text: $draft, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
+                    .focused(isFocused)
                     .lineLimit(1...5)
                     .submitLabel(.send)
                     .onSubmit {

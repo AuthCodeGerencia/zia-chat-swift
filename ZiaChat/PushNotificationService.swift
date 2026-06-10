@@ -2,12 +2,22 @@ import Combine
 import UIKit
 import UserNotifications
 
+struct PushNotificationDestination: Equatable, Sendable {
+    var channelId: String?
+    var conversationId: String?
+    var messageId: String?
+
+    var isValid: Bool {
+        channelId != nil || conversationId != nil
+    }
+}
+
 @MainActor
 final class PushNotificationService: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
     static let shared = PushNotificationService()
 
     @Published private(set) var deviceToken: String?
-    @Published var pendingChannelId: String?
+    @Published private(set) var pendingDestination: PushNotificationDestination?
     @Published private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
     @Published var lastError: String?
 
@@ -45,6 +55,23 @@ final class PushNotificationService: NSObject, ObservableObject, UNUserNotificat
         lastError = error.localizedDescription
     }
 
+    func receive(userInfo: [AnyHashable: Any]) {
+        receive(destination: Self.destination(from: userInfo))
+    }
+
+    func receive(destination: PushNotificationDestination) {
+        guard destination.isValid else {
+            lastError = "This notification does not contain a chat destination."
+            return
+        }
+        pendingDestination = destination
+    }
+
+    func consume(_ destination: PushNotificationDestination) {
+        guard pendingDestination == destination else { return }
+        pendingDestination = nil
+    }
+
     func registerCurrentToken(configuration: CoreAppConfiguration) async {
         guard let deviceToken, configuration.isUsable else { return }
 
@@ -71,21 +98,42 @@ final class PushNotificationService: NSObject, ObservableObject, UNUserNotificat
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
-        let channelId = response.notification.request.content.userInfo["channelId"] as? String
+        let destination = Self.destination(from: response.notification.request.content.userInfo)
         await MainActor.run {
-            pendingChannelId = channelId
+            receive(destination: destination)
         }
         try? await center.setBadgeCount(0)
     }
+
+    nonisolated private static func destination(from userInfo: [AnyHashable: Any]) -> PushNotificationDestination {
+        PushNotificationDestination(
+            channelId: stringValue(userInfo["channelId"] ?? userInfo["channel_id"]),
+            conversationId: stringValue(userInfo["conversationId"] ?? userInfo["conversation_id"]),
+            messageId: stringValue(userInfo["messageId"] ?? userInfo["message_id"])
+        )
+    }
+
+    nonisolated private static func stringValue(_ value: Any?) -> String? {
+        if let value = value as? String {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        if let value = value as? UUID {
+            return value.uuidString
+        }
+        return nil
+    }
 }
 
+@MainActor
 final class ZiaChatAppDelegate: NSObject, UIApplicationDelegate {
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
-        Task { @MainActor in
-            PushNotificationService.shared.configure()
+        PushNotificationService.shared.configure()
+        if let userInfo = launchOptions?[.remoteNotification] as? [AnyHashable: Any] {
+            PushNotificationService.shared.receive(userInfo: userInfo)
         }
         return true
     }

@@ -266,9 +266,6 @@ final class CoreChannelsStore: ObservableObject {
         lastError = nil
         do {
             let client = try SupabaseCoreClient(configuration: configuration)
-            Task {
-                try? await client.ensureChannelMembership(channelId: channel.id, conversationId: conversationId)
-            }
             let loaded = try await client.listMessagePage(conversationId: conversationId)
             messages[conversationId] = loaded
             clearUnread(for: channel.id)
