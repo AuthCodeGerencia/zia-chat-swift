@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var store = CoreChannelsStore()
+    @StateObject private var voiceStore = CoreVoiceRoomStore()
     @State private var showingSettings = false
     @State private var showingNewChannel = false
     @State private var navigationPath: [CoreChannel.ID] = []
@@ -12,13 +13,22 @@ struct ContentView: View {
                 NavigationStack(path: $navigationPath) {
                     ChannelListView(
                         store: store,
+                        voiceStore: voiceStore,
                         showingSettings: $showingSettings,
                         showingNewChannel: $showingNewChannel,
                         navigationPath: $navigationPath
                     )
                     .navigationDestination(for: CoreChannel.ID.self) { channelId in
                         if let channel = store.channel(with: channelId) {
-                            ChatDetailView(store: store, channel: channel)
+                            if channel.isVoice {
+                                VoiceChannelView(
+                                    voiceStore: voiceStore,
+                                    channel: channel,
+                                    configuration: store.configuration
+                                )
+                            } else {
+                                ChatDetailView(store: store, channel: channel)
+                            }
                         } else {
                             MissingChannelView()
                         }
@@ -37,6 +47,7 @@ struct ContentView: View {
         .onChange(of: store.configuration.isUsable) { _, isUsable in
             if !isUsable {
                 navigationPath.removeAll()
+                Task { await voiceStore.leave() }
             }
         }
         .task {
@@ -113,6 +124,7 @@ private struct LoginView: View {
 
 private struct ChannelListView: View {
     @ObservedObject var store: CoreChannelsStore
+    @ObservedObject var voiceStore: CoreVoiceRoomStore
     @Binding var showingSettings: Bool
     @Binding var showingNewChannel: Bool
     @Binding var navigationPath: [CoreChannel.ID]
@@ -199,7 +211,19 @@ private struct ChannelListView: View {
             }
         }
         .safeAreaInset(edge: .bottom) {
-            SyncStatusBar(store: store)
+            VStack(spacing: 0) {
+                if let channel = voiceStore.connectedChannel {
+                    ConnectedVoiceBar(
+                        voiceStore: voiceStore,
+                        channel: channel,
+                        onOpen: {
+                            store.selectedChannelId = channel.id
+                            navigationPath = [channel.id]
+                        }
+                    )
+                }
+                SyncStatusBar(store: store)
+            }
         }
     }
 }
@@ -439,6 +463,253 @@ private struct ChannelHeader: View {
         .padding(.horizontal)
         .padding(.vertical, 10)
         .background(.bar)
+    }
+}
+
+private struct VoiceChannelView: View {
+    @ObservedObject var voiceStore: CoreVoiceRoomStore
+    let channel: CoreChannel
+    let configuration: CoreAppConfiguration
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ChannelHeader(channel: channel)
+
+            Group {
+                if voiceStore.connectedChannel?.id == channel.id, voiceStore.isConnected {
+                    participantList
+                } else if voiceStore.connectionState == .requestingAccess ||
+                            voiceStore.connectionState == .connecting {
+                    VStack(spacing: 14) {
+                        ProgressView()
+                            .controlSize(.large)
+                        Text(voiceStore.connectionState == .requestingAccess
+                             ? "Requesting microphone access"
+                             : "Connecting to voice")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ContentUnavailableView {
+                        Label("Voice unavailable", systemImage: "waveform.slash")
+                    } description: {
+                        Text(voiceStore.lastError ?? "Join this channel to start talking.")
+                    } actions: {
+                        Button("Try Again") {
+                            Task {
+                                await voiceStore.join(channel: channel, configuration: configuration)
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+            }
+
+            if voiceStore.connectedChannel?.id == channel.id, voiceStore.isConnected {
+                VoiceControls(voiceStore: voiceStore)
+            }
+        }
+        .navigationTitle(channel.displayName)
+        .navigationBarTitleDisplayMode(.inline)
+        .task(id: channel.id) {
+            await voiceStore.join(channel: channel, configuration: configuration)
+        }
+    }
+
+    private var participantList: some View {
+        List {
+            Section {
+                ForEach(voiceStore.participants) { participant in
+                    VoiceParticipantRow(participant: participant)
+                }
+            } header: {
+                Text("\(voiceStore.participants.count) connected")
+            }
+        }
+        .listStyle(.plain)
+        .overlay {
+            if voiceStore.participants.isEmpty {
+                ProgressView("Loading participants")
+            }
+        }
+    }
+}
+
+private struct VoiceParticipantRow: View {
+    let participant: CoreVoiceParticipant
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(Color.accentColor.opacity(0.14))
+                Text(initials)
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(Color.accentColor)
+            }
+            .overlay {
+                Circle()
+                    .stroke(participant.isSpeaking ? Color.green : Color.clear, lineWidth: 3)
+            }
+            .frame(width: 44, height: 44)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(participant.name)
+                        .font(.body.weight(.semibold))
+                    if participant.isLocal {
+                        Text("You")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Text(participant.isSpeaking ? "Speaking" : "Connected")
+                    .font(.caption)
+                    .foregroundStyle(participant.isSpeaking ? Color.green : .secondary)
+            }
+
+            Spacer()
+
+            Image(systemName: participant.isMuted ? "mic.slash.fill" : "mic.fill")
+                .foregroundStyle(participant.isMuted ? .secondary : Color.green)
+                .frame(width: 28, height: 28)
+                .accessibilityLabel(participant.isMuted ? "Muted" : "Microphone on")
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var initials: String {
+        let parts = participant.name.split(separator: " ").prefix(2)
+        let value = parts.compactMap(\.first).map(String.init).joined()
+        return value.isEmpty ? "?" : value.uppercased()
+    }
+}
+
+private struct VoiceControls: View {
+    @ObservedObject var voiceStore: CoreVoiceRoomStore
+
+    var body: some View {
+        HStack(spacing: 24) {
+            VoiceControlButton(
+                title: voiceStore.isMuted ? "Unmute" : "Mute",
+                systemImage: voiceStore.isMuted ? "mic.slash.fill" : "mic.fill",
+                isActive: voiceStore.isMuted
+            ) {
+                Task { await voiceStore.toggleMute() }
+            }
+
+            VoiceControlButton(
+                title: "Speaker",
+                systemImage: voiceStore.isSpeakerEnabled ? "speaker.wave.2.fill" : "speaker.fill",
+                isActive: voiceStore.isSpeakerEnabled
+            ) {
+                voiceStore.toggleSpeaker()
+            }
+
+            VoiceControlButton(
+                title: "Leave",
+                systemImage: "phone.down.fill",
+                color: .red,
+                isActive: true
+            ) {
+                Task { await voiceStore.leave() }
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal)
+        .padding(.vertical, 14)
+        .background(.bar)
+    }
+}
+
+private struct VoiceControlButton: View {
+    let title: String
+    let systemImage: String
+    var color: Color = .accentColor
+    var isActive = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                Image(systemName: systemImage)
+                    .font(.title3.weight(.semibold))
+                    .frame(width: 48, height: 48)
+                    .background(isActive ? color : Color(.tertiarySystemFill))
+                    .foregroundStyle(isActive ? .white : .primary)
+                    .clipShape(Circle())
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+            }
+            .frame(width: 68)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct ConnectedVoiceBar: View {
+    @ObservedObject var voiceStore: CoreVoiceRoomStore
+    let channel: CoreChannel
+    let onOpen: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Button(action: onOpen) {
+                HStack(spacing: 10) {
+                    Image(systemName: "waveform")
+                        .foregroundStyle(Color.green)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(channel.displayName)
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                        Text(statusText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+
+            Spacer()
+
+            Button {
+                Task { await voiceStore.toggleMute() }
+            } label: {
+                Image(systemName: voiceStore.isMuted ? "mic.slash.fill" : "mic.fill")
+                    .frame(width: 34, height: 34)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(voiceStore.isMuted ? "Unmute" : "Mute")
+
+            Button(role: .destructive) {
+                Task { await voiceStore.leave() }
+            } label: {
+                Image(systemName: "phone.down.fill")
+                    .frame(width: 34, height: 34)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("Leave voice channel")
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 9)
+        .background(.regularMaterial)
+        .overlay(alignment: .top) {
+            Divider()
+        }
+    }
+
+    private var statusText: String {
+        switch voiceStore.connectionState {
+        case .reconnecting:
+            return "Reconnecting"
+        case .connected:
+            return "\(voiceStore.participants.count) connected"
+        default:
+            return "Voice channel"
+        }
     }
 }
 

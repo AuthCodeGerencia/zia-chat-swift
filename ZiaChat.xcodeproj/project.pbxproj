@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		F4B032352FD88A0100921463 /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = F4B032362FD88A0100921463 /* Supabase */; };
+		F4B032382FD88A0100921463 /* LiveKit in Frameworks */ = {isa = PBXBuildFile; productRef = F4B032392FD88A0100921463 /* LiveKit */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -27,6 +28,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F4B032382FD88A0100921463 /* LiveKit in Frameworks */,
 				F4B032352FD88A0100921463 /* Supabase in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -70,6 +72,7 @@
 			);
 			name = ZiaChat;
 			packageProductDependencies = (
+				F4B032392FD88A0100921463 /* LiveKit */,
 				F4B032362FD88A0100921463 /* Supabase */,
 			);
 			productName = ZiaChat;
@@ -101,6 +104,7 @@
 			mainGroup = F4B0321F2FD8854400921463;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
+				F4B0323A2FD88A0100921463 /* XCRemoteSwiftPackageReference "client-sdk-swift" */,
 				F4B032372FD88A0100921463 /* XCRemoteSwiftPackageReference "supabase-swift" */,
 			);
 			preferredProjectObjectVersion = 77;
@@ -264,6 +268,7 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleIconName = AppIcon;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "ZiaChat uses the microphone when you join a voice channel.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -306,6 +311,7 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleIconName = AppIcon;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "ZiaChat uses the microphone when you join a voice channel.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -358,6 +364,14 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
+		F4B0323A2FD88A0100921463 /* XCRemoteSwiftPackageReference "client-sdk-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/livekit/client-sdk-swift.git";
+			requirement = {
+				kind = exactVersion;
+				version = 2.14.1;
+			};
+		};
 		F4B032372FD88A0100921463 /* XCRemoteSwiftPackageReference "supabase-swift" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/supabase/supabase-swift.git";
@@ -369,6 +383,11 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		F4B032392FD88A0100921463 /* LiveKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = F4B0323A2FD88A0100921463 /* XCRemoteSwiftPackageReference "client-sdk-swift" */;
+			productName = LiveKit;
+		};
 		F4B032362FD88A0100921463 /* Supabase */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = F4B032372FD88A0100921463 /* XCRemoteSwiftPackageReference "supabase-swift" */;

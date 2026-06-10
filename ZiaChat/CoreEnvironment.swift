@@ -3,18 +3,21 @@ import Foundation
 struct CoreEnvironment {
     var supabaseURL: String = ""
     var supabaseAnonKey: String = ""
+    var appURL: String = ""
 
     private static let projectSupabaseURL = "https://supabase.authcode.biz"
     private static let projectSupabaseAnonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imlua2Ntb2J0eXB5aml3Y2Vwb3VyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzUwNjg1NTUsImV4cCI6MjA1MDY0NDU1NX0.xVJhcEWKizMRP4ZOYXUww2FUG9N2517yv0XggOjaOKM"
+    private static let projectAppURL = "https://portal.agenciadevio.com"
 
     static func load(filePath: String = #filePath) -> CoreEnvironment {
         let process = ProcessInfo.processInfo.environment
         var environment = CoreEnvironment(
             supabaseURL: process["NEXT_PUBLIC_SUPABASE_URL"] ?? "",
-            supabaseAnonKey: process["NEXT_PUBLIC_SUPABASE_ANON_KEY"] ?? ""
+            supabaseAnonKey: process["NEXT_PUBLIC_SUPABASE_ANON_KEY"] ?? "",
+            appURL: process["NEXT_PUBLIC_APP_URL"] ?? ""
         )
 
-        guard environment.supabaseURL.isEmpty || environment.supabaseAnonKey.isEmpty else {
+        guard environment.supabaseURL.isEmpty || environment.supabaseAnonKey.isEmpty || environment.appURL.isEmpty else {
             return environment
         }
 
@@ -25,11 +28,17 @@ struct CoreEnvironment {
         if environment.supabaseAnonKey.isEmpty {
             environment.supabaseAnonKey = envValues["NEXT_PUBLIC_SUPABASE_ANON_KEY"] ?? ""
         }
+        if environment.appURL.isEmpty {
+            environment.appURL = envValues["NEXT_PUBLIC_APP_URL"] ?? ""
+        }
         if environment.supabaseURL.isEmpty {
             environment.supabaseURL = projectSupabaseURL
         }
         if environment.supabaseAnonKey.isEmpty {
             environment.supabaseAnonKey = projectSupabaseAnonKey
+        }
+        if environment.appURL.isEmpty {
+            environment.appURL = projectAppURL
         }
         return environment
     }
