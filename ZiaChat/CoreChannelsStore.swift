@@ -13,6 +13,8 @@ final class CoreChannelsStore: ObservableObject {
     @Published var isCreatingChannel = false
     @Published var isLoggingIn = false
     @Published var isLoadingMessages: [String: Bool] = [:]
+    @Published var isLoadingOlderMessages: [String: Bool] = [:]
+    @Published var hasOlderMessages: [String: Bool] = [:]
     @Published var channelSearchQuery = ""
     @Published var channelSearchResults: [CoreChannelSearchHit] = []
     @Published var isSearchingChannels = false
@@ -96,6 +98,8 @@ final class CoreChannelsStore: ObservableObject {
         save(configuration: next)
         channels = CorePreviewData.channels
         messages = CorePreviewData.messages
+        isLoadingOlderMessages = [:]
+        hasOlderMessages = [:]
         selectedChannelId = channels.first?.id
     }
 
@@ -293,8 +297,13 @@ final class CoreChannelsStore: ObservableObject {
         lastError = nil
         do {
             let client = try SupabaseCoreClient(configuration: configuration)
-            let loaded = try await client.listMessagePage(conversationId: conversationId)
+            let pageLimit = force ? max(21, messages[conversationId]?.count ?? 0) : 21
+            let loaded = try await client.listMessagePage(
+                conversationId: conversationId,
+                limit: pageLimit
+            )
             messages[conversationId] = loaded
+            hasOlderMessages[conversationId] = loaded.count == pageLimit
             clearUnread(for: channel.id)
             isLoadingMessages[conversationId] = false
 
@@ -310,9 +319,49 @@ final class CoreChannelsStore: ObservableObject {
         }
     }
 
-    func send(_ text: String, in channel: CoreChannel, parentMessageId: String? = nil) async {
+    func loadOlderMessages(in channel: CoreChannel) async {
+        guard configuration.isUsable,
+              let conversationId = channel.conversationId,
+              hasOlderMessages[conversationId] != false,
+              isLoadingMessages[conversationId] != true,
+              isLoadingOlderMessages[conversationId] != true,
+              let oldestMessage = messages[conversationId]?.first else {
+            return
+        }
+
+        isLoadingOlderMessages[conversationId] = true
+        defer { isLoadingOlderMessages[conversationId] = false }
+
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let page = try await client.listMessagePage(
+                conversationId: conversationId,
+                before: oldestMessage.createdAt
+            )
+
+            hasOlderMessages[conversationId] = page.count == 21
+            mergeMessagePage(page, conversationId: conversationId)
+
+            if let enriched = try? await client.enrichMessages(page) {
+                mergeMessagePage(enriched, conversationId: conversationId)
+            }
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func send(
+        _ text: String,
+        attachments: [CorePendingAttachment] = [],
+        in channel: CoreChannel,
+        parentMessageId: String? = nil
+    ) async {
         let content = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !content.isEmpty, let conversationId = channel.conversationId else { return }
+        guard !content.isEmpty || !attachments.isEmpty,
+              let conversationId = channel.conversationId else {
+            return
+        }
         guard configuration.isUsable else {
             appendPreviewMessage(content, channel: channel, parentMessageId: parentMessageId)
             return
@@ -324,7 +373,10 @@ final class CoreChannelsStore: ObservableObject {
             conversationId: conversationId,
             parentMessageId: parentMessageId
         )
-        upsertMessage(optimisticMessage)
+        let insertedOptimisticMessage = !content.isEmpty
+        if insertedOptimisticMessage {
+            upsertMessage(optimisticMessage)
+        }
 
         isSending = true
         lastError = nil
@@ -336,16 +388,21 @@ final class CoreChannelsStore: ObservableObject {
                 conversationId: conversationId,
                 channelId: channel.id,
                 parentMessageId: parentMessageId,
-                content: content
+                content: content,
+                attachments: attachments
             )
             message.author = optimisticMessage.author
-            removeMessage(id: optimisticMessage.id, conversationId: conversationId)
+            if insertedOptimisticMessage {
+                removeMessage(id: optimisticMessage.id, conversationId: conversationId)
+            }
             upsertMessage(message)
             Task {
                 try? await client.markRead(conversationId: conversationId, lastReadMessageId: message.id)
             }
         } catch {
-            removeMessage(id: optimisticMessage.id, conversationId: conversationId)
+            if insertedOptimisticMessage {
+                removeMessage(id: optimisticMessage.id, conversationId: conversationId)
+            }
             lastError = error.localizedDescription
         }
         isSending = false
@@ -564,12 +621,16 @@ final class CoreChannelsStore: ObservableObject {
         guard message.parentMessageId == nil, message.deletedAt == nil else { return }
 
         removeMatchingOptimisticMessage(for: message)
-        upsertMessage(message)
+        let isAttachmentOnly = message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if !isAttachmentOnly {
+            upsertMessage(message)
+        }
         clearUnreadForActiveConversation(message.conversationId)
 
         if let client = try? SupabaseCoreClient(configuration: configuration) {
             try? await client.markRead(conversationId: message.conversationId, lastReadMessageId: message.id)
-            if let enriched = try? await client.enrichMessages([message]).first {
+            let enriched = await client.enrichRealtimeMessage(message)
+            if !isAttachmentOnly || enriched.attachments?.isEmpty == false {
                 upsertMessage(enriched)
             }
         }
@@ -584,8 +645,8 @@ final class CoreChannelsStore: ObservableObject {
         }
 
         upsertMessage(message)
-        if let client = try? SupabaseCoreClient(configuration: configuration),
-           let enriched = try? await client.enrichMessages([message]).first {
+        if let client = try? SupabaseCoreClient(configuration: configuration) {
+            let enriched = await client.enrichRealtimeMessage(message)
             upsertMessage(enriched)
         }
     }
@@ -640,7 +701,10 @@ final class CoreChannelsStore: ObservableObject {
             var copy = message
             copy.author = message.author ?? current[index].author
             copy.reactions = message.reactions ?? current[index].reactions
-            copy.attachments = message.attachments ?? current[index].attachments
+            if message.attachments?.isEmpty != false,
+               current[index].attachments?.isEmpty == false {
+                copy.attachments = current[index].attachments
+            }
             copy.parent = message.parent ?? current[index].parent
             current[index] = copy
         } else {
@@ -649,6 +713,31 @@ final class CoreChannelsStore: ObservableObject {
 
         current.sort { $0.createdAt < $1.createdAt }
         messages[message.conversationId] = current
+    }
+
+    private func mergeMessagePage(_ page: [CoreMessage], conversationId: String) {
+        guard !page.isEmpty else { return }
+        var byID = Dictionary(
+            uniqueKeysWithValues: messages[conversationId, default: []].map { ($0.id, $0) }
+        )
+
+        for message in page {
+            if let existing = byID[message.id] {
+                var copy = message
+                copy.author = message.author ?? existing.author
+                copy.reactions = message.reactions ?? existing.reactions
+                if message.attachments?.isEmpty != false,
+                   existing.attachments?.isEmpty == false {
+                    copy.attachments = existing.attachments
+                }
+                copy.parent = message.parent ?? existing.parent
+                byID[message.id] = copy
+            } else {
+                byID[message.id] = message
+            }
+        }
+
+        messages[conversationId] = byID.values.sorted { $0.createdAt < $1.createdAt }
     }
 
     private func removeMessage(id: String, conversationId: String) {

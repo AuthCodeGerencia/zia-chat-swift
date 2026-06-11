@@ -1,4 +1,6 @@
 import SwiftUI
+import PhotosUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
@@ -535,6 +537,7 @@ private struct ChatDetailView: View {
     let channel: CoreChannel
     @State private var draft = ""
     @State private var replyTarget: CoreMessage?
+    @State private var pendingAttachments: [CorePendingAttachment] = []
     @FocusState private var isComposerFocused: Bool
     private let bottomID = "chat-bottom-anchor"
 
@@ -579,6 +582,17 @@ private struct ChatDetailView: View {
                                 )
                                 .id(message.id)
                                 .scaleEffect(y: -1)
+                                .onAppear {
+                                    guard message.id == messages.first?.id else { return }
+                                    Task { await store.loadOlderMessages(in: channel) }
+                                }
+                            }
+
+                            if store.isLoadingOlderMessages[channel.conversationId ?? ""] == true {
+                                ProgressView()
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
+                                    .scaleEffect(y: -1)
                             }
                         }
                         .padding(.horizontal)
@@ -601,7 +615,7 @@ private struct ChatDetailView: View {
                             )
                         }
                     }
-                    .onChange(of: messages.count) { _, _ in
+                    .onChange(of: messages.last?.id) { _, _ in
                         scrollToBottom(proxy: proxy, animated: true)
                     }
                     .task(id: channel.id) {
@@ -615,15 +629,23 @@ private struct ChatDetailView: View {
                 channel: channel,
                 draft: $draft,
                 replyTarget: $replyTarget,
+                attachments: $pendingAttachments,
                 isSending: store.isSending,
                 isFocused: $isComposerFocused,
                 onSend: {
                     let text = draft
                     let parentId = replyTarget?.id
+                    let attachments = pendingAttachments
                     draft = ""
                     replyTarget = nil
+                    pendingAttachments = []
                     Task {
-                        await store.send(text, in: channel, parentMessageId: parentId)
+                        await store.send(
+                            text,
+                            attachments: attachments,
+                            in: channel,
+                            parentMessageId: parentId
+                        )
                     }
                 }
             )
@@ -965,15 +987,17 @@ private struct MessageBubble: View {
                         .padding(.horizontal, 10)
                 }
 
-                EmojiAwareText(
-                    message.content.isEmpty ? "Attachment" : message.content,
-                    font: .body,
-                    color: isMine ? .white : .primary
-                )
+                if !message.content.isEmpty {
+                    EmojiAwareText(
+                        message.content,
+                        font: .body,
+                        color: isMine ? .white : .primary
+                    )
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
                     .background(isMine ? Color.accentColor : Color(.secondarySystemGroupedBackground))
                     .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                }
 
                 if let attachments = message.attachments, !attachments.isEmpty {
                     AttachmentStrip(attachments: attachments)
@@ -1026,10 +1050,14 @@ private struct ComposerView: View {
     let channel: CoreChannel
     @Binding var draft: String
     @Binding var replyTarget: CoreMessage?
+    @Binding var attachments: [CorePendingAttachment]
     let isSending: Bool
     var isFocused: FocusState<Bool>.Binding
     let onSend: () -> Void
     @State private var showEmojiPicker = false
+    @State private var selectedPhotos: [PhotosPickerItem] = []
+    @State private var isLoadingPhotos = false
+    @State private var attachmentError: String?
     private let emojis = [
         "\u{1F600}", "\u{1F60A}", "\u{1F64C}", "\u{1F44D}", "\u{1F525}",
         "\u{2705}", "\u{1F389}", "\u{1F440}", "\u{1F4A1}", "\u{2764}\u{FE0F}",
@@ -1037,7 +1065,9 @@ private struct ComposerView: View {
     ]
 
     var canSend: Bool {
-        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty) &&
+        !isLoadingPhotos &&
+        !isSending
     }
 
     var body: some View {
@@ -1082,6 +1112,17 @@ private struct ComposerView: View {
                 }
             }
 
+            if !attachments.isEmpty || isLoadingPhotos || attachmentError != nil {
+                PendingAttachmentStrip(
+                    attachments: attachments,
+                    isLoading: isLoadingPhotos,
+                    error: attachmentError,
+                    onRemove: { id in
+                        attachments.removeAll { $0.id == id }
+                    }
+                )
+            }
+
             HStack(spacing: 10) {
                 Button {
                     withAnimation(.snappy) {
@@ -1094,6 +1135,19 @@ private struct ComposerView: View {
                 .buttonStyle(.borderless)
                 .foregroundStyle(showEmojiPicker ? Color.accentColor : .secondary)
                 .accessibilityLabel("Emojis")
+
+                PhotosPicker(
+                    selection: $selectedPhotos,
+                    maxSelectionCount: max(1, 5 - attachments.count),
+                    matching: .images
+                ) {
+                    Image(systemName: "photo")
+                        .frame(width: 32, height: 32)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .disabled(attachments.count >= 5 || isLoadingPhotos || isSending)
+                .accessibilityLabel("Add photos or GIFs")
 
                 TextField("Message #\(channel.displayName)", text: $draft, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
@@ -1115,6 +1169,45 @@ private struct ComposerView: View {
             }
             .padding()
             .background(.bar)
+        }
+        .onChange(of: selectedPhotos) { _, items in
+            guard !items.isEmpty else { return }
+            Task { await loadPhotos(items) }
+        }
+    }
+
+    private func loadPhotos(_ items: [PhotosPickerItem]) async {
+        isLoadingPhotos = true
+        attachmentError = nil
+        defer {
+            selectedPhotos = []
+            isLoadingPhotos = false
+        }
+
+        for item in items.prefix(max(0, 5 - attachments.count)) {
+            do {
+                guard let data = try await item.loadTransferable(type: Data.self) else { continue }
+                guard data.count <= 15 * 1_024 * 1_024 else {
+                    attachmentError = "Each image or GIF must be 15 MB or smaller."
+                    continue
+                }
+
+                let contentType = item.supportedContentTypes.first(where: {
+                    $0.conforms(to: .gif)
+                }) ?? item.supportedContentTypes.first(where: {
+                    $0.conforms(to: .image)
+                }) ?? .jpeg
+                let extensionName = contentType.preferredFilenameExtension ?? "jpg"
+                attachments.append(
+                    CorePendingAttachment(
+                        data: data,
+                        fileName: "image-\(UUID().uuidString).\(extensionName)",
+                        mimeType: contentType.preferredMIMEType ?? "image/jpeg"
+                    )
+                )
+            } catch {
+                attachmentError = error.localizedDescription
+            }
         }
     }
 }
@@ -1279,15 +1372,79 @@ private struct AttachmentStrip: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(attachments) { attachment in
-                Link(destination: attachment.resolvedURL ?? URL(string: "about:blank")!) {
-                    Label(attachment.fileName, systemImage: attachment.systemImage)
-                        .font(.caption)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 7)
-                        .background(.thinMaterial)
-                        .clipShape(Capsule())
+                if attachment.isImage, let url = attachment.resolvedURL {
+                    Link(destination: url) {
+                        AttachmentMediaView(url: url, isGIF: attachment.isGIF)
+                            .frame(width: 220, height: 180)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .overlay(alignment: .bottomLeading) {
+                                Text(attachment.fileName)
+                                    .font(.caption2)
+                                    .lineLimit(1)
+                                    .padding(6)
+                                    .foregroundStyle(.white)
+                                    .background(.black.opacity(0.65))
+                            }
+                    }
+                    .buttonStyle(.plain)
+                } else {
+                    Link(destination: attachment.resolvedURL ?? URL(string: "about:blank")!) {
+                        Label(attachment.fileName, systemImage: attachment.systemImage)
+                            .font(.caption)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
+                            .background(.thinMaterial)
+                            .clipShape(Capsule())
+                    }
+                    .disabled(attachment.resolvedURL == nil)
                 }
-                .disabled(attachment.resolvedURL == nil)
+            }
+        }
+    }
+}
+
+private struct PendingAttachmentStrip: View {
+    let attachments: [CorePendingAttachment]
+    let isLoading: Bool
+    let error: String?
+    let onRemove: (UUID) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(attachments) { attachment in
+                        ZStack(alignment: .topTrailing) {
+                            PendingAttachmentPreview(attachment: attachment)
+                                .frame(width: 74, height: 74)
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                            Button {
+                                onRemove(attachment.id)
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .symbolRenderingMode(.palette)
+                                    .foregroundStyle(.white, .black.opacity(0.75))
+                            }
+                            .offset(x: 5, y: -5)
+                            .accessibilityLabel("Remove attachment")
+                        }
+                    }
+
+                    if isLoading {
+                        ProgressView()
+                            .frame(width: 74, height: 74)
+                    }
+                }
+                .padding(.horizontal)
+                .padding(.top, 8)
+            }
+
+            if let error {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal)
             }
         }
     }

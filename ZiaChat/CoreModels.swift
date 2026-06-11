@@ -228,6 +228,37 @@ struct CoreAttachment: Identifiable, Codable, Hashable {
         if mimeType.contains("pdf") { return "doc.richtext" }
         return "paperclip"
     }
+
+    var isImage: Bool {
+        mimeType?.hasPrefix("image/") == true
+    }
+
+    var isGIF: Bool {
+        mimeType?.lowercased() == "image/gif" ||
+        fileName.lowercased().hasSuffix(".gif")
+    }
+}
+
+struct CorePendingAttachment: Identifiable, Hashable {
+    let id: UUID
+    var data: Data
+    var fileName: String
+    var mimeType: String
+
+    init(id: UUID = UUID(), data: Data, fileName: String, mimeType: String) {
+        self.id = id
+        self.data = data
+        self.fileName = fileName
+        self.mimeType = mimeType
+    }
+
+    var sizeBytes: Int {
+        data.count
+    }
+
+    var isGIF: Bool {
+        mimeType == "image/gif"
+    }
 }
 
 struct CoreMessage: Identifiable, Codable, Hashable {

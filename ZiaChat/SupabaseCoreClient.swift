@@ -19,6 +19,7 @@ enum SupabaseCoreError: LocalizedError {
 }
 
 final class SupabaseCoreClient {
+    private static let attachmentsBucket = "core-attachments"
     private let configuration: CoreAppConfiguration
     private let client: SupabaseClient
 
@@ -129,37 +130,84 @@ final class SupabaseCoreClient {
         return try await enrichMessages(displayOrder)
     }
 
-    func listMessagePage(conversationId: String) async throws -> [CoreMessage] {
+    func listMessagePage(
+        conversationId: String,
+        before: Date? = nil,
+        limit: Int = 21
+    ) async throws -> [CoreMessage] {
         let loaded: [CoreMessage]
-        do {
-            loaded = try await client
-                .rpc(
-                    "core_list_zia_messages",
-                    params: ListMessagesParams(
-                        conversationId: conversationId,
-                        limit: 21
+        if let before {
+            loaded = try await messagePageQuery(
+                conversationId: conversationId,
+                before: before,
+                limit: limit
+            )
+        } else {
+            do {
+                loaded = try await client
+                    .rpc(
+                        "core_list_zia_messages",
+                        params: ListMessagesParams(
+                            conversationId: conversationId,
+                            limit: limit
+                        )
                     )
+                    .execute()
+                    .value
+            } catch {
+                loaded = try await messagePageQuery(
+                    conversationId: conversationId,
+                    before: nil,
+                    limit: limit
                 )
-                .execute()
-                .value
-        } catch {
-            loaded = try await client
-                .from("core_messages")
-                .select(Self.messageColumns)
-                .eq("conversation_id", value: conversationId)
-                .is("deleted_at", value: nil)
-                .is("parent_message_id", value: nil)
-                .order("created_at", ascending: false)
-                .limit(21)
-                .execute()
-                .value
+            }
         }
 
         return Array(loaded.reversed())
     }
 
+    private func messagePageQuery(
+        conversationId: String,
+        before: Date?,
+        limit: Int
+    ) async throws -> [CoreMessage] {
+        var query = client
+            .from("core_messages")
+            .select(Self.messageColumns)
+            .eq("conversation_id", value: conversationId)
+            .is("deleted_at", value: nil)
+            .is("parent_message_id", value: nil)
+
+        if let before {
+            query = query.lt("created_at", value: Self.iso8601String(from: before))
+        }
+
+        return try await query
+            .order("created_at", ascending: false)
+            .limit(limit)
+            .execute()
+            .value
+    }
+
     func enrichMessages(_ messages: [CoreMessage]) async throws -> [CoreMessage] {
         try await enrich(messages)
+    }
+
+    func enrichRealtimeMessage(_ message: CoreMessage) async -> CoreMessage {
+        let needsAttachment = message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
+        for attempt in 0..<6 {
+            if attempt > 0 {
+                try? await Task.sleep(for: .milliseconds(250 * attempt))
+            }
+
+            guard let enriched = try? await enrich([message]).first else { continue }
+            if !needsAttachment || enriched.attachments?.isEmpty == false {
+                return enriched
+            }
+        }
+
+        return message
     }
 
     func ensureChannelMembership(channelId: String, conversationId: String) async throws {
@@ -171,7 +219,8 @@ final class SupabaseCoreClient {
         conversationId: String,
         channelId: String?,
         parentMessageId: String?,
-        content: String
+        content: String,
+        attachments: [CorePendingAttachment] = []
     ) async throws -> CoreMessage {
         try await ensureMembership(conversationId: conversationId, channelId: channelId)
 
@@ -192,7 +241,33 @@ final class SupabaseCoreClient {
             .value
 
         guard let message = inserted.first else { throw SupabaseCoreError.emptyResponse }
-        return message
+        guard !attachments.isEmpty else { return message }
+
+        do {
+            let rows = try await uploadAttachments(
+                attachments,
+                empresaId: empresaId,
+                conversationId: conversationId,
+                messageId: message.id
+            )
+            let saved: [CoreAttachment] = try await client
+                .from("core_attachments")
+                .insert(rows)
+                .select()
+                .execute()
+                .value
+
+            var enrichedMessage = message
+            enrichedMessage.attachments = try await signAttachments(saved)
+            return enrichedMessage
+        } catch {
+            _ = try? await client
+                .from("core_messages")
+                .update(["deleted_at": ISO8601DateFormatter().string(from: Date())])
+                .eq("id", value: message.id)
+                .execute()
+            throw error
+        }
     }
 
     func react(empresaId: Int, conversationId: String, messageId: String, emoji: String) async throws {
@@ -352,12 +427,62 @@ final class SupabaseCoreClient {
     private func fetchAttachments(messageIds: [String]) async throws -> [CoreAttachment] {
         guard !messageIds.isEmpty else { return [] }
 
-        return try await client
+        let attachments: [CoreAttachment] = try await client
             .from("core_attachments")
             .select()
             .in("message_id", values: messageIds)
             .execute()
             .value
+        return try await signAttachments(attachments)
+    }
+
+    private func uploadAttachments(
+        _ attachments: [CorePendingAttachment],
+        empresaId: Int,
+        conversationId: String,
+        messageId: String
+    ) async throws -> [CoreAttachmentInsert] {
+        var rows: [CoreAttachmentInsert] = []
+        for (index, attachment) in attachments.enumerated() {
+            let safeName = Self.safeFileName(attachment.fileName)
+            let path = "core-attachments/\(empresaId)/\(conversationId)/\(messageId)/\(Int(Date().timeIntervalSince1970 * 1_000))-\(index)-\(safeName)"
+            try await client.storage
+                .from(Self.attachmentsBucket)
+                .upload(
+                    path,
+                    data: attachment.data,
+                    options: FileOptions(contentType: attachment.mimeType)
+                )
+            rows.append(
+                CoreAttachmentInsert(
+                    empresaId: empresaId,
+                    messageId: messageId,
+                    uploaderId: configuration.userId,
+                    bucket: Self.attachmentsBucket,
+                    path: path,
+                    fileName: attachment.fileName,
+                    mimeType: attachment.mimeType,
+                    sizeBytes: attachment.sizeBytes
+                )
+            )
+        }
+        return rows
+    }
+
+    private func signAttachments(_ attachments: [CoreAttachment]) async throws -> [CoreAttachment] {
+        var result: [CoreAttachment] = []
+        for attachment in attachments {
+            var copy = attachment
+            if copy.url?.nilIfBlank == nil, let path = copy.path?.nilIfBlank {
+                let bucket = copy.bucket?.nilIfBlank ?? Self.attachmentsBucket
+                copy.url = try await client.storage
+                    .from(bucket)
+                    .createSignedURL(path: path, expiresIn: 3_600)
+                    .absoluteString
+            }
+            result.append(copy)
+        }
+        return result
     }
 
     private func fetchParents(ids: [String]) async throws -> [CoreMessageQuote] {
@@ -401,6 +526,19 @@ final class SupabaseCoreClient {
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "%", with: "\\%")
             .replacingOccurrences(of: "_", with: "\\_")
+    }
+
+    nonisolated private static func safeFileName(_ value: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        let scalars = value.unicodeScalars.map { allowed.contains($0) ? Character(String($0)) : "-" }
+        let result = String(scalars)
+        return result.isEmpty ? "image" : result
+    }
+
+    nonisolated private static func iso8601String(from date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
     }
 
     nonisolated private static let messageColumns = """
@@ -484,6 +622,28 @@ private struct CoreMessageInsert: Encodable {
         case parentMessageId = "parent_message_id"
         case userId = "user_id"
         case content
+    }
+}
+
+private struct CoreAttachmentInsert: Encodable {
+    var empresaId: Int
+    var messageId: String
+    var uploaderId: String
+    var bucket: String
+    var path: String
+    var fileName: String
+    var mimeType: String
+    var sizeBytes: Int
+
+    enum CodingKeys: String, CodingKey {
+        case empresaId = "empresa_id"
+        case messageId = "message_id"
+        case uploaderId = "uploader_id"
+        case bucket
+        case path
+        case fileName = "file_name"
+        case mimeType = "mime_type"
+        case sizeBytes = "size_bytes"
     }
 }
 
