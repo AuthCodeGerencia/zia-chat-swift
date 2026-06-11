@@ -132,9 +132,6 @@ final class ZiaChatAppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         PushNotificationService.shared.configure()
-        if let userInfo = launchOptions?[.remoteNotification] as? [AnyHashable: Any] {
-            PushNotificationService.shared.receive(userInfo: userInfo)
-        }
         return true
     }
 

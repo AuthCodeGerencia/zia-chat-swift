@@ -241,6 +241,33 @@ final class CoreChannelsStore: ObservableObject {
         CoreChannelCache.save(loadedChannels, userId: configuration.userId)
     }
 
+    func channelForNotification(channelId: String?, conversationId: String?) async throws -> CoreChannel? {
+        if let channel = resolveChannel(channelId: channelId, conversationId: conversationId) {
+            return channel
+        }
+
+        let activeConfiguration = try await ensureFreshSession()
+        let client = try SupabaseCoreClient(configuration: activeConfiguration)
+        let loadedChannels: [CoreChannel]
+        do {
+            loadedChannels = try await client.listChannelsFast()
+        } catch {
+            loadedChannels = try await client.listChannels()
+        }
+        applyChannels(loadedChannels)
+        return resolveChannel(channelId: channelId, conversationId: conversationId)
+    }
+
+    private func resolveChannel(channelId: String?, conversationId: String?) -> CoreChannel? {
+        if let channelId, let channel = channel(with: channelId) {
+            return channel
+        }
+        if let conversationId {
+            return channels.first { $0.conversationId == conversationId }
+        }
+        return nil
+    }
+
     func open(_ channel: CoreChannel, force: Bool = false) async {
         guard let conversationId = channel.conversationId else { return }
         selectedChannelId = channel.id

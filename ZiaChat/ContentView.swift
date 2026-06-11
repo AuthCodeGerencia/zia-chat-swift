@@ -77,6 +77,7 @@ struct ContentView: View {
             guard phase == .active, store.configuration.isUsable else { return }
             Task {
                 _ = try? await store.ensureFreshSession()
+                schedulePendingPushNavigation()
             }
         }
         .task(id: store.configuration.userId) {
@@ -95,8 +96,18 @@ struct ContentView: View {
     }
 
     private func schedulePendingPushNavigation() {
-        guard pushService.pendingDestination != nil, pushNavigationTask == nil else { return }
+        guard scenePhase == .active,
+              pushService.pendingDestination != nil,
+              pushNavigationTask == nil else {
+            return
+        }
         pushNavigationTask = Task {
+            // Let SwiftUI finish restoring the NavigationStack after a notification launch.
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled, scenePhase == .active else {
+                pushNavigationTask = nil
+                return
+            }
             await openPendingPushDestination()
             pushNavigationTask = nil
         }
@@ -108,36 +119,35 @@ struct ContentView: View {
             return
         }
 
-        do {
-            _ = try await store.ensureFreshSession()
-            if resolveChannel(for: destination) == nil {
-                await store.refresh()
+        var latestError: Error?
+        for attempt in 0..<3 {
+            guard !Task.isCancelled,
+                  pushService.pendingDestination == destination else {
+                return
             }
-        } catch {
-            pushService.lastError = error.localizedDescription
-            return
+
+            do {
+                if let channel = try await store.channelForNotification(
+                    channelId: destination.channelId,
+                    conversationId: destination.conversationId
+                ) {
+                    store.selectedChannelId = channel.id
+                    navigationPath = [channel.id]
+                    pushService.consume(destination)
+                    pushService.lastError = nil
+                    return
+                }
+            } catch {
+                latestError = error
+            }
+
+            if attempt < 2 {
+                try? await Task.sleep(for: .milliseconds(450 * (attempt + 1)))
+            }
         }
 
-        guard !Task.isCancelled else { return }
-        guard let channel = resolveChannel(for: destination) else {
-            pushService.lastError = "The chat from this notification is not available for this account."
-            return
-        }
-
-        store.selectedChannelId = channel.id
-        navigationPath = [channel.id]
-        pushService.consume(destination)
-    }
-
-    private func resolveChannel(for destination: PushNotificationDestination) -> CoreChannel? {
-        if let channelId = destination.channelId,
-           let channel = store.channel(with: channelId) {
-            return channel
-        }
-        if let conversationId = destination.conversationId {
-            return store.channels.first { $0.conversationId == conversationId }
-        }
-        return nil
+        pushService.lastError = latestError?.localizedDescription
+            ?? "The chat from this notification is not available for this account."
     }
 }
 
