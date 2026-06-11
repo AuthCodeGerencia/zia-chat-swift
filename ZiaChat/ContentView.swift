@@ -95,6 +95,7 @@ struct ContentView: View {
                 schedulePendingPushNavigation()
             }
         }
+        .preferredColorScheme(.light)
     }
 
     private func schedulePendingPushNavigation() {
@@ -244,6 +245,11 @@ private struct ChannelListView: View {
                 defaultChannelContent
             }
         }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .background(Color.white)
+        .contentMargins(.horizontal, 0, for: .scrollContent)
+        .listSectionSpacing(0)
         .overlay {
             if store.isLoading && store.channels.isEmpty {
                 ProgressView("Loading channels")
@@ -267,25 +273,9 @@ private struct ChannelListView: View {
             store.updateChannelSearch(newValue)
         }
         .navigationTitle("ZiaChat")
+        .toolbarBackground(Color.white, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
         .toolbar {
-            ToolbarItem(placement: .topBarLeading) {
-                Menu {
-                    Button {
-                        showingSettings = true
-                    } label: {
-                        Label("Settings", systemImage: "gearshape")
-                    }
-                    Button(role: .destructive) {
-                        store.signOut()
-                    } label: {
-                        Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
-                    }
-                } label: {
-                    Image(systemName: "person.crop.circle")
-                }
-                .accessibilityLabel("Account")
-            }
-
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
                     showingNewChannel = true
@@ -308,7 +298,11 @@ private struct ChannelListView: View {
                         }
                     )
                 }
-                SyncStatusBar(store: store)
+
+                ChannelBottomBar(
+                    onSettings: { showingSettings = true },
+                    onSignOut: { store.signOut() }
+                )
             }
         }
     }
@@ -316,21 +310,9 @@ private struct ChannelListView: View {
     @ViewBuilder
     private var defaultChannelContent: some View {
         Section {
-            ForEach(store.favoriteChannels) { channel in
+            ForEach(sortedTextChannels) { channel in
                 ChannelNavigationRow(store: store, channel: channel, navigationPath: $navigationPath)
             }
-        } header: {
-            if !store.favoriteChannels.isEmpty {
-                Label("Favorites", systemImage: "star.fill")
-            }
-        }
-
-        Section {
-            ForEach(store.textChannels) { channel in
-                ChannelNavigationRow(store: store, channel: channel, navigationPath: $navigationPath)
-            }
-        } header: {
-            Label("Channels", systemImage: "number")
         }
 
         if !store.voiceChannels.isEmpty {
@@ -341,6 +323,23 @@ private struct ChannelListView: View {
             } header: {
                 Label("Voice", systemImage: "speaker.wave.2.fill")
             }
+        }
+    }
+
+    private var sortedTextChannels: [CoreChannel] {
+        store.textChannels.sorted { first, second in
+            let firstFavorite = store.favoriteChannelIds.contains(first.id)
+            let secondFavorite = store.favoriteChannelIds.contains(second.id)
+            if firstFavorite != secondFavorite {
+                return firstFavorite
+            }
+
+            let firstDate = first.conversationId.flatMap { store.channelPreviews[$0]?.createdAt }
+            let secondDate = second.conversationId.flatMap { store.channelPreviews[$0]?.createdAt }
+            if firstDate != secondDate {
+                return (firstDate ?? .distantPast) > (secondDate ?? .distantPast)
+            }
+            return first.displayName.localizedCaseInsensitiveCompare(second.displayName) == .orderedAscending
         }
     }
 
@@ -381,6 +380,48 @@ private struct ChannelListView: View {
     }
 }
 
+private struct ChannelBottomBar: View {
+    let onSettings: () -> Void
+    let onSignOut: () -> Void
+
+    var body: some View {
+        HStack {
+            VStack(spacing: 3) {
+                Image(systemName: "bubble.left.and.bubble.right.fill")
+                    .font(.system(size: 20, weight: .semibold))
+                Text("Chats")
+                    .font(.caption2.weight(.semibold))
+            }
+            .foregroundStyle(Color.accentColor)
+            .frame(maxWidth: .infinity)
+
+            Menu {
+                Button(action: onSettings) {
+                    Label("Settings", systemImage: "gearshape")
+                }
+                Button(role: .destructive, action: onSignOut) {
+                    Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
+                }
+            } label: {
+                VStack(spacing: 3) {
+                    Image(systemName: "person.crop.circle")
+                        .font(.system(size: 21, weight: .semibold))
+                    Text("Profile")
+                        .font(.caption2.weight(.semibold))
+                }
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .frame(height: 49)
+        .padding(.horizontal, 28)
+        .background(Color.white)
+        .overlay(alignment: .top) {
+            Divider()
+        }
+    }
+}
+
 private struct ChannelSearchResultRow: View {
     let hit: CoreChannelSearchHit
     let onOpen: () -> Void
@@ -392,14 +433,7 @@ private struct ChannelSearchResultRow: View {
     var body: some View {
         Button(action: onOpen) {
             HStack(spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(hit.channel.tint.gradient)
-                    Image(systemName: hit.channel.symbolName)
-                        .foregroundStyle(.white)
-                        .font(.headline)
-                }
-                .frame(width: 42, height: 42)
+                ChannelLogoView(channel: hit.channel, size: 42)
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 6) {
@@ -447,10 +481,8 @@ private struct ChannelNavigationRow: View {
     var body: some View {
         ChannelRowView(
             channel: channel,
-            isFavorite: store.favoriteChannelIds.contains(channel.id),
-            onToggleFavorite: {
-                store.toggleFavorite(channel.id)
-            }
+            preview: channel.conversationId.flatMap { store.channelPreviews[$0] },
+            isFavorite: store.favoriteChannelIds.contains(channel.id)
         )
         .contentShape(Rectangle())
         .onTapGesture {
@@ -458,45 +490,35 @@ private struct ChannelNavigationRow: View {
             navigationPath = [channel.id]
         }
         .accessibilityAddTraits(.isButton)
+        .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
+        .listRowBackground(Color.white)
         .swipeActions(edge: .leading, allowsFullSwipe: false) {
             Button {
                 store.toggleFavorite(channel.id)
             } label: {
-                Label("Favorite", systemImage: store.favoriteChannelIds.contains(channel.id) ? "star.slash" : "star")
+                Label(
+                    store.favoriteChannelIds.contains(channel.id) ? "Unpin" : "Pin",
+                    systemImage: store.favoriteChannelIds.contains(channel.id) ? "pin.slash.fill" : "pin.fill"
+                )
             }
-            .tint(.yellow)
+            .tint(.orange)
         }
     }
 }
 
 private struct ChannelRowView: View {
     let channel: CoreChannel
+    let preview: CoreMessage?
     let isFavorite: Bool
-    let onToggleFavorite: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
-            Button(action: onToggleFavorite) {
-                Image(systemName: isFavorite ? "star.fill" : "star")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(isFavorite ? .yellow : .secondary)
-                    .frame(width: 22, height: 22)
-            }
-            .buttonStyle(.plain)
+        HStack(spacing: 11) {
+            ChannelLogoView(channel: channel, size: 40)
 
-            ZStack {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(channel.tint.gradient)
-                Image(systemName: channel.symbolName)
-                    .foregroundStyle(.white)
-                    .font(.headline)
-            }
-            .frame(width: 42, height: 42)
-
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(channel.displayName)
-                        .font(.headline)
+                        .font(.body.weight(.semibold))
                         .lineLimit(1)
 
                     if channel.visibility == .private {
@@ -506,19 +528,31 @@ private struct ChannelRowView: View {
                     }
                 }
 
-                Text(channel.subtitle)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                ChannelPreviewText(preview: preview, fallback: channel.subtitle)
             }
 
-            Spacer(minLength: 8)
+            Spacer(minLength: 4)
 
-            VStack(alignment: .trailing, spacing: 5) {
-                if channel.mentionCount > 0 {
-                    CountBadge(text: "@\(CoreFormat.badgeCount(channel.mentionCount))", color: .red)
-                } else if channel.unreadCount > 0 {
-                    CountBadge(text: CoreFormat.badgeCount(channel.unreadCount), color: .green)
+            VStack(alignment: .trailing, spacing: 4) {
+                if let preview {
+                    Text(CoreFormat.conversationTime(preview.createdAt))
+                        .font(.caption2)
+                        .foregroundStyle(channel.unreadCount > 0 ? Color.green : .secondary)
+                }
+
+                HStack(spacing: 6) {
+                    if isFavorite {
+                        Image(systemName: "pin.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("Pinned")
+                    }
+
+                    if channel.mentionCount > 0 {
+                        CountBadge(text: "@\(CoreFormat.badgeCount(channel.mentionCount))", color: .red)
+                    } else if channel.unreadCount > 0 {
+                        CountBadge(text: CoreFormat.badgeCount(channel.unreadCount), color: .green)
+                    }
                 }
 
                 if channel.visibleAsSuperAdmin {
@@ -528,16 +562,48 @@ private struct ChannelRowView: View {
                 }
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 8)
+    }
+}
+
+private struct ChannelPreviewText: View {
+    let preview: CoreMessage?
+    let fallback: String
+
+    var body: some View {
+        if let preview {
+            HStack(spacing: 5) {
+                if preview.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   let attachment = preview.attachments?.first {
+                    Image(systemName: attachment.isGIF ? "sparkles.rectangle.stack" : attachment.systemImage)
+                        .font(.caption)
+                    Text(attachment.isGIF ? "GIF" : attachment.isImage ? "Photo" : attachment.fileName)
+                } else {
+                    Text(preview.content)
+                }
+            }
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+        } else {
+            Text(fallback)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
     }
 }
 
 private struct ChatDetailView: View {
+    @Environment(\.dismiss) private var dismiss
     @ObservedObject var store: CoreChannelsStore
     let channel: CoreChannel
     @State private var draft = ""
     @State private var replyTarget: CoreMessage?
     @State private var pendingAttachments: [CorePendingAttachment] = []
+    @State private var selectedMessage: CoreMessage?
+    @State private var threadRoot: CoreMessage?
+    @State private var messageToForward: CoreMessage?
     @FocusState private var isComposerFocused: Bool
     private let bottomID = "chat-bottom-anchor"
 
@@ -547,7 +613,11 @@ private struct ChatDetailView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ChannelHeader(channel: channel)
+            ChatTopBar(
+                channel: channel,
+                onBack: { dismiss() },
+                onRefresh: { Task { await store.open(channel, force: true) } }
+            )
 
             if channel.conversationId == nil {
                 ContentUnavailableView(
@@ -575,7 +645,11 @@ private struct ChatDetailView: View {
                                 MessageBubble(
                                     message: message,
                                     isMine: message.userId == store.configuration.userId,
-                                    onReply: { replyTarget = message },
+                                    mentionableUsers: store.members(for: channel),
+                                    currentUserName: store.configuration.displayName,
+                                    onReply: { threadRoot = message },
+                                    onLongPress: { selectedMessage = message },
+                                    onThread: { threadRoot = message },
                                     onReact: { emoji in
                                         Task { await store.react(to: message, emoji: emoji) }
                                     }
@@ -630,6 +704,7 @@ private struct ChatDetailView: View {
                 draft: $draft,
                 replyTarget: $replyTarget,
                 attachments: $pendingAttachments,
+                mentionableUsers: store.members(for: channel),
                 isSending: store.isSending,
                 isFocused: $isComposerFocused,
                 onSend: {
@@ -650,17 +725,44 @@ private struct ChatDetailView: View {
                 }
             )
         }
-        .navigationTitle(channel.displayName)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    Task { await store.open(channel, force: true) }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .accessibilityLabel("Refresh messages")
+        .toolbar(.hidden, for: .navigationBar)
+        .background(Color.white)
+        .overlay {
+            if let selectedMessage {
+                MessageActionOverlay(
+                    message: selectedMessage,
+                    isMine: selectedMessage.userId == store.configuration.userId,
+                    onDismiss: { self.selectedMessage = nil },
+                    onReply: {
+                        threadRoot = selectedMessage
+                        self.selectedMessage = nil
+                    },
+                    onForward: {
+                        messageToForward = selectedMessage
+                        self.selectedMessage = nil
+                    },
+                    onCopy: {
+                        UIPasteboard.general.string = selectedMessage.content
+                        self.selectedMessage = nil
+                    },
+                    onThread: {
+                        threadRoot = selectedMessage
+                        self.selectedMessage = nil
+                    },
+                    onReact: { emoji in
+                        self.selectedMessage = nil
+                        Task { await store.react(to: selectedMessage, emoji: emoji) }
+                    }
+                )
+                .transition(.opacity)
+                .zIndex(20)
             }
+        }
+        .sheet(item: $threadRoot) { message in
+            ThreadView(store: store, channel: channel, root: message)
+        }
+        .sheet(item: $messageToForward) { message in
+            ForwardMessageView(store: store, message: message)
         }
     }
 
@@ -678,29 +780,50 @@ private struct ChatDetailView: View {
     }
 }
 
-private struct ChannelHeader: View {
+private struct ChatTopBar: View {
     let channel: CoreChannel
+    let onBack: () -> Void
+    let onRefresh: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: channel.symbolName)
-                .foregroundStyle(.tint)
-                .font(.headline)
+            Button(action: onBack) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 20, weight: .semibold))
+                    .frame(width: 38, height: 38)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.primary)
+            .accessibilityLabel("Back")
 
-            VStack(alignment: .leading, spacing: 2) {
+            ChannelLogoView(channel: channel, size: 32)
+
+            VStack(alignment: .leading, spacing: 1) {
                 Text(channel.displayName)
                     .font(.subheadline.weight(.semibold))
-                Text(channel.descriptionText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                     .lineLimit(1)
+                Text(channel.visibility == .private ? "Private channel" : "Channel")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
 
             Spacer()
+
+            Button(action: onRefresh) {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 19, weight: .semibold))
+                    .frame(width: 38, height: 38)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.primary)
+            .accessibilityLabel("Refresh messages")
         }
-        .padding(.horizontal)
-        .padding(.vertical, 10)
-        .background(.bar)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color.white)
+        .overlay(alignment: .bottom) {
+            Divider()
+        }
     }
 }
 
@@ -711,7 +834,7 @@ private struct VoiceChannelView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ChannelHeader(channel: channel)
+            VoiceChannelHeader(channel: channel)
 
             Group {
                 if voiceStore.connectedChannel?.id == channel.id, voiceStore.isConnected {
@@ -778,6 +901,27 @@ private struct VoiceChannelView: View {
                 ProgressView("Loading participants")
             }
         }
+    }
+}
+
+private struct VoiceChannelHeader: View {
+    let channel: CoreChannel
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ChannelLogoView(channel: channel, size: 32)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(channel.displayName)
+                    .font(.subheadline.weight(.semibold))
+                Text("Voice channel")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 10)
+        .background(Color.white)
     }
 }
 
@@ -904,8 +1048,7 @@ private struct ConnectedVoiceBar: View {
         HStack(spacing: 12) {
             Button(action: onOpen) {
                 HStack(spacing: 10) {
-                    Image(systemName: "waveform")
-                        .foregroundStyle(Color.green)
+                    ChannelLogoView(channel: channel, size: 34)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(channel.displayName)
                             .font(.subheadline.weight(.semibold))
@@ -961,7 +1104,11 @@ private struct ConnectedVoiceBar: View {
 private struct MessageBubble: View {
     let message: CoreMessage
     let isMine: Bool
+    let mentionableUsers: [CoreUserLite]
+    let currentUserName: String
     let onReply: () -> Void
+    let onLongPress: () -> Void
+    let onThread: () -> Void
     let onReact: (String) -> Void
 
     var body: some View {
@@ -976,7 +1123,7 @@ private struct MessageBubble: View {
                 if !isMine {
                     Text(message.authorName)
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(authorColor)
                 }
 
                 if let parent = message.parent {
@@ -991,12 +1138,21 @@ private struct MessageBubble: View {
                     EmojiAwareText(
                         message.content,
                         font: .body,
-                        color: isMine ? .white : .primary
+                        color: .primary,
+                        mentionableUsers: mentionableUsers,
+                        currentUserName: currentUserName
                     )
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
-                    .background(isMine ? Color.accentColor : Color(.secondarySystemGroupedBackground))
+                    .background(isMine ? Color(red: 0.85, green: 0.97, blue: 0.82) : Color.white)
                     .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay {
+                        if !isMine {
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .stroke(Color.black.opacity(0.06), lineWidth: 1)
+                        }
+                    }
+                    .shadow(color: .black.opacity(isMine ? 0.03 : 0.06), radius: 1, y: 1)
                 }
 
                 if let attachments = message.attachments, !attachments.isEmpty {
@@ -1022,26 +1178,383 @@ private struct MessageBubble: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
-            }
-            .contextMenu {
-                Button {
-                    onReply()
-                } label: {
-                    Label("Reply", systemImage: "arrowshape.turn.up.left")
-                }
 
-                ForEach(["\u{1F44D}", "\u{2764}\u{FE0F}", "\u{1F602}", "\u{1F389}"], id: \.self) { emoji in
-                    Button {
-                        onReact(emoji)
-                    } label: {
-                        EmojiGlyph(emoji, size: 20)
+                if let replyCount = message.replyCount, replyCount > 0 {
+                    Button(action: onThread) {
+                        Label(
+                            "\(replyCount) \(replyCount == 1 ? "reply" : "replies")",
+                            systemImage: "bubble.left.and.bubble.right"
+                        )
+                        .font(.caption.weight(.semibold))
                     }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.accentColor)
                 }
             }
+            .contentShape(Rectangle())
+            .onLongPressGesture(minimumDuration: 0.35, perform: onLongPress)
 
             if !isMine {
                 Spacer(minLength: 52)
             }
+        }
+    }
+
+    private var authorColor: Color {
+        let colors: [Color] = [
+            Color(red: 0.07, green: 0.45, blue: 0.73),
+            Color(red: 0.63, green: 0.20, blue: 0.58),
+            Color(red: 0.84, green: 0.32, blue: 0.18),
+            Color(red: 0.10, green: 0.55, blue: 0.38),
+            Color(red: 0.72, green: 0.42, blue: 0.05)
+        ]
+        let value = message.userId.unicodeScalars.reduce(0) { $0 + Int($1.value) }
+        return colors[value % colors.count]
+    }
+}
+
+private struct MessageActionOverlay: View {
+    let message: CoreMessage
+    let isMine: Bool
+    let onDismiss: () -> Void
+    let onReply: () -> Void
+    let onForward: () -> Void
+    let onCopy: () -> Void
+    let onThread: () -> Void
+    let onReact: (String) -> Void
+
+    private let reactions = ["👍", "❤️", "😂", "😮", "😢", "🙏"]
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.46)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onDismiss)
+
+            VStack(alignment: isMine ? .trailing : .leading, spacing: 8) {
+                HStack(spacing: 4) {
+                    ForEach(reactions, id: \.self) { emoji in
+                        Button {
+                            onReact(emoji)
+                        } label: {
+                            EmojiGlyph(emoji, size: 28)
+                                .frame(width: 40, height: 40)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(.regularMaterial)
+                .clipShape(Capsule())
+
+                MessageContextPreview(message: message, isMine: isMine)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+
+                VStack(spacing: 0) {
+                    MessageActionRow(title: "Reply in thread", systemImage: "arrowshape.turn.up.left", action: onReply)
+                    Divider().padding(.leading, 16)
+                    MessageActionRow(title: "Forward", systemImage: "arrowshape.turn.up.right", action: onForward)
+                    Divider().padding(.leading, 16)
+                    MessageActionRow(title: "Copy", systemImage: "doc.on.doc", action: onCopy)
+                    Divider().padding(.leading, 16)
+                    MessageActionRow(title: "Open thread", systemImage: "bubble.left.and.bubble.right", action: onThread)
+                }
+                .background(.regularMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+            .frame(maxWidth: 300, alignment: isMine ? .trailing : .leading)
+            .padding(.horizontal, 24)
+        }
+        .animation(nil, value: message.id)
+    }
+}
+
+private struct MessageActionRow: View {
+    let title: String
+    let systemImage: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack {
+                Text(title)
+                Spacer()
+                Image(systemName: systemImage)
+                    .font(.title3)
+            }
+            .padding(.horizontal, 16)
+            .frame(height: 50)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct MessageContextPreview: View {
+    let message: CoreMessage
+    let isMine: Bool
+
+    var body: some View {
+        VStack(alignment: isMine ? .trailing : .leading, spacing: 6) {
+            if !isMine {
+                Text(message.authorName)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+
+            if !message.content.isEmpty {
+                EmojiAwareText(
+                    message.content,
+                    font: .body,
+                    color: .primary
+                )
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(isMine ? Color(red: 0.85, green: 0.97, blue: 0.82) : Color.white)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            }
+
+            if let attachment = message.attachments?.first,
+               attachment.isImage,
+               let url = attachment.resolvedURL {
+                AttachmentMediaView(url: url, isGIF: attachment.isGIF)
+                    .frame(width: 220, height: 180)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+
+            Text(CoreFormat.relativeTime(message.createdAt))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .frame(maxWidth: 280, alignment: isMine ? .trailing : .leading)
+        .background(Color(.systemBackground))
+    }
+}
+
+private struct ForwardMessageView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var store: CoreChannelsStore
+    let message: CoreMessage
+
+    var body: some View {
+        NavigationStack {
+            List(store.textChannels) { channel in
+                Button {
+                    Task {
+                        await store.forward(message, to: channel)
+                        if store.lastError == nil {
+                            dismiss()
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 12) {
+                        ChannelLogoView(channel: channel, size: 38)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(channel.displayName)
+                                .foregroundStyle(.primary)
+                            Text(channel.descriptionText)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+                .disabled(store.isSending)
+            }
+            .navigationTitle("Forward to")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+private struct ChannelLogoView: View {
+    let channel: CoreChannel
+    let size: CGFloat
+
+    var body: some View {
+        Group {
+            if let iconURL = channel.metadata?.iconImage.flatMap(URL.init(string:)) {
+                AsyncImage(url: iconURL) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    default:
+                        fallback
+                    }
+                }
+            } else {
+                fallback
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: min(10, size * 0.24), style: .continuous))
+    }
+
+    private var fallback: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: min(10, size * 0.24), style: .continuous)
+                .fill(channel.tint.gradient)
+            Image(systemName: channel.symbolName)
+                .foregroundStyle(.white)
+                .font(.system(size: max(13, size * 0.4), weight: .semibold))
+        }
+    }
+}
+
+private struct ThreadView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var store: CoreChannelsStore
+    let channel: CoreChannel
+    let root: CoreMessage
+
+    @State private var draft = ""
+    @State private var attachments: [CorePendingAttachment] = []
+    @State private var unusedReplyTarget: CoreMessage?
+    @FocusState private var isFocused: Bool
+    private let bottomID = "thread-bottom"
+
+    private var replies: [CoreMessage] {
+        store.threadReplies[root.id] ?? []
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 14) {
+                            ThreadMessageRow(
+                                message: root,
+                                isRoot: true,
+                                mentionableUsers: store.members(for: channel),
+                                currentUserName: store.configuration.displayName
+                            )
+
+                            if store.isLoadingThread[root.id] == true {
+                                ProgressView()
+                                    .frame(maxWidth: .infinity)
+                                    .padding()
+                            } else if replies.isEmpty {
+                                Text("Be the first to reply in this thread.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 28)
+                            } else {
+                                ForEach(replies) { reply in
+                                    ThreadMessageRow(
+                                        message: reply,
+                                        isRoot: false,
+                                        mentionableUsers: store.members(for: channel),
+                                        currentUserName: store.configuration.displayName
+                                    )
+                                }
+                            }
+
+                            Color.clear.frame(height: 1).id(bottomID)
+                        }
+                        .padding()
+                    }
+                    .onChange(of: replies.last?.id) { _, _ in
+                        withAnimation(.snappy) {
+                            proxy.scrollTo(bottomID, anchor: .bottom)
+                        }
+                    }
+                }
+
+                ComposerView(
+                    channel: channel,
+                    draft: $draft,
+                    replyTarget: $unusedReplyTarget,
+                    attachments: $attachments,
+                    mentionableUsers: store.members(for: channel),
+                    isSending: store.isSending,
+                    isFocused: $isFocused,
+                    onSend: {
+                        let text = draft
+                        let pending = attachments
+                        draft = ""
+                        attachments = []
+                        Task {
+                            await store.sendThreadReply(
+                                text,
+                                attachments: pending,
+                                to: root,
+                                in: channel
+                            )
+                        }
+                    }
+                )
+            }
+            .navigationTitle("Thread")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .task(id: root.id) {
+                await store.loadThread(for: root)
+            }
+        }
+    }
+}
+
+private struct ThreadMessageRow: View {
+    let message: CoreMessage
+    let isRoot: Bool
+    let mentionableUsers: [CoreUserLite]
+    let currentUserName: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            AvatarView(name: message.authorName, avatarURL: message.author?.avatarURL)
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Text(message.authorName)
+                        .font(.subheadline.weight(.semibold))
+                    Text(CoreFormat.relativeTime(message.createdAt))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if !message.content.isEmpty {
+                    EmojiAwareText(
+                        message.content,
+                        font: .body,
+                        color: .primary,
+                        mentionableUsers: mentionableUsers,
+                        currentUserName: currentUserName
+                    )
+                }
+
+                if let attachments = message.attachments, !attachments.isEmpty {
+                    AttachmentStrip(attachments: attachments)
+                }
+
+                if isRoot {
+                    Text("Thread")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+
+            Spacer()
+        }
+        .padding(.bottom, isRoot ? 12 : 0)
+        .overlay(alignment: .bottom) {
+            if isRoot { Divider() }
         }
     }
 }
@@ -1051,6 +1564,7 @@ private struct ComposerView: View {
     @Binding var draft: String
     @Binding var replyTarget: CoreMessage?
     @Binding var attachments: [CorePendingAttachment]
+    let mentionableUsers: [CoreUserLite]
     let isSending: Bool
     var isFocused: FocusState<Bool>.Binding
     let onSend: () -> Void
@@ -1063,6 +1577,15 @@ private struct ComposerView: View {
         (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty) &&
         !isLoadingPhotos &&
         !isSending
+    }
+
+    private var mentionSuggestions: [CoreUserLite] {
+        guard let query = mentionQuery else { return [] }
+        return Array(
+            mentionableUsers
+                .filter { query.isEmpty || $0.displayName.localizedCaseInsensitiveContains(query) }
+                .prefix(6)
+        )
     }
 
     var body: some View {
@@ -1097,61 +1620,103 @@ private struct ComposerView: View {
                 )
             }
 
-            HStack(spacing: 10) {
-                Button {
-                    withAnimation(.snappy) {
-                        if showEmojiPicker {
+            if !mentionSuggestions.isEmpty {
+                VStack(spacing: 0) {
+                    ForEach(mentionSuggestions) { user in
+                        Button {
+                            insertMention(user)
+                        } label: {
+                            HStack(spacing: 10) {
+                                AvatarView(name: user.displayName, avatarURL: user.avatarURL)
+                                Text(user.displayName)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                            }
+                            .padding(.horizontal, 12)
+                            .frame(height: 46)
+                        }
+                        .buttonStyle(.plain)
+
+                        if user.id != mentionSuggestions.last?.id {
+                            Divider().padding(.leading, 54)
+                        }
+                    }
+                }
+                .background(Color.white)
+                .overlay(alignment: .top) { Divider() }
+            }
+
+            HStack(alignment: .bottom, spacing: 8) {
+                HStack(alignment: .bottom, spacing: 4) {
+                    Button {
+                        withAnimation(.snappy) {
+                            if showEmojiPicker {
+                                showEmojiPicker = false
+                                isFocused.wrappedValue = true
+                            } else {
+                                isFocused.wrappedValue = false
+                                showEmojiPicker = true
+                            }
+                        }
+                    } label: {
+                        Image(systemName: showEmojiPicker ? "keyboard" : "face.smiling")
+                            .font(.system(size: 20))
+                            .frame(width: 34, height: 38)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(showEmojiPicker ? Color.accentColor : .secondary)
+                    .accessibilityLabel("Emojis")
+
+                    TextField("Message", text: $draft, axis: .vertical)
+                        .textFieldStyle(.plain)
+                        .focused(isFocused)
+                        .lineLimit(1...5)
+                        .padding(.vertical, 9)
+                        .submitLabel(.send)
+                        .onSubmit {
+                            if canSend {
+                                onSend()
+                            }
+                        }
+                        .onTapGesture {
                             showEmojiPicker = false
-                            isFocused.wrappedValue = true
-                        } else {
-                            isFocused.wrappedValue = false
-                            showEmojiPicker = true
                         }
-                    }
-                } label: {
-                    Image(systemName: showEmojiPicker ? "keyboard" : "face.smiling")
-                        .frame(width: 32, height: 32)
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(showEmojiPicker ? Color.accentColor : .secondary)
-                .accessibilityLabel("Emojis")
 
-                PhotosPicker(
-                    selection: $selectedPhotos,
-                    maxSelectionCount: max(1, 5 - attachments.count),
-                    matching: .images
-                ) {
-                    Image(systemName: "photo")
-                        .frame(width: 32, height: 32)
+                    PhotosPicker(
+                        selection: $selectedPhotos,
+                        maxSelectionCount: max(1, 5 - attachments.count),
+                        matching: .images
+                    ) {
+                        Image(systemName: "photo")
+                            .font(.system(size: 19))
+                            .frame(width: 34, height: 38)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .disabled(attachments.count >= 5 || isLoadingPhotos || isSending)
+                    .accessibilityLabel("Add photos or GIFs")
                 }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.secondary)
-                .disabled(attachments.count >= 5 || isLoadingPhotos || isSending)
-                .accessibilityLabel("Add photos or GIFs")
-
-                TextField("Message #\(channel.displayName)", text: $draft, axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
-                    .focused(isFocused)
-                    .lineLimit(1...5)
-                    .submitLabel(.send)
-                    .onSubmit {
-                        if canSend {
-                            onSend()
-                        }
-                    }
-                    .onTapGesture {
-                        showEmojiPicker = false
-                    }
+                .padding(.horizontal, 4)
+                .background(Color(red: 0.95, green: 0.96, blue: 0.96))
+                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
 
                 Button(action: onSend) {
                     Image(systemName: "paperplane.fill")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 42, height: 42)
+                        .background(Color(red: 0.08, green: 0.65, blue: 0.42))
+                        .clipShape(Circle())
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.plain)
                 .disabled(!canSend)
+                .opacity(canSend ? 1 : 0.35)
                 .accessibilityLabel("Send message")
             }
-            .padding()
-            .background(.bar)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 7)
+            .background(Color.white)
 
             if showEmojiPicker {
                 WhatsAppEmojiPicker(
@@ -1173,6 +1738,24 @@ private struct ComposerView: View {
                 showEmojiPicker = false
             }
         }
+    }
+
+    private var mentionQuery: String? {
+        guard let atIndex = draft.lastIndex(of: "@") else { return nil }
+        if atIndex > draft.startIndex {
+            let previous = draft[draft.index(before: atIndex)]
+            guard previous.isWhitespace else { return nil }
+        }
+
+        let query = String(draft[draft.index(after: atIndex)...])
+        guard !query.contains(where: \.isWhitespace) else { return nil }
+        return query
+    }
+
+    private func insertMention(_ user: CoreUserLite) {
+        guard let atIndex = draft.lastIndex(of: "@") else { return }
+        draft.replaceSubrange(atIndex..<draft.endIndex, with: "@\(user.displayName) ")
+        isFocused.wrappedValue = true
     }
 
     private func loadPhotos(_ items: [PhotosPickerItem]) async {
@@ -1325,43 +1908,6 @@ private struct ConfigurationBanner: View {
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(.plain)
-    }
-}
-
-private struct SyncStatusBar: View {
-    @ObservedObject var store: CoreChannelsStore
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: statusIcon)
-                .foregroundStyle(statusColor)
-            Text(statusText)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            Spacer()
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 10)
-        .background(.bar)
-    }
-
-    private var statusIcon: String {
-        if store.isLoading { return "arrow.triangle.2.circlepath" }
-        if store.lastError != nil { return "exclamationmark.triangle.fill" }
-        return store.configuration.isUsable ? "checkmark.circle.fill" : "gearshape.fill"
-    }
-
-    private var statusColor: Color {
-        if store.lastError != nil { return .orange }
-        return store.configuration.isUsable ? .green : .secondary
-    }
-
-    private var statusText: String {
-        if let error = store.lastError { return error }
-        if store.isLoading { return "Syncing Azank React channels" }
-        if store.configuration.isUsable { return "\(store.channels.count) channels synced" }
-        return "Starter mode until Core settings are saved"
     }
 }
 

@@ -78,6 +78,45 @@ final class SupabaseCoreClient {
         return channels.filter { $0.empresaId == empresaId }
     }
 
+    func listMentionableUsers() async throws -> [CoreUserLite] {
+        var query = client
+            .from("profiles")
+            .select("id,full_name,avatar_url,rol_id")
+
+        if let empresaId = configuration.empresaId {
+            query = query.eq("empresa_id", value: empresaId)
+        }
+
+        let users: [CoreUserLite] = try await query
+            .order("full_name", ascending: true)
+            .execute()
+            .value
+
+        return users.map(normalizedAvatarUser)
+    }
+
+    func listChannelMembers(channelId: String) async throws -> [CoreUserLite] {
+        let memberships: [ChannelMemberUserID] = try await client
+            .from("core_channel_members")
+            .select("user_id")
+            .eq("channel_id", value: channelId)
+            .execute()
+            .value
+
+        let userIds = Array(Set(memberships.map(\.userId)))
+        guard !userIds.isEmpty else { return [] }
+
+        let users: [CoreUserLite] = try await client
+            .from("profiles")
+            .select("id,full_name,avatar_url,rol_id")
+            .in("id", values: userIds)
+            .order("full_name", ascending: true)
+            .execute()
+            .value
+
+        return users.map(normalizedAvatarUser)
+    }
+
     func createChannel(name: String, description: String, visibility: CoreChannelVisibility) async throws -> CoreChannel {
         let rows: [CoreChannelCreateResponse] = try await client
             .rpc(
@@ -123,6 +162,40 @@ final class SupabaseCoreClient {
             .value
 
         return loaded
+    }
+
+    func listChannelPreviews(conversationIds: [String]) async throws -> [String: CoreMessage] {
+        guard !conversationIds.isEmpty else { return [:] }
+
+        let limit = min(max(conversationIds.count * 8, 100), 1_000)
+        let loaded: [CoreMessage] = try await client
+            .from("core_messages")
+            .select(Self.messageColumns)
+            .in("conversation_id", values: conversationIds)
+            .is("deleted_at", value: nil)
+            .is("parent_message_id", value: nil)
+            .order("created_at", ascending: false)
+            .limit(limit)
+            .execute()
+            .value
+
+        var previews: [String: CoreMessage] = [:]
+        for message in loaded where previews[message.conversationId] == nil {
+            previews[message.conversationId] = message
+        }
+
+        let previewIDs = previews.values.map(\.id)
+        let attachments = (try? await fetchAttachments(messageIds: previewIDs)) ?? []
+        let attachmentMap = Dictionary(grouping: attachments, by: { $0.messageId ?? "" })
+
+        for (conversationId, message) in previews {
+            var copy = message
+            let metadataAttachments = Self.metadataAttachments(from: message)
+            copy.attachments = attachmentMap[message.id, default: []] + metadataAttachments
+            previews[conversationId] = copy
+        }
+
+        return previews
     }
 
     func listMessages(conversationId: String) async throws -> [CoreMessage] {
@@ -191,6 +264,72 @@ final class SupabaseCoreClient {
 
     func enrichMessages(_ messages: [CoreMessage]) async throws -> [CoreMessage] {
         try await enrich(messages)
+    }
+
+    func listThreadReplies(conversationId: String, parentMessageId: String) async throws -> [CoreMessage] {
+        let replies: [CoreMessage] = try await client
+            .from("core_messages")
+            .select(Self.messageColumns)
+            .eq("conversation_id", value: conversationId)
+            .eq("parent_message_id", value: parentMessageId)
+            .is("deleted_at", value: nil)
+            .order("created_at", ascending: true)
+            .execute()
+            .value
+
+        return try await enrich(replies)
+    }
+
+    func forwardMessage(_ source: CoreMessage, to channel: CoreChannel) async throws -> CoreMessage {
+        guard let conversationId = channel.conversationId else {
+            throw SupabaseCoreError.emptyResponse
+        }
+
+        try await ensureMembership(conversationId: conversationId, channelId: channel.id)
+
+        let row = CoreMessageInsert(
+            empresaId: channel.empresaId,
+            conversationId: conversationId,
+            channelId: channel.id,
+            parentMessageId: nil,
+            userId: configuration.userId,
+            content: source.content
+        )
+        let inserted: [CoreMessage] = try await client
+            .from("core_messages")
+            .insert(row)
+            .select()
+            .execute()
+            .value
+        guard var message = inserted.first else { throw SupabaseCoreError.emptyResponse }
+
+        let attachments = source.attachments ?? []
+        guard !attachments.isEmpty else { return message }
+
+        let rows = attachments.compactMap { attachment -> CoreAttachmentInsert? in
+            guard let path = attachment.path?.nilIfBlank else { return nil }
+            return CoreAttachmentInsert(
+                empresaId: channel.empresaId,
+                messageId: message.id,
+                uploaderId: configuration.userId,
+                bucket: attachment.bucket?.nilIfBlank ?? Self.attachmentsBucket,
+                path: path,
+                fileName: attachment.fileName,
+                mimeType: attachment.mimeType?.nilIfBlank ?? "application/octet-stream",
+                sizeBytes: attachment.sizeBytes ?? 0
+            )
+        }
+
+        if !rows.isEmpty {
+            let saved: [CoreAttachment] = try await client
+                .from("core_attachments")
+                .insert(rows)
+                .select()
+                .execute()
+                .value
+            message.attachments = try await signAttachments(saved)
+        }
+        return message
     }
 
     func enrichRealtimeMessage(_ message: CoreMessage) async -> CoreMessage {
@@ -378,6 +517,7 @@ final class SupabaseCoreClient {
         async let reactionsTask = fetchReactions(messageIds: messages.map(\.id))
         async let attachmentsTask = fetchAttachments(messageIds: messages.map(\.id))
         async let parentsTask = fetchParents(ids: messages.compactMap(\.parentMessageId))
+        async let replyCountsTask = fetchReplyCounts(messageIds: messages.map(\.id))
 
         let userMap = (try? await usersTask) ?? [:]
         let reactionMap = Dictionary(grouping: ((try? await reactionsTask) ?? []), by: \.messageId)
@@ -389,6 +529,7 @@ final class SupabaseCoreClient {
         let parentMap = ((try? await parentsTask) ?? []).reduce(into: [String: CoreMessageQuote]()) {
             $0[$1.id] = $1
         }
+        let replyCounts = (try? await replyCountsTask) ?? [:]
 
         return messages.map { message in
             var copy = message
@@ -398,6 +539,7 @@ final class SupabaseCoreClient {
             if let parentId = message.parentMessageId {
                 copy.parent = parentMap[parentId]
             }
+            copy.replyCount = replyCounts[message.id] ?? 0
             return copy
         }
     }
@@ -438,6 +580,23 @@ final class SupabaseCoreClient {
             .execute()
             .value
         return attachments
+    }
+
+    private func fetchReplyCounts(messageIds: [String]) async throws -> [String: Int] {
+        guard !messageIds.isEmpty else { return [:] }
+
+        let replies: [ParentMessageID] = try await client
+            .from("core_messages")
+            .select("parent_message_id")
+            .in("parent_message_id", values: messageIds)
+            .is("deleted_at", value: nil)
+            .execute()
+            .value
+
+        return replies.reduce(into: [:]) { counts, reply in
+            guard let parentMessageId = reply.parentMessageId else { return }
+            counts[parentMessageId, default: 0] += 1
+        }
     }
 
     private func uploadAttachments(
@@ -690,6 +849,22 @@ private struct ReactionInsert: Encodable {
 
 private struct ReactionID: Decodable {
     var id: String
+}
+
+private struct ParentMessageID: Decodable {
+    var parentMessageId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case parentMessageId = "parent_message_id"
+    }
+}
+
+private struct ChannelMemberUserID: Decodable {
+    var userId: String
+
+    enum CodingKeys: String, CodingKey {
+        case userId = "user_id"
+    }
 }
 
 private struct ConversationMemberUpsert: Encodable {

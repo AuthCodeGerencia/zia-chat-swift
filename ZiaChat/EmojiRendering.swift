@@ -1,6 +1,6 @@
 import SwiftUI
 
-#if canImport(UIKit) && targetEnvironment(simulator)
+#if canImport(UIKit)
 import UIKit
 #endif
 
@@ -97,33 +97,112 @@ struct EmojiAwareText: View {
     let value: String
     let font: Font
     let color: Color
+    let mentionableUsers: [CoreUserLite]
+    let currentUserName: String?
 
-    init(_ value: String, font: Font, color: Color) {
+    init(
+        _ value: String,
+        font: Font,
+        color: Color,
+        mentionableUsers: [CoreUserLite] = [],
+        currentUserName: String? = nil
+    ) {
         self.value = value
         self.font = font
         self.color = color
+        self.mentionableUsers = mentionableUsers
+        self.currentUserName = currentUserName
     }
 
     var body: some View {
         #if targetEnvironment(simulator)
-        SimulatorEmojiText(value: value, font: font, color: color)
+        if needsInteractiveRendering {
+            Text(attributedValue)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            SimulatorEmojiText(value: value, font: font, color: color)
+        }
         #else
         Text(attributedValue)
             .fixedSize(horizontal: false, vertical: true)
         #endif
     }
 
-    private var attributedValue: AttributedString {
-        var result = AttributedString()
-        for character in value {
-            var segment = AttributedString(String(character))
-            if !character.isEmojiCharacter {
-                segment.font = font
-                segment.foregroundColor = color
-            }
-            result.append(segment)
+    private var needsInteractiveRendering: Bool {
+        if value.range(of: #"(?i)(https?://|www\.)\S+"#, options: .regularExpression) != nil {
+            return true
         }
-        return result
+        return mentionableUsers.contains {
+            value.localizedCaseInsensitiveContains("@\($0.displayName)")
+        }
+    }
+
+    private var attributedValue: AttributedString {
+        #if canImport(UIKit)
+        let baseColor = color == .white ? UIColor.white : UIColor.label
+        let result = NSMutableAttributedString(
+            string: value,
+            attributes: [
+                .font: UIFont.preferredFont(forTextStyle: .body),
+                .foregroundColor: baseColor
+            ]
+        )
+        let fullRange = NSRange(location: 0, length: result.length)
+
+        if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) {
+            detector.enumerateMatches(in: value, range: fullRange) { match, _, _ in
+                guard let match, let rawURL = match.url else { return }
+                let url: URL?
+                if rawURL.scheme == nil, rawURL.absoluteString.hasPrefix("www.") {
+                    url = URL(string: "https://\(rawURL.absoluteString)")
+                } else {
+                    url = rawURL
+                }
+                guard let url else { return }
+                result.addAttributes(
+                    [
+                        .link: url,
+                        .foregroundColor: UIColor.systemBlue,
+                        .underlineStyle: NSUnderlineStyle.single.rawValue
+                    ],
+                    range: match.range
+                )
+            }
+        }
+
+        let names = Set(
+            mentionableUsers
+                .map(\.displayName)
+                .filter { !$0.isEmpty }
+        )
+        .sorted { $0.count > $1.count }
+
+        if !names.isEmpty {
+            let pattern = "@(\(names.map(NSRegularExpression.escapedPattern).joined(separator: "|")))(?=$|[\\s.,!?;:)])"
+            if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
+                regex.enumerateMatches(in: value, range: fullRange) { match, _, _ in
+                    guard let match else { return }
+                    let token = (value as NSString).substring(with: match.range)
+                    let mentionedName = String(token.dropFirst())
+                    let isCurrentUser = mentionedName.caseInsensitiveCompare(currentUserName ?? "") == .orderedSame
+                    result.addAttributes(
+                        [
+                            .font: UIFont.preferredFont(forTextStyle: .headline),
+                            .foregroundColor: isCurrentUser ? UIColor.white : UIColor.systemBlue,
+                            .backgroundColor: isCurrentUser
+                                ? UIColor.systemBlue
+                                : UIColor.systemBlue.withAlphaComponent(0.12)
+                        ],
+                        range: match.range
+                    )
+                }
+            }
+        }
+
+        return (try? AttributedString(result, including: \.uiKit)) ?? AttributedString(value)
+        #else
+        return AttributedString(value)
+        #endif
     }
 }
 

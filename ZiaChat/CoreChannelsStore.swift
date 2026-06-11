@@ -6,6 +6,9 @@ final class CoreChannelsStore: ObservableObject {
     @Published var configuration: CoreAppConfiguration
     @Published var channels: [CoreChannel] = CorePreviewData.channels
     @Published var messages: [String: [CoreMessage]] = CorePreviewData.messages
+    @Published var channelPreviews: [String: CoreMessage] = [:]
+    @Published var mentionableUsers: [CoreUserLite] = []
+    @Published var channelMembers: [String: [CoreUserLite]] = [:]
     @Published var selectedChannelId: CoreChannel.ID?
     @Published var favoriteChannelIds: Set<CoreChannel.ID> = []
     @Published var isLoading = false
@@ -15,6 +18,8 @@ final class CoreChannelsStore: ObservableObject {
     @Published var isLoadingMessages: [String: Bool] = [:]
     @Published var isLoadingOlderMessages: [String: Bool] = [:]
     @Published var hasOlderMessages: [String: Bool] = [:]
+    @Published var threadReplies: [String: [CoreMessage]] = [:]
+    @Published var isLoadingThread: [String: Bool] = [:]
     @Published var channelSearchQuery = ""
     @Published var channelSearchResults: [CoreChannelSearchHit] = []
     @Published var isSearchingChannels = false
@@ -98,6 +103,9 @@ final class CoreChannelsStore: ObservableObject {
         save(configuration: next)
         channels = CorePreviewData.channels
         messages = CorePreviewData.messages
+        channelPreviews = [:]
+        mentionableUsers = []
+        channelMembers = [:]
         isLoadingOlderMessages = [:]
         hasOlderMessages = [:]
         selectedChannelId = channels.first?.id
@@ -221,6 +229,10 @@ final class CoreChannelsStore: ObservableObject {
                     fastChannels = try await client.listChannels()
                 }
                 applyChannels(fastChannels)
+                await loadChannelPreviews(using: client)
+                if let users = try? await client.listMentionableUsers() {
+                    mentionableUsers = users
+                }
 
                 Task { @MainActor [weak self] in
                     guard let self, self.configuration.isUsable else { return }
@@ -243,6 +255,18 @@ final class CoreChannelsStore: ObservableObject {
         channels = loadedChannels
         selectedChannelId = selectedChannelId.flatMap(channel(with:))?.id ?? channels.first?.id
         CoreChannelCache.save(loadedChannels, userId: configuration.userId)
+    }
+
+    private func loadChannelPreviews(using client: SupabaseCoreClient) async {
+        let conversationIds = channels.compactMap(\.conversationId)
+        guard !conversationIds.isEmpty else {
+            channelPreviews = [:]
+            return
+        }
+
+        if let previews = try? await client.listChannelPreviews(conversationIds: conversationIds) {
+            channelPreviews = previews
+        }
     }
 
     func channelForNotification(channelId: String?, conversationId: String?) async throws -> CoreChannel? {
@@ -282,6 +306,7 @@ final class CoreChannelsStore: ObservableObject {
             lastError = error.localizedDescription
             return
         }
+        await loadChannelMembers(for: channel, force: force)
         startRealtime(for: channel)
         if !force, messages[conversationId]?.isEmpty == false {
             Task {
@@ -316,6 +341,21 @@ final class CoreChannelsStore: ObservableObject {
         } catch {
             lastError = error.localizedDescription
             isLoadingMessages[conversationId] = false
+        }
+    }
+
+    func members(for channel: CoreChannel) -> [CoreUserLite] {
+        channelMembers[channel.id] ?? []
+    }
+
+    private func loadChannelMembers(for channel: CoreChannel, force: Bool) async {
+        if !force, channelMembers[channel.id] != nil { return }
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            channelMembers[channel.id] = try await client.listChannelMembers(channelId: channel.id)
+        } catch {
+            channelMembers[channel.id] = []
         }
     }
 
@@ -396,6 +436,7 @@ final class CoreChannelsStore: ObservableObject {
                 removeMessage(id: optimisticMessage.id, conversationId: conversationId)
             }
             upsertMessage(message)
+            updateChannelPreview(with: message)
             Task {
                 try? await client.markRead(conversationId: conversationId, lastReadMessageId: message.id)
             }
@@ -406,6 +447,82 @@ final class CoreChannelsStore: ObservableObject {
             lastError = error.localizedDescription
         }
         isSending = false
+    }
+
+    func loadThread(for message: CoreMessage, force: Bool = false) async {
+        if !force, threadReplies[message.id] != nil { return }
+        guard configuration.isUsable else { return }
+
+        isLoadingThread[message.id] = true
+        defer { isLoadingThread[message.id] = false }
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            threadReplies[message.id] = try await client.listThreadReplies(
+                conversationId: message.conversationId,
+                parentMessageId: message.id
+            )
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func sendThreadReply(
+        _ text: String,
+        attachments: [CorePendingAttachment] = [],
+        to root: CoreMessage,
+        in channel: CoreChannel
+    ) async {
+        let content = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !content.isEmpty || !attachments.isEmpty,
+              let conversationId = channel.conversationId else {
+            return
+        }
+
+        isSending = true
+        lastError = nil
+        defer { isSending = false }
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            var reply = try await client.sendMessage(
+                empresaId: channel.empresaId,
+                conversationId: conversationId,
+                channelId: channel.id,
+                parentMessageId: root.id,
+                content: content,
+                attachments: attachments
+            )
+            reply.author = CoreUserLite(
+                id: configuration.userId,
+                fullName: configuration.displayName.isEmpty ? "You" : configuration.displayName
+            )
+            if upsertThreadReply(reply, parentMessageId: root.id) {
+                incrementReplyCount(for: root.id, conversationId: conversationId)
+            }
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func forward(_ message: CoreMessage, to channel: CoreChannel) async {
+        guard configuration.isUsable else { return }
+        isSending = true
+        lastError = nil
+        defer { isSending = false }
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            var forwarded = try await client.forwardMessage(message, to: channel)
+            forwarded.author = CoreUserLite(
+                id: configuration.userId,
+                fullName: configuration.displayName.isEmpty ? "You" : configuration.displayName
+            )
+            upsertMessage(forwarded)
+            updateChannelPreview(with: forwarded)
+        } catch {
+            lastError = error.localizedDescription
+        }
     }
 
     func createChannel(name: String, description: String, visibility: CoreChannelVisibility) async {
@@ -618,8 +735,22 @@ final class CoreChannelsStore: ObservableObject {
 
     private func handleRealtimeInsert(_ message: CoreMessage) async {
         guard message.conversationId == realtimeConversationId else { return }
-        guard message.parentMessageId == nil, message.deletedAt == nil else { return }
+        guard message.deletedAt == nil else { return }
 
+        if let parentMessageId = message.parentMessageId {
+            if threadReplies[parentMessageId] != nil,
+               let client = try? SupabaseCoreClient(configuration: configuration) {
+                let enriched = await client.enrichRealtimeMessage(message)
+                if upsertThreadReply(enriched, parentMessageId: parentMessageId) {
+                    incrementReplyCount(for: parentMessageId, conversationId: message.conversationId)
+                }
+            }
+            return
+        }
+
+        if !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            updateChannelPreview(with: message)
+        }
         removeMatchingOptimisticMessage(for: message)
         let isAttachmentOnly = message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if !isAttachmentOnly {
@@ -632,6 +763,7 @@ final class CoreChannelsStore: ObservableObject {
             let enriched = await client.enrichRealtimeMessage(message)
             if !isAttachmentOnly || enriched.attachments?.isEmpty == false {
                 upsertMessage(enriched)
+                updateChannelPreview(with: enriched)
             }
         }
     }
@@ -645,9 +777,11 @@ final class CoreChannelsStore: ObservableObject {
         }
 
         upsertMessage(message)
+        updateChannelPreview(with: message)
         if let client = try? SupabaseCoreClient(configuration: configuration) {
             let enriched = await client.enrichRealtimeMessage(message)
             upsertMessage(enriched)
+            updateChannelPreview(with: enriched)
         }
     }
 
@@ -757,6 +891,35 @@ final class CoreChannelsStore: ObservableObject {
     private func clearUnreadForActiveConversation(_ conversationId: String) {
         guard let channel = channels.first(where: { $0.conversationId == conversationId }) else { return }
         clearUnread(for: channel.id)
+    }
+
+    private func updateChannelPreview(with message: CoreMessage) {
+        guard message.parentMessageId == nil, message.deletedAt == nil else { return }
+        if let current = channelPreviews[message.conversationId],
+           current.createdAt > message.createdAt {
+            return
+        }
+        channelPreviews[message.conversationId] = message
+    }
+
+    private func incrementReplyCount(for messageId: String, conversationId: String) {
+        guard let index = messages[conversationId]?.firstIndex(where: { $0.id == messageId }) else { return }
+        messages[conversationId]?[index].replyCount = (messages[conversationId]?[index].replyCount ?? 0) + 1
+    }
+
+    @discardableResult
+    private func upsertThreadReply(_ reply: CoreMessage, parentMessageId: String) -> Bool {
+        var replies = threadReplies[parentMessageId, default: []]
+        if let index = replies.firstIndex(where: { $0.id == reply.id }) {
+            replies[index] = reply
+            threadReplies[parentMessageId] = replies
+            return false
+        }
+
+        replies.append(reply)
+        replies.sort { $0.createdAt < $1.createdAt }
+        threadReplies[parentMessageId] = replies
+        return true
     }
 }
 
