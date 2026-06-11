@@ -96,13 +96,19 @@ final class PushNotificationService: NSObject, ObservableObject, UNUserNotificat
 
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
-        didReceive response: UNNotificationResponse
-    ) async {
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
         let destination = Self.destination(from: response.notification.request.content.userInfo)
-        await MainActor.run {
-            receive(destination: destination)
+        completionHandler()
+
+        Task.detached(priority: .userInitiated) {
+            // Keep notification routing outside UIKit's scene-restoration transaction.
+            try? await Task.sleep(for: .milliseconds(750))
+            guard !Task.isCancelled else { return }
+            await PushNotificationService.shared.receive(destination: destination)
+            try? await UNUserNotificationCenter.current().setBadgeCount(0)
         }
-        try? await center.setBadgeCount(0)
     }
 
     nonisolated private static func destination(from userInfo: [AnyHashable: Any]) -> PushNotificationDestination {
