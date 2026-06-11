@@ -381,7 +381,11 @@ final class SupabaseCoreClient {
 
         let userMap = (try? await usersTask) ?? [:]
         let reactionMap = Dictionary(grouping: ((try? await reactionsTask) ?? []), by: \.messageId)
-        let attachmentMap = Dictionary(grouping: ((try? await attachmentsTask) ?? []), by: { $0.messageId ?? "" })
+        let storedAttachments = (try? await attachmentsTask) ?? []
+        let fallbackAttachments = messages.flatMap(Self.metadataAttachments)
+        let allAttachments = (try? await signAttachments(storedAttachments + fallbackAttachments)) ??
+            (storedAttachments + fallbackAttachments)
+        let attachmentMap = Dictionary(grouping: allAttachments, by: { $0.messageId ?? "" })
         let parentMap = ((try? await parentsTask) ?? []).reduce(into: [String: CoreMessageQuote]()) {
             $0[$1.id] = $1
         }
@@ -433,7 +437,7 @@ final class SupabaseCoreClient {
             .in("message_id", values: messageIds)
             .execute()
             .value
-        return try await signAttachments(attachments)
+        return attachments
     }
 
     private func uploadAttachments(
@@ -541,8 +545,31 @@ final class SupabaseCoreClient {
         return formatter.string(from: date)
     }
 
+    private static func metadataAttachments(from message: CoreMessage) -> [CoreAttachment] {
+        (message.metadata?.attachments ?? []).enumerated().compactMap { index, attachment in
+            let path = attachment.path?.nilIfBlank
+            let url = attachment.url?.nilIfBlank
+            guard path != nil || url != nil else { return nil }
+
+            return CoreAttachment(
+                id: "\(message.id)-metadata-\(index)",
+                empresaId: message.empresaId,
+                messageId: message.id,
+                ticketId: nil,
+                uploaderId: message.userId,
+                bucket: attachment.bucket?.nilIfBlank ?? attachmentsBucket,
+                path: path,
+                url: url,
+                fileName: attachment.fileName?.nilIfBlank ?? "archivo",
+                mimeType: attachment.mimeType?.nilIfBlank,
+                sizeBytes: attachment.sizeBytes,
+                createdAt: message.createdAt
+            )
+        }
+    }
+
     nonisolated private static let messageColumns = """
-        id,empresa_id,conversation_id,channel_id,parent_message_id,user_id,content,edited_at,deleted_at,created_at
+        id,empresa_id,conversation_id,channel_id,parent_message_id,user_id,content,edited_at,deleted_at,created_at,metadata
         """
 
     nonisolated private static func decodeDate(_ decoder: Decoder) throws -> Date {

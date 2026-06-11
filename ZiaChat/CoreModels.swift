@@ -261,6 +261,57 @@ struct CorePendingAttachment: Identifiable, Hashable {
     }
 }
 
+struct CoreMessageMetadata: Codable, Hashable {
+    var attachments: [CoreMetadataAttachment]?
+}
+
+struct CoreMetadataAttachment: Codable, Hashable {
+    var bucket: String?
+    var path: String?
+    var url: String?
+    var fileName: String?
+    var mimeType: String?
+    var sizeBytes: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case bucket
+        case path
+        case url
+        case fileName
+        case fileNameSnake = "file_name"
+        case mimeType
+        case mimeTypeSnake = "mime_type"
+        case sizeBytes
+        case sizeBytesSnake = "size_bytes"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        bucket = try? container.decodeIfPresent(String.self, forKey: .bucket)
+        path = try? container.decodeIfPresent(String.self, forKey: .path)
+        url = try? container.decodeIfPresent(String.self, forKey: .url)
+        fileName =
+            (try? container.decodeIfPresent(String.self, forKey: .fileNameSnake)) ??
+            (try? container.decodeIfPresent(String.self, forKey: .fileName))
+        mimeType =
+            (try? container.decodeIfPresent(String.self, forKey: .mimeTypeSnake)) ??
+            (try? container.decodeIfPresent(String.self, forKey: .mimeType))
+        sizeBytes =
+            (try? container.decodeIfPresent(Int.self, forKey: .sizeBytesSnake)) ??
+            (try? container.decodeIfPresent(Int.self, forKey: .sizeBytes))
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(bucket, forKey: .bucket)
+        try container.encodeIfPresent(path, forKey: .path)
+        try container.encodeIfPresent(url, forKey: .url)
+        try container.encodeIfPresent(fileName, forKey: .fileNameSnake)
+        try container.encodeIfPresent(mimeType, forKey: .mimeTypeSnake)
+        try container.encodeIfPresent(sizeBytes, forKey: .sizeBytesSnake)
+    }
+}
+
 struct CoreMessage: Identifiable, Codable, Hashable {
     var id: String
     var empresaId: Int
@@ -272,6 +323,7 @@ struct CoreMessage: Identifiable, Codable, Hashable {
     var editedAt: Date?
     var deletedAt: Date?
     var createdAt: Date
+    var metadata: CoreMessageMetadata? = nil
     var author: CoreUserLite?
     var parent: CoreMessageQuote?
     var reactions: [CoreReaction]?
@@ -289,6 +341,7 @@ struct CoreMessage: Identifiable, Codable, Hashable {
         case editedAt = "edited_at"
         case deletedAt = "deleted_at"
         case createdAt = "created_at"
+        case metadata
     }
 
     var authorName: String {

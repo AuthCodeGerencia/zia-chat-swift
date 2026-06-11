@@ -1058,11 +1058,6 @@ private struct ComposerView: View {
     @State private var selectedPhotos: [PhotosPickerItem] = []
     @State private var isLoadingPhotos = false
     @State private var attachmentError: String?
-    private let emojis = [
-        "\u{1F600}", "\u{1F60A}", "\u{1F64C}", "\u{1F44D}", "\u{1F525}",
-        "\u{2705}", "\u{1F389}", "\u{1F440}", "\u{1F4A1}", "\u{2764}\u{FE0F}",
-        "\u{1F602}", "\u{1F60D}", "\u{1F914}", "\u{1F44F}", "\u{1F680}", "\u{1F4AF}"
-    ]
 
     var canSend: Bool {
         (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty) &&
@@ -1091,27 +1086,6 @@ private struct ComposerView: View {
                 .background(Color(.secondarySystemGroupedBackground))
             }
 
-            if showEmojiPicker {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(emojis, id: \.self) { emoji in
-                            Button {
-                                draft.append(emoji)
-                            } label: {
-                                EmojiGlyph(emoji, size: 22)
-                                    .frame(width: 34, height: 34)
-                                    .background(Color(.secondarySystemGroupedBackground))
-                                    .clipShape(Circle())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Insert emoji")
-                        }
-                    }
-                    .padding(.horizontal)
-                    .padding(.top, 8)
-                }
-            }
-
             if !attachments.isEmpty || isLoadingPhotos || attachmentError != nil {
                 PendingAttachmentStrip(
                     attachments: attachments,
@@ -1126,10 +1100,16 @@ private struct ComposerView: View {
             HStack(spacing: 10) {
                 Button {
                     withAnimation(.snappy) {
-                        showEmojiPicker.toggle()
+                        if showEmojiPicker {
+                            showEmojiPicker = false
+                            isFocused.wrappedValue = true
+                        } else {
+                            isFocused.wrappedValue = false
+                            showEmojiPicker = true
+                        }
                     }
                 } label: {
-                    Image(systemName: "face.smiling")
+                    Image(systemName: showEmojiPicker ? "keyboard" : "face.smiling")
                         .frame(width: 32, height: 32)
                 }
                 .buttonStyle(.borderless)
@@ -1159,6 +1139,9 @@ private struct ComposerView: View {
                             onSend()
                         }
                     }
+                    .onTapGesture {
+                        showEmojiPicker = false
+                    }
 
                 Button(action: onSend) {
                     Image(systemName: "paperplane.fill")
@@ -1169,10 +1152,26 @@ private struct ComposerView: View {
             }
             .padding()
             .background(.bar)
+
+            if showEmojiPicker {
+                WhatsAppEmojiPicker(
+                    onSelect: { draft.append($0) },
+                    onDelete: {
+                        guard !draft.isEmpty else { return }
+                        draft.removeLast()
+                    }
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
         }
         .onChange(of: selectedPhotos) { _, items in
             guard !items.isEmpty else { return }
             Task { await loadPhotos(items) }
+        }
+        .onChange(of: isFocused.wrappedValue) { _, focused in
+            if focused {
+                showEmojiPicker = false
+            }
         }
     }
 
