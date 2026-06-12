@@ -5,6 +5,7 @@ import Combine
 final class CoreChannelsStore: ObservableObject {
     @Published var configuration: CoreAppConfiguration
     @Published var channels: [CoreChannel] = CorePreviewData.channels
+    @Published var directMessages: [CoreDirectMessage] = []
     @Published var messages: [String: [CoreMessage]] = CorePreviewData.messages
     @Published var channelPreviews: [String: CoreMessage] = [:]
     @Published var mentionableUsers: [CoreUserLite] = []
@@ -64,7 +65,7 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     func channel(with id: CoreChannel.ID) -> CoreChannel? {
-        channels.first { $0.id == id }
+        channels.first { $0.id == id } ?? directMessages.first { $0.id == id }?.chatTarget
     }
 
     func save(configuration: CoreAppConfiguration) {
@@ -102,6 +103,7 @@ final class CoreChannelsStore: ObservableObject {
         next.clearSession()
         save(configuration: next)
         channels = CorePreviewData.channels
+        directMessages = []
         messages = CorePreviewData.messages
         channelPreviews = [:]
         mentionableUsers = []
@@ -229,6 +231,9 @@ final class CoreChannelsStore: ObservableObject {
                     fastChannels = try await client.listChannels()
                 }
                 applyChannels(fastChannels)
+                if let loadedDirectMessages = try? await client.listDirectMessages() {
+                    directMessages = loadedDirectMessages
+                }
                 await loadChannelPreviews(using: client)
                 if let users = try? await client.listMentionableUsers() {
                     mentionableUsers = users
@@ -292,6 +297,7 @@ final class CoreChannelsStore: ObservableObject {
         }
         if let conversationId {
             return channels.first { $0.conversationId == conversationId }
+                ?? directMessages.first { $0.id == conversationId }?.chatTarget
         }
         return nil
     }
@@ -345,10 +351,20 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     func members(for channel: CoreChannel) -> [CoreUserLite] {
-        channelMembers[channel.id] ?? []
+        if channel.isDirect,
+           let directMessage = directMessages.first(where: { $0.id == channel.id }) {
+            return [directMessage.peer]
+        }
+        return channelMembers[channel.id] ?? []
     }
 
     private func loadChannelMembers(for channel: CoreChannel, force: Bool) async {
+        if channel.isDirect {
+            if let directMessage = directMessages.first(where: { $0.id == channel.id }) {
+                channelMembers[channel.id] = [directMessage.peer]
+            }
+            return
+        }
         if !force, channelMembers[channel.id] != nil { return }
         do {
             let activeConfiguration = try await ensureFreshSession()
@@ -426,7 +442,7 @@ final class CoreChannelsStore: ObservableObject {
             var message = try await client.sendMessage(
                 empresaId: channel.empresaId,
                 conversationId: conversationId,
-                channelId: channel.id,
+                channelId: channel.isDirect ? nil : channel.id,
                 parentMessageId: parentMessageId,
                 content: content,
                 attachments: attachments
@@ -488,7 +504,7 @@ final class CoreChannelsStore: ObservableObject {
             var reply = try await client.sendMessage(
                 empresaId: channel.empresaId,
                 conversationId: conversationId,
-                channelId: channel.id,
+                channelId: channel.isDirect ? nil : channel.id,
                 parentMessageId: root.id,
                 content: content,
                 attachments: attachments
@@ -895,6 +911,21 @@ final class CoreChannelsStore: ObservableObject {
 
     private func updateChannelPreview(with message: CoreMessage) {
         guard message.parentMessageId == nil, message.deletedAt == nil else { return }
+        if let index = directMessages.firstIndex(where: { $0.id == message.conversationId }) {
+            if let currentDate = directMessages[index].lastMessageCreatedAt,
+               currentDate > message.createdAt {
+                return
+            }
+            directMessages[index].lastMessageId = message.id
+            directMessages[index].lastMessageUserId = message.userId
+            directMessages[index].lastMessageContent = message.content
+            directMessages[index].lastMessageCreatedAt = message.createdAt
+            directMessages[index].updatedAt = message.createdAt
+            directMessages.sort {
+                ($0.lastMessageCreatedAt ?? $0.updatedAt) > ($1.lastMessageCreatedAt ?? $1.updatedAt)
+            }
+            return
+        }
         if let current = channelPreviews[message.conversationId],
            current.createdAt > message.createdAt {
             return

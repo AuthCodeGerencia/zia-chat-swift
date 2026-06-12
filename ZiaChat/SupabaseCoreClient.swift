@@ -78,6 +78,19 @@ final class SupabaseCoreClient {
         return channels.filter { $0.empresaId == empresaId }
     }
 
+    func listDirectMessages() async throws -> [CoreDirectMessage] {
+        let directMessages: [CoreDirectMessage] = try await client
+            .rpc(
+                "core_list_user_dms",
+                params: ListChannelsParams(pDisplayName: configuration.displayName.nilIfBlank)
+            )
+            .execute()
+            .value
+
+        guard let empresaId = configuration.empresaId else { return directMessages }
+        return directMessages.filter { $0.empresaId == empresaId }
+    }
+
     func listMentionableUsers() async throws -> [CoreUserLite] {
         var query = client
             .from("profiles")

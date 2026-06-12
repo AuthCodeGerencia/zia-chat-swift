@@ -92,6 +92,10 @@ struct CoreChannel: Identifiable, Codable, Hashable {
         metadata?.channelType == "voice"
     }
 
+    var isDirect: Bool {
+        metadata?.channelType == "dm"
+    }
+
     var displayName: String {
         name.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "#", with: "")
     }
@@ -107,12 +111,75 @@ struct CoreChannel: Identifiable, Codable, Hashable {
 
     var symbolName: String {
         if isVoice { return "speaker.wave.2.fill" }
+        if isDirect { return "person.fill" }
         return visibility == .private ? "lock.fill" : "number"
     }
 
     var tint: Color {
         if isVoice { return .blue }
         return visibility == .private ? .purple : .teal
+    }
+}
+
+struct CoreDirectMessage: Identifiable, Codable, Hashable {
+    var id: String
+    var empresaId: Int
+    var dmKey: String
+    var createdAt: Date
+    var updatedAt: Date
+    var peerId: String
+    var peerFullName: String?
+    var peerAvatarURLString: String?
+    var peerRoleId: Int?
+    var unreadCount: Int
+    var mentionCount: Int
+    var lastMessageId: String?
+    var lastMessageUserId: String?
+    var lastMessageContent: String?
+    var lastMessageCreatedAt: Date?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case empresaId = "empresa_id"
+        case dmKey = "dm_key"
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+        case peerId = "peer_id"
+        case peerFullName = "peer_full_name"
+        case peerAvatarURLString = "peer_avatar_url"
+        case peerRoleId = "peer_rol_id"
+        case unreadCount = "unread_count"
+        case mentionCount = "mention_count"
+        case lastMessageId = "last_message_id"
+        case lastMessageUserId = "last_message_user_id"
+        case lastMessageContent = "last_message_content"
+        case lastMessageCreatedAt = "last_message_created_at"
+    }
+
+    var peer: CoreUserLite {
+        CoreUserLite(
+            id: peerId,
+            fullName: peerFullName,
+            avatarURLString: peerAvatarURLString,
+            roleId: peerRoleId
+        )
+    }
+
+    var chatTarget: CoreChannel {
+        CoreChannel(
+            id: id,
+            empresaId: empresaId,
+            name: peer.displayName,
+            slug: "dm-\(peerId)",
+            description: "Direct message",
+            visibility: .private,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            metadata: CoreChannelMetadata(channelType: "dm", iconImage: nil),
+            conversationId: id,
+            unreadCount: unreadCount,
+            mentionCount: mentionCount
+        )
     }
 }
 

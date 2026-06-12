@@ -225,6 +225,7 @@ private struct ChannelListView: View {
     @Binding var showingNewChannel: Bool
     @Binding var navigationPath: [CoreChannel.ID]
     @State private var searchText = ""
+    @State private var selectedSection: ChannelListSection = .channels
 
     private var isSearching: Bool {
         !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -239,7 +240,9 @@ private struct ChannelListView: View {
                 .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
             }
 
-            if isSearching {
+            if selectedSection == .direct {
+                directMessageContent
+            } else if isSearching {
                 channelSearchContent
             } else {
                 defaultChannelContent
@@ -267,23 +270,31 @@ private struct ChannelListView: View {
         .searchable(
             text: $searchText,
             placement: .navigationBarDrawer(displayMode: .always),
-            prompt: "Buscar palabras clave en canales"
+            prompt: selectedSection == .channels ? "Buscar palabras clave en canales" : "Buscar chats directos"
         )
         .onChange(of: searchText) { _, newValue in
-            store.updateChannelSearch(newValue)
+            if selectedSection == .channels {
+                store.updateChannelSearch(newValue)
+            }
         }
-        .navigationTitle("ZiaChat")
+        .onChange(of: selectedSection) { _, _ in
+            searchText = ""
+            store.clearChannelSearch()
+        }
+        .navigationTitle(selectedSection == .channels ? "ZiaChat" : "Directos")
         .toolbarBackground(Color.white, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    showingNewChannel = true
-                } label: {
-                    Image(systemName: "square.and.pencil")
+                if selectedSection == .channels {
+                    Button {
+                        showingNewChannel = true
+                    } label: {
+                        Image(systemName: "square.and.pencil")
+                    }
+                    .disabled(!store.configuration.isUsable)
+                    .accessibilityLabel("New channel")
                 }
-                .disabled(!store.configuration.isUsable)
-                .accessibilityLabel("New channel")
             }
         }
         .safeAreaInset(edge: .bottom) {
@@ -300,10 +311,48 @@ private struct ChannelListView: View {
                 }
 
                 ChannelBottomBar(
+                    selection: $selectedSection,
                     onSettings: { showingSettings = true },
                     onSignOut: { store.signOut() }
                 )
             }
+        }
+    }
+
+    @ViewBuilder
+    private var directMessageContent: some View {
+        if filteredDirectMessages.isEmpty {
+            ContentUnavailableView(
+                searchText.isEmpty ? "No hay chats directos" : "Sin resultados",
+                systemImage: searchText.isEmpty ? "person.2" : "magnifyingglass",
+                description: Text(
+                    searchText.isEmpty
+                        ? "Tus conversaciones directas de Azank aparecerán aquí."
+                        : "No encontramos un chat directo con ese nombre."
+                )
+            )
+            .listRowSeparator(.hidden)
+        } else {
+            Section {
+                ForEach(filteredDirectMessages) { directMessage in
+                    DirectMessageRow(directMessage: directMessage)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            store.selectedChannelId = directMessage.id
+                            navigationPath = [directMessage.id]
+                        }
+                        .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
+                        .listRowBackground(Color.white)
+                }
+            }
+        }
+    }
+
+    private var filteredDirectMessages: [CoreDirectMessage] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return store.directMessages }
+        return store.directMessages.filter {
+            $0.peer.displayName.localizedCaseInsensitiveContains(query)
         }
     }
 
@@ -380,19 +429,40 @@ private struct ChannelListView: View {
     }
 }
 
+private enum ChannelListSection {
+    case channels
+    case direct
+}
+
 private struct ChannelBottomBar: View {
+    @Binding var selection: ChannelListSection
     let onSettings: () -> Void
     let onSignOut: () -> Void
 
     var body: some View {
         HStack {
-            VStack(spacing: 3) {
-                Image(systemName: "bubble.left.and.bubble.right.fill")
-                    .font(.system(size: 20, weight: .semibold))
-                Text("Chats")
-                    .font(.caption2.weight(.semibold))
+            Button {
+                selection = .channels
+            } label: {
+                BottomBarItem(
+                    title: "Canales",
+                    symbol: selection == .channels ? "bubble.left.and.bubble.right.fill" : "bubble.left.and.bubble.right",
+                    selected: selection == .channels
+                )
             }
-            .foregroundStyle(Color.accentColor)
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity)
+
+            Button {
+                selection = .direct
+            } label: {
+                BottomBarItem(
+                    title: "Directos",
+                    symbol: selection == .direct ? "person.2.fill" : "person.2",
+                    selected: selection == .direct
+                )
+            }
+            .buttonStyle(.plain)
             .frame(maxWidth: .infinity)
 
             Menu {
@@ -419,6 +489,62 @@ private struct ChannelBottomBar: View {
         .overlay(alignment: .top) {
             Divider()
         }
+    }
+}
+
+private struct BottomBarItem: View {
+    let title: String
+    let symbol: String
+    let selected: Bool
+
+    var body: some View {
+        VStack(spacing: 3) {
+            Image(systemName: symbol)
+                .font(.system(size: 20, weight: .semibold))
+            Text(title)
+                .font(.caption2.weight(.semibold))
+        }
+        .foregroundStyle(selected ? Color.accentColor : .secondary)
+    }
+}
+
+private struct DirectMessageRow: View {
+    let directMessage: CoreDirectMessage
+
+    var body: some View {
+        HStack(spacing: 11) {
+            AvatarView(name: directMessage.peer.displayName, avatarURL: directMessage.peer.avatarURL)
+                .frame(width: 42, height: 42)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(directMessage.peer.displayName)
+                    .font(.body.weight(.semibold))
+                    .lineLimit(1)
+                Text(directMessage.lastMessageContent.flatMap(nonBlankText) ?? "Sin mensajes todavía")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 4)
+
+            VStack(alignment: .trailing, spacing: 5) {
+                if let date = directMessage.lastMessageCreatedAt {
+                    Text(CoreFormat.conversationTime(date))
+                        .font(.caption2)
+                        .foregroundStyle(directMessage.unreadCount > 0 ? Color.green : .secondary)
+                }
+                if directMessage.unreadCount > 0 {
+                    CountBadge(text: CoreFormat.badgeCount(directMessage.unreadCount), color: .green)
+                }
+            }
+        }
+        .padding(.vertical, 8)
+    }
+
+    private func nonBlankText(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 
@@ -1112,7 +1238,7 @@ private struct MessageBubble: View {
     let onReact: (String) -> Void
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 8) {
+        HStack(alignment: .top, spacing: 8) {
             if isMine {
                 Spacer(minLength: 52)
             } else {
