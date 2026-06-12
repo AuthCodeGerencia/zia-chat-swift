@@ -2888,6 +2888,8 @@ private struct ComposerView: View {
     @State private var selectedPhotos: [PhotosPickerItem] = []
     @State private var isLoadingPhotos = false
     @State private var attachmentError: String?
+    @State private var mediaEditorItems: [MediaEditorItem] = []
+    @State private var showMediaEditor = false
 
     var canSend: Bool {
         (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty) &&
@@ -3070,8 +3072,22 @@ private struct ComposerView: View {
             isPresented: $showPhotoPicker,
             selection: $selectedPhotos,
             maxSelectionCount: max(1, 5 - attachments.count),
-            matching: .images
+            matching: .any(of: [.images, .videos])
         )
+        .fullScreenCover(isPresented: $showMediaEditor) {
+            MediaEditorView(
+                items: mediaEditorItems,
+                onCancel: {
+                    showMediaEditor = false
+                    mediaEditorItems = []
+                },
+                onSend: { editedAttachments, caption in
+                    showMediaEditor = false
+                    mediaEditorItems = []
+                    sendEditedMedia(editedAttachments, caption: caption)
+                }
+            )
+        }
         .fileImporter(
             isPresented: $showFileImporter,
             allowedContentTypes: [.item],
@@ -3276,29 +3292,93 @@ private struct ComposerView: View {
             isLoadingPhotos = false
         }
 
+        var editorItems: [MediaEditorItem] = []
+
         for item in items.prefix(max(0, 5 - attachments.count)) {
             do {
-                guard let data = try await item.loadTransferable(type: Data.self) else { continue }
-                guard data.count <= 15 * 1_024 * 1_024 else {
-                    attachmentError = "Each image or GIF must be 15 MB or smaller."
+                let isVideo = item.supportedContentTypes.contains { $0.conforms(to: .movie) }
+
+                if isVideo {
+                    // El video se transfiere como archivo (sin cargarlo completo
+                    // en memoria); el editor lo comprime/recorta y se validan
+                    // 15 MB tras exportar.
+                    guard let movie = try await item.loadTransferable(type: PickedMovie.self) else { continue }
+                    let fileSize = (try? FileManager.default
+                        .attributesOfItem(atPath: movie.url.path)[.size] as? Int) ?? 0
+                    guard fileSize <= 500 * 1_024 * 1_024 else {
+                        try? FileManager.default.removeItem(at: movie.url)
+                        attachmentError = "El video es demasiado grande (máx. 500 MB)."
+                        continue
+                    }
+                    let ext = movie.url.pathExtension.lowercased()
+                    editorItems.append(
+                        MediaEditorItem(
+                            videoURL: movie.url,
+                            fileName: movie.url.lastPathComponent,
+                            mimeType: ext == "mov" ? "video/quicktime" : "video/mp4"
+                        )
+                    )
                     continue
                 }
 
-                let contentType = item.supportedContentTypes.first(where: {
-                    $0.conforms(to: .gif)
-                }) ?? item.supportedContentTypes.first(where: {
-                    $0.conforms(to: .image)
-                }) ?? .jpeg
-                let extensionName = contentType.preferredFilenameExtension ?? "jpg"
-                attachments.append(
-                    CorePendingAttachment(
-                        data: data,
-                        fileName: "image-\(UUID().uuidString).\(extensionName)",
-                        mimeType: contentType.preferredMIMEType ?? "image/jpeg"
+                guard let data = try await item.loadTransferable(type: Data.self) else { continue }
+                let isGIF = item.supportedContentTypes.contains { $0.conforms(to: .gif) }
+
+                if isGIF {
+                    // Los GIF animados se envían tal cual (editarlos rompería la animación).
+                    guard data.count <= 15 * 1_024 * 1_024 else {
+                        attachmentError = "Cada GIF debe pesar 15 MB o menos."
+                        continue
+                    }
+                    attachments.append(
+                        CorePendingAttachment(
+                            data: data,
+                            fileName: "image-\(UUID().uuidString).gif",
+                            mimeType: "image/gif"
+                        )
                     )
-                )
+                } else if let image = UIImage(data: data) {
+                    guard data.count <= 60 * 1_024 * 1_024 else {
+                        attachmentError = "La imagen es demasiado grande (máx. 60 MB)."
+                        continue
+                    }
+                    editorItems.append(
+                        MediaEditorItem(
+                            image: image,
+                            fileName: "image-\(UUID().uuidString).jpg",
+                            mimeType: "image/jpeg"
+                        )
+                    )
+                }
             } catch {
                 attachmentError = error.localizedDescription
+            }
+        }
+
+        if !editorItems.isEmpty {
+            mediaEditorItems = editorItems
+            showMediaEditor = true
+        }
+    }
+
+    /// Envía los medios ya editados (crop/dibujo/trim/calidad) con su caption,
+    /// respetando hilo y respuesta citada, igual que las notas de voz.
+    private func sendEditedMedia(_ editedAttachments: [CorePendingAttachment], caption: String) {
+        guard !editedAttachments.isEmpty else { return }
+        attachmentError = nil
+        let quoted = threadParentId == nil ? replyTarget : nil
+        Task {
+            await store.send(
+                caption,
+                attachments: editedAttachments,
+                in: channel,
+                parentMessageId: threadParentId,
+                replyTo: quoted
+            )
+            if let error = store.lastError {
+                attachmentError = "No se pudo enviar: \(error)"
+            } else {
+                replyTarget = nil
             }
         }
     }
