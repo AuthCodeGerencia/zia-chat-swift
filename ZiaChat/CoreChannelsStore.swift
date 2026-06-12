@@ -29,6 +29,9 @@ final class CoreChannelsStore: ObservableObject {
     @Published var isLoadingThread: [String: Bool] = [:]
     @Published var channelThreads: [String: [CoreThreadSummary]] = [:]
     @Published var isLoadingChannelThreads: [String: Bool] = [:]
+    @Published var isLoadingAllThreads = false
+    /// conversationId → (userId → lastReadAt). Recibos de lectura por conversación.
+    @Published var conversationReads: [String: [String: Date]] = [:]
     @Published var channelSearchQuery = ""
     @Published var channelSearchResults: [CoreChannelSearchHit] = []
     @Published var isSearchingChannels = false
@@ -503,6 +506,45 @@ final class CoreChannelsStore: ObservableObject {
         }
     }
 
+    // MARK: - Recibos de lectura
+
+    /// Carga las marcas de lectura de todos los miembros de la conversación.
+    func loadConversationReads(for channel: CoreChannel) async {
+        guard let conversationId = channel.conversationId, configuration.isUsable else { return }
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let reads = try await client.listConversationReads(conversationId: conversationId)
+            conversationReads[conversationId] = Dictionary(
+                reads.map { ($0.userId, $0.lastReadAt) },
+                uniquingKeysWith: max
+            )
+        } catch {
+            // Los recibos de lectura no son críticos; no se reporta el error.
+        }
+    }
+
+    /// Miembros (excluyendo al autor) que ya leyeron un mensaje: su marca de
+    /// lectura es posterior o igual a la fecha del mensaje.
+    func readers(of message: CoreMessage, in channel: CoreChannel) -> [CoreUserLite] {
+        let reads = conversationReads[message.conversationId] ?? [:]
+        return members(for: channel).filter { member in
+            guard member.id != message.userId else { return false }
+            guard let readAt = reads[member.id] else { return false }
+            return readAt >= message.createdAt
+        }
+    }
+
+    /// Palomitas de un mensaje propio: ✓ enviado, ✓✓ gris leído por algunos,
+    /// ✓✓ azul leído por todos los demás miembros.
+    func receipt(for message: CoreMessage, in channel: CoreChannel) -> MessageReceipt {
+        let recipients = members(for: channel).filter { $0.id != message.userId }
+        guard !recipients.isEmpty else { return .sent }
+        let readCount = readers(of: message, in: channel).count
+        if readCount == 0 { return .sent }
+        return readCount < recipients.count ? .readBySome : .readByAll
+    }
+
     func members(for channel: CoreChannel) -> [CoreUserLite] {
         if channel.isDirect,
            let directMessage = directMessages.first(where: { $0.id == channel.id }) {
@@ -753,6 +795,28 @@ final class CoreChannelsStore: ObservableObject {
             channelThreads[conversationId] = try await client.listChannelThreads(conversationId: conversationId)
         } catch {
             lastError = error.localizedDescription
+        }
+    }
+
+    /// Carga los threads de todos los canales de texto (filtro "Hilos" del index).
+    /// Con `force == false` solo consulta los canales que aún no tienen threads
+    /// en memoria, así el refresco incremental es barato.
+    func loadAllChannelThreads(force: Bool = false) async {
+        guard configuration.isUsable else { return }
+        let targets = textChannels.filter { channel in
+            guard let conversationId = channel.conversationId else { return false }
+            return force || channelThreads[conversationId] == nil
+        }
+        guard !targets.isEmpty else { return }
+
+        isLoadingAllThreads = true
+        defer { isLoadingAllThreads = false }
+        await withTaskGroup(of: Void.self) { group in
+            for channel in targets {
+                group.addTask { [weak self] in
+                    await self?.loadChannelThreads(for: channel, force: force)
+                }
+            }
         }
     }
 

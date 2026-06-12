@@ -194,6 +194,9 @@ final class VideoEditState: ObservableObject {
 struct MediaEditorView: View {
     let onCancel: () -> Void
     let onSend: ([CorePendingAttachment], String) -> Void
+    /// Guarda la imagen actual (ya editada) como sticker. Devuelve `true` si
+    /// se subió correctamente. `nil` oculta el botón de sticker.
+    let onSaveSticker: ((Data) async -> Bool)?
 
     @State private var items: [MediaEditorItem]
     @State private var selectedIndex = 0
@@ -201,20 +204,27 @@ struct MediaEditorView: View {
     @State private var editingMode: EditingMode = .none
     @State private var isExporting = false
     @State private var exportError: String?
+    @State private var stickerSaveState: StickerSaveState = .idle
     @FocusState private var captionFocused: Bool
 
     private enum EditingMode {
         case none, crop, draw
     }
 
+    private enum StickerSaveState: Equatable {
+        case idle, saving, saved, failed
+    }
+
     init(
         items: [MediaEditorItem],
         onCancel: @escaping () -> Void,
-        onSend: @escaping ([CorePendingAttachment], String) -> Void
+        onSend: @escaping ([CorePendingAttachment], String) -> Void,
+        onSaveSticker: ((Data) async -> Bool)? = nil
     ) {
         _items = State(initialValue: items)
         self.onCancel = onCancel
         self.onSend = onSend
+        self.onSaveSticker = onSaveSticker
     }
 
     private var currentItem: MediaEditorItem? {
@@ -322,13 +332,61 @@ struct MediaEditorView: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Dibujar")
+
+                    if onSaveSticker != nil {
+                        stickerButton
+                    }
                 }
 
                 qualityToggle(for: item)
             }
         }
         .padding(.horizontal, 8)
-        .padding(.top, 4)
+        // Margen extra bajo el notch/Dynamic Island para que las herramientas
+        // (cerrar, recortar, dibujar, HD) no queden pegadas al borde.
+        .padding(.top, 16)
+        .padding(.bottom, 4)
+    }
+
+    /// Guarda la imagen actual como sticker en la colección de la empresa.
+    private var stickerButton: some View {
+        Button {
+            saveCurrentAsSticker()
+        } label: {
+            Group {
+                switch stickerSaveState {
+                case .idle:
+                    Image(systemName: "face.smiling")
+                case .saving:
+                    ProgressView().tint(.white).controlSize(.small)
+                case .saved:
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(Color(red: 0.18, green: 0.85, blue: 0.55))
+                case .failed:
+                    Image(systemName: "exclamationmark.circle")
+                        .foregroundStyle(.orange)
+                }
+            }
+            .font(.system(size: 18, weight: .medium))
+            .foregroundStyle(.white)
+            .frame(width: 40, height: 40)
+        }
+        .buttonStyle(.plain)
+        .disabled(stickerSaveState == .saving)
+        .accessibilityLabel("Guardar como sticker")
+    }
+
+    private func saveCurrentAsSticker() {
+        guard let onSaveSticker,
+              let image = currentItem?.image,
+              let data = image.pngData() else { return }
+        stickerSaveState = .saving
+        Task {
+            let ok = await onSaveSticker(data)
+            stickerSaveState = ok ? .saved : .failed
+            try? await Task.sleep(for: .seconds(2))
+            stickerSaveState = .idle
+        }
     }
 
     private func qualityToggle(for item: MediaEditorItem) -> some View {
@@ -793,6 +851,7 @@ private struct ImageCropView: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
+            .padding(.top, 8)
 
             GeometryReader { geometry in
                 ZStack {
@@ -1039,6 +1098,7 @@ private struct ImageDrawView: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
+            .padding(.top, 8)
 
             GeometryReader { geometry in
                 let fitted = fittedFrame(in: geometry.size)

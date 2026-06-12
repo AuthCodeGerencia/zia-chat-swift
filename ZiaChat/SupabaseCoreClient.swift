@@ -436,7 +436,7 @@ final class SupabaseCoreClient {
             )
         } else {
             do {
-                loaded = try await client
+                let fromRPC: [CoreMessage] = try await client
                     .rpc(
                         "core_list_zia_messages",
                         params: ListMessagesParams(
@@ -446,6 +446,19 @@ final class SupabaseCoreClient {
                     )
                     .execute()
                     .value
+                // El RPC hace JOIN con core_channels, así que para los DMs
+                // (channel_id NULL) devuelve vacío sin error. Si no trae nada,
+                // reintenta con la consulta directa (RLS) antes de asumir que
+                // la conversación está realmente vacía.
+                if fromRPC.isEmpty {
+                    loaded = try await messagePageQuery(
+                        conversationId: conversationId,
+                        before: nil,
+                        limit: limit
+                    )
+                } else {
+                    loaded = fromRPC
+                }
             } catch {
                 loaded = try await messagePageQuery(
                     conversationId: conversationId,
@@ -782,14 +795,27 @@ final class SupabaseCoreClient {
 
     func listStickers() async throws -> [CoreSticker] {
         guard let empresaId = configuration.empresaId else { return [] }
-        let rows: [CoreSticker] = try await client
-            .from("core_stickers")
-            .select("id,name,image_url")
-            .eq("empresa_id", value: empresaId)
-            .order("name", ascending: true)
-            .execute()
-            .value
-        return rows
+        do {
+            let rows: [CoreSticker] = try await client
+                .from("core_stickers")
+                .select("id,name,image_url,created_by")
+                .eq("empresa_id", value: empresaId)
+                .order("name", ascending: true)
+                .execute()
+                .value
+            return rows
+        } catch {
+            // Si la migración created_by aún no está aplicada, cae al select
+            // anterior para no romper el picker.
+            let rows: [CoreSticker] = try await client
+                .from("core_stickers")
+                .select("id,name,image_url")
+                .eq("empresa_id", value: empresaId)
+                .order("name", ascending: true)
+                .execute()
+                .value
+            return rows
+        }
     }
 
     /// Uploads a sticker via the web app's `/api/core/stickers` route (same
@@ -855,6 +881,19 @@ final class SupabaseCoreClient {
             .from("core_reactions")
             .insert(row)
             .execute()
+    }
+
+    /// Lee las marcas de lectura de todos los miembros de una conversación
+    /// (visible dentro de la empresa gracias a la RLS de core_message_reads).
+    /// Sirve para los recibos de lectura: palomitas y "Vistos por".
+    func listConversationReads(conversationId: String) async throws -> [CoreConversationRead] {
+        let rows: [CoreConversationRead] = try await client
+            .from("core_message_reads")
+            .select("user_id,last_read_at")
+            .eq("conversation_id", value: conversationId)
+            .execute()
+            .value
+        return rows
     }
 
     func markRead(conversationId: String, lastReadMessageId: String?) async throws {

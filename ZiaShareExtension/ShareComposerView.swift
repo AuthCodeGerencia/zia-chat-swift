@@ -27,6 +27,11 @@ struct ShareComposerView: View {
     @State private var attachments: [CorePendingAttachment] = []
     @State private var oversizedNames: [String] = []
     @State private var errorText: String?
+    @State private var saveAsStickers = false
+
+    private var imageAttachments: [CorePendingAttachment] {
+        attachments.filter { $0.mimeType.hasPrefix("image/") }
+    }
 
     var body: some View {
         NavigationStack {
@@ -42,7 +47,7 @@ struct ShareComposerView: View {
                         if phase == .sending {
                             ProgressView()
                         } else {
-                            Button("Enviar") {
+                            Button(saveAsStickers ? "Guardar" : "Enviar") {
                                 Task { await send() }
                             }
                             .fontWeight(.semibold)
@@ -83,8 +88,10 @@ struct ShareComposerView: View {
         case .sent:
             statusView(
                 symbol: "checkmark.circle.fill",
-                title: "Enviado",
-                message: "Tu contenido se envió al canal.",
+                title: saveAsStickers ? "Stickers guardados" : "Enviado",
+                message: saveAsStickers
+                    ? "Los stickers ya están en tu colección de Zia."
+                    : "Tu contenido se envió al canal.",
                 tint: ZenitBrand.teal
             )
 
@@ -95,6 +102,24 @@ struct ShareComposerView: View {
 
     private var composer: some View {
         List {
+            if let errorText {
+                Section {
+                    Text(errorText)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
+
+            if !imageAttachments.isEmpty {
+                Section {
+                    Toggle(isOn: $saveAsStickers) {
+                        Label("Guardar como stickers", systemImage: "face.smiling")
+                    }
+                } footer: {
+                    Text("Agrega las imágenes (por ejemplo, stickers .webp compartidos desde WhatsApp) a tu colección de stickers de Zia en lugar de enviarlas a un canal.")
+                }
+            }
+
             if !attachments.isEmpty || !oversizedNames.isEmpty {
                 Section("Adjuntos") {
                     ForEach(attachments) { attachment in
@@ -121,17 +146,13 @@ struct ShareComposerView: View {
                 }
             }
 
+            if !saveAsStickers {
             Section("Mensaje") {
                 TextField("Escribe un mensaje…", text: $messageText, axis: .vertical)
                     .lineLimit(1...6)
             }
 
             Section("Enviar al canal") {
-                if let errorText {
-                    Text(errorText)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                }
                 if filteredChannels.isEmpty {
                     Text(searchText.isEmpty ? "No hay canales disponibles." : "Sin resultados para “\(searchText)”.")
                         .foregroundStyle(.secondary)
@@ -159,6 +180,7 @@ struct ShareComposerView: View {
                         }
                     }
                 }
+            }
             }
         }
         .searchable(text: $searchText, prompt: "Buscar canal")
@@ -198,7 +220,9 @@ struct ShareComposerView: View {
     }
 
     private var canSend: Bool {
-        guard phase == .ready, selectedChannelId != nil else { return false }
+        guard phase == .ready else { return false }
+        if saveAsStickers { return !imageAttachments.isEmpty }
+        guard selectedChannelId != nil else { return false }
         let hasText = !messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         return hasText || !attachments.isEmpty
     }
@@ -245,6 +269,10 @@ struct ShareComposerView: View {
     }
 
     private func send() async {
+        if saveAsStickers {
+            await saveStickers()
+            return
+        }
         guard let channel = channels.first(where: { $0.id == selectedChannelId }),
               let conversationId = channel.conversationId else { return }
 
@@ -262,6 +290,34 @@ struct ShareComposerView: View {
             )
             phase = .sent
             try? await Task.sleep(for: .milliseconds(700))
+            onFinish()
+        } catch {
+            phase = .ready
+            errorText = error.localizedDescription
+        }
+    }
+
+    /// Guarda las imágenes compartidas (p. ej. stickers de WhatsApp) en la
+    /// colección de stickers de Zia, detectando el formato real (.webp, .png…).
+    private func saveStickers() async {
+        phase = .sending
+        errorText = nil
+        do {
+            let client = try SupabaseCoreClient(configuration: configuration)
+            for (index, attachment) in imageAttachments.enumerated() {
+                let format = StickerImageFormat.detect(attachment.data)
+                let base = (attachment.fileName as NSString).deletingPathExtension
+                let name = base.isEmpty ? "Sticker \(index + 1)" : base
+                let fileName = "sticker-\(Int(Date().timeIntervalSince1970 * 1000))-\(index).\(format.fileExtension)"
+                _ = try await client.uploadSticker(
+                    name: name,
+                    data: attachment.data,
+                    fileName: fileName,
+                    mimeType: format.mimeType
+                )
+            }
+            phase = .sent
+            try? await Task.sleep(for: .milliseconds(900))
             onFinish()
         } catch {
             phase = .ready

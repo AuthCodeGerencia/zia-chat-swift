@@ -2,6 +2,8 @@ import SwiftUI
 import Combine
 import PhotosUI
 import AVFoundation
+import UIKit
+import UniformTypeIdentifiers
 
 // MARK: - Models
 // CoreSticker, CorePoll y CorePollOption viven en CoreModels.swift para que
@@ -259,6 +261,28 @@ extension CoreChannelsStore {
         }
     }
 
+    /// Descarga la imagen/sticker de un mensaje recibido y la guarda en la
+    /// colección de stickers del usuario (visible también en el stock global).
+    func saveStickerFromAttachment(_ attachment: CoreAttachment) async -> Bool {
+        guard let url = attachment.resolvedURL else { return false }
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            let format = StickerImageFormat.detect(data)
+            let base = (attachment.fileName as NSString).deletingPathExtension
+            let name = base.isEmpty ? "Sticker" : base
+            let fileName = "sticker-\(Int(Date().timeIntervalSince1970 * 1000)).\(format.fileExtension)"
+            return await uploadSticker(
+                name: name,
+                data: data,
+                fileName: fileName,
+                mimeType: format.mimeType
+            ) != nil
+        } catch {
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
     /// Sends a recorded voice note as an audio attachment.
     func sendVoiceNote(
         data: Data,
@@ -321,7 +345,7 @@ enum ComposerTool: String, CaseIterable, Identifiable {
         case .poll: return "Encuesta"
         case .emoji: return "Emoji"
         case .gif: return "GIF"
-        case .sticker: return "Regalo"
+        case .sticker: return "Sticker"
         }
     }
 
@@ -334,7 +358,7 @@ enum ComposerTool: String, CaseIterable, Identifiable {
         case .poll: return "chart.bar"
         case .emoji: return "face.smiling"
         case .gif: return "rectangle.stack.badge.play"
-        case .sticker: return "gift"
+        case .sticker: return "face.smiling.inverse"
         }
     }
 
@@ -590,14 +614,27 @@ struct StickerPickerPanel: View {
     @State private var isLoading = false
     @State private var didLoad = false
     @State private var uploadItem: PhotosPickerItem?
+    @State private var showPhotosPicker = false
+    @State private var showFileImporter = false
     @State private var isUploading = false
+    @State private var importHint: String?
+    @State private var scope: StickerScope = .global
+
+    enum StickerScope: String, CaseIterable {
+        case global = "Globales"
+        case mine = "Míos"
+    }
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 8), count: 4)
 
     private var filtered: [CoreSticker] {
+        var base = stickers
+        if scope == .mine {
+            base = base.filter { $0.createdBy == store.configuration.userId }
+        }
         let term = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !term.isEmpty else { return stickers }
-        return stickers.filter { $0.name.lowercased().contains(term) }
+        guard !term.isEmpty else { return base }
+        return base.filter { $0.name.lowercased().contains(term) }
     }
 
     var body: some View {
@@ -607,7 +644,27 @@ struct StickerPickerPanel: View {
                 TextField("Buscar stickers", text: $search)
                     .textFieldStyle(.plain)
                 Spacer(minLength: 4)
-                PhotosPicker(selection: $uploadItem, matching: .images) {
+                if isUploading {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+                Menu {
+                    Button {
+                        showPhotosPicker = true
+                    } label: {
+                        Label("Desde Fotos", systemImage: "photo.on.rectangle")
+                    }
+                    Button {
+                        Task { await pasteFromClipboard() }
+                    } label: {
+                        Label("Pegar sticker copiado", systemImage: "doc.on.clipboard")
+                    }
+                    Button {
+                        showFileImporter = true
+                    } label: {
+                        Label("Importar archivo (.webp)", systemImage: "folder")
+                    }
+                } label: {
                     Label("Subir", systemImage: "plus")
                         .font(.caption.weight(.semibold))
                 }
@@ -617,11 +674,27 @@ struct StickerPickerPanel: View {
             .background(Color(red: 0.95, green: 0.96, blue: 0.96))
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
+            if let importHint {
+                Text(importHint)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Picker("Colección", selection: $scope) {
+                ForEach(StickerScope.allCases, id: \.self) { scope in
+                    Text(scope.rawValue).tag(scope)
+                }
+            }
+            .pickerStyle(.segmented)
+
             ScrollView {
                 if isLoading {
                     ProgressView().padding(.top, 24)
                 } else if filtered.isEmpty {
-                    Text("No hay stickers todavía.")
+                    Text(scope == .mine
+                         ? "Aún no tienes stickers propios. Sube uno o guarda los que te envíen."
+                         : "No hay stickers todavía.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .padding(.top, 24)
@@ -659,6 +732,14 @@ struct StickerPickerPanel: View {
             guard let item else { return }
             Task { await upload(item) }
         }
+        .photosPicker(isPresented: $showPhotosPicker, selection: $uploadItem, matching: .images)
+        .fileImporter(
+            isPresented: $showFileImporter,
+            allowedContentTypes: [.image],
+            allowsMultipleSelection: true
+        ) { result in
+            Task { await importFiles(result) }
+        }
     }
 
     private func reload() async {
@@ -671,10 +752,57 @@ struct StickerPickerPanel: View {
         isUploading = true
         defer { isUploading = false; uploadItem = nil }
         guard let data = try? await item.loadTransferable(type: Data.self) else { return }
-        let fileName = "sticker-\(Int(Date().timeIntervalSince1970)).png"
-        let name = "Sticker"
-        if let created = await store.uploadSticker(name: name, data: data, fileName: fileName, mimeType: "image/png") {
+        await uploadData(data, name: "Sticker")
+    }
+
+    /// Sube datos de imagen detectando su formato real (WebP de WhatsApp,
+    /// PNG, GIF o JPEG) para conservar transparencia y animación.
+    private func uploadData(_ data: Data, name: String) async {
+        let format = StickerImageFormat.detect(data)
+        let suffix = UUID().uuidString.prefix(6)
+        let fileName = "sticker-\(Int(Date().timeIntervalSince1970 * 1000))-\(suffix).\(format.fileExtension)"
+        if let created = await store.uploadSticker(name: name, data: data, fileName: fileName, mimeType: format.mimeType) {
             stickers.insert(created, at: 0)
+            importHint = nil
+        } else {
+            importHint = "No se pudo subir el sticker. Intenta de nuevo."
+        }
+    }
+
+    /// Importa un sticker copiado en WhatsApp (mantener presionado → Copiar).
+    private func pasteFromClipboard() async {
+        isUploading = true
+        defer { isUploading = false }
+
+        let pasteboard = UIPasteboard.general
+        var data: Data?
+        for type in [UTType.webP, .png, .gif, .jpeg] {
+            if let found = pasteboard.data(forPasteboardType: type.identifier) {
+                data = found
+                break
+            }
+        }
+        if data == nil, let image = pasteboard.image {
+            data = image.pngData()
+        }
+        guard let data else {
+            importHint = "Copia primero un sticker en WhatsApp (mantén presionado → Copiar) y vuelve a intentar."
+            return
+        }
+        await uploadData(data, name: "Sticker WhatsApp")
+    }
+
+    /// Importa archivos .webp/.png exportados de WhatsApp desde Archivos.
+    private func importFiles(_ result: Result<[URL], Error>) async {
+        guard case .success(let urls) = result, !urls.isEmpty else { return }
+        isUploading = true
+        defer { isUploading = false }
+        for url in urls {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            guard let data = try? Data(contentsOf: url) else { continue }
+            let name = url.deletingPathExtension().lastPathComponent
+            await uploadData(data, name: name.isEmpty ? "Sticker" : name)
         }
     }
 }

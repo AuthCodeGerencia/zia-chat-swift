@@ -229,6 +229,7 @@ private struct LoginView: View {
 enum ChannelListFilter: CaseIterable {
     case todos
     case directos
+    case hilos
     case favoritos
     case noLeidos
     case voz
@@ -237,6 +238,7 @@ enum ChannelListFilter: CaseIterable {
         switch self {
         case .todos: return "Todos"
         case .directos: return "Directos"
+        case .hilos: return "Hilos"
         case .favoritos: return "Favoritos"
         case .noLeidos: return "No leídos"
         case .voz: return "Voz"
@@ -247,6 +249,7 @@ enum ChannelListFilter: CaseIterable {
         switch self {
         case .todos: return nil
         case .directos: return "person.2.fill"
+        case .hilos: return "bubble.left.and.bubble.right.fill"
         case .favoritos: return "star.fill"
         case .noLeidos: return "circle.badge.fill"
         case .voz: return "speaker.wave.2.fill"
@@ -266,6 +269,14 @@ private enum ChannelListItem: Identifiable {
     }
 }
 
+/// Un thread mostrado en el filtro "Hilos" del index, junto con su canal.
+struct ChannelThreadItem: Identifiable {
+    let channel: CoreChannel
+    let summary: CoreThreadSummary
+
+    var id: String { summary.id }
+}
+
 private struct ChannelListView: View {
     @ObservedObject var store: CoreChannelsStore
     @ObservedObject var voiceStore: CoreVoiceRoomStore
@@ -276,6 +287,8 @@ private struct ChannelListView: View {
     @State private var channelToEdit: CoreChannel?
     @State private var channelFilter: ChannelListFilter = .todos
     @State private var showNewDM = false
+    @State private var selectedThreadItem: ChannelThreadItem?
+    @ObservedObject private var threadReads = ThreadReadTracker.shared
 
     private var isSearching: Bool {
         !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -315,6 +328,18 @@ private struct ChannelListView: View {
         }
         .refreshable {
             await store.refresh()
+            if channelFilter == .hilos {
+                await store.loadAllChannelThreads(force: true)
+            }
+        }
+        .task(id: store.textChannels.count) {
+            // Precarga los threads para que el chip "Hilos" muestre su badge
+            // de nuevos mensajes sin tener que entrar al filtro.
+            guard !store.textChannels.isEmpty else { return }
+            await store.loadAllChannelThreads()
+        }
+        .sheet(item: $selectedThreadItem) { item in
+            ThreadView(store: store, channel: item.channel, root: item.summary.root)
         }
         .searchable(
             text: $searchText,
@@ -391,6 +416,9 @@ private struct ChannelListView: View {
         let chipForeground: Color = isSelected ? .white : .primary
         return Button {
             withAnimation(.snappy) { channelFilter = filter }
+            if filter == .hilos {
+                Task { await store.loadAllChannelThreads() }
+            }
         } label: {
             HStack(spacing: 4) {
                 if let icon = filter.systemImage {
@@ -401,6 +429,15 @@ private struct ChannelListView: View {
                     .font(.caption.weight(.semibold))
                 if filter == .noLeidos, totalUnreadCount > 0 {
                     Text(CoreFormat.badgeCount(totalUnreadCount))
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(isSelected ? ZenitBrand.accent : Color.white)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(isSelected ? Color.white : ZenitBrand.accent)
+                        .clipShape(Capsule())
+                }
+                if filter == .hilos, unreadThreadItems.count > 0 {
+                    Text(CoreFormat.badgeCount(unreadThreadItems.count))
                         .font(.system(size: 10, weight: .bold))
                         .foregroundStyle(isSelected ? ZenitBrand.accent : Color.white)
                         .padding(.horizontal, 5)
@@ -438,6 +475,8 @@ private struct ChannelListView: View {
             allChannelsContent
         case .directos:
             directMessagesContent
+        case .hilos:
+            threadsContent
         case .favoritos:
             favoritesContent
         case .noLeidos:
@@ -445,6 +484,84 @@ private struct ChannelListView: View {
         case .voz:
             voiceContent
         }
+    }
+
+    // MARK: - Filtro Hilos
+
+    /// Todos los threads de los canales de texto, ordenados por actividad.
+    private var allThreadItems: [ChannelThreadItem] {
+        store.textChannels
+            .flatMap { channel -> [ChannelThreadItem] in
+                guard let conversationId = channel.conversationId else { return [] }
+                return (store.channelThreads[conversationId] ?? []).map {
+                    ChannelThreadItem(channel: channel, summary: $0)
+                }
+            }
+            .sorted { $0.summary.lastReplyAt > $1.summary.lastReplyAt }
+    }
+
+    /// Threads con respuestas nuevas (de otros) desde la última vez que se abrieron.
+    private var unreadThreadItems: [ChannelThreadItem] {
+        allThreadItems.filter {
+            threadReads.isUnread($0.summary, currentUserId: store.configuration.userId)
+        }
+    }
+
+    private var readThreadItems: [ChannelThreadItem] {
+        allThreadItems.filter {
+            !threadReads.isUnread($0.summary, currentUserId: store.configuration.userId)
+        }
+    }
+
+    @ViewBuilder
+    private var threadsContent: some View {
+        if store.isLoadingAllThreads && allThreadItems.isEmpty {
+            HStack {
+                Spacer()
+                ProgressView("Cargando hilos…")
+                Spacer()
+            }
+            .padding(.top, 32)
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.white)
+        } else if allThreadItems.isEmpty {
+            ContentUnavailableView(
+                "Sin hilos",
+                systemImage: "bubble.left.and.bubble.right",
+                description: Text("Todavía no hay conversaciones en threads en tus canales.")
+            )
+            .listRowSeparator(.hidden)
+        } else {
+            if !unreadThreadItems.isEmpty {
+                Section {
+                    ForEach(unreadThreadItems) { item in
+                        indexThreadRow(item, isUnread: true)
+                    }
+                } header: {
+                    Label("Nuevos mensajes", systemImage: "circle.badge.fill")
+                }
+            }
+
+            if !readThreadItems.isEmpty {
+                Section {
+                    ForEach(readThreadItems) { item in
+                        indexThreadRow(item, isUnread: false)
+                    }
+                } header: {
+                    if !unreadThreadItems.isEmpty {
+                        Label("Todos", systemImage: "bubble.left.and.bubble.right")
+                    }
+                }
+            }
+        }
+    }
+
+    private func indexThreadRow(_ item: ChannelThreadItem, isUnread: Bool) -> some View {
+        IndexThreadRow(item: item, isUnread: isUnread)
+            .contentShape(Rectangle())
+            .onTapGesture { selectedThreadItem = item }
+            .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
+            .listRowBackground(Color.white)
     }
 
     @ViewBuilder
@@ -1061,6 +1178,7 @@ private struct ChatDetailView: View {
     @State private var selectedMessage: CoreMessage?
     @State private var threadRoot: CoreMessage?
     @State private var messageToForward: CoreMessage?
+    @State private var messageInfoTarget: CoreMessage?
     @State private var showThreadsOverview = false
     @ObservedObject private var threadReads = ThreadReadTracker.shared
     @FocusState private var isComposerFocused: Bool
@@ -1156,6 +1274,17 @@ private struct ChatDetailView: View {
                         self.selectedMessage = nil
                         Task { await store.togglePin(target) }
                     },
+                    onInfo: {
+                        messageInfoTarget = selectedMessage
+                        self.selectedMessage = nil
+                    },
+                    onSaveSticker: selectedMessage.attachments?.first(where: { $0.isImage }) == nil ? nil : {
+                        let attachment = selectedMessage.attachments?.first(where: { $0.isImage })
+                        self.selectedMessage = nil
+                        if let attachment {
+                            Task { _ = await store.saveStickerFromAttachment(attachment) }
+                        }
+                    },
                     onReact: { emoji in
                         self.selectedMessage = nil
                         Task { await store.react(to: selectedMessage, emoji: emoji) }
@@ -1171,12 +1300,21 @@ private struct ChatDetailView: View {
         .sheet(item: $messageToForward) { message in
             ForwardMessageView(store: store, message: message)
         }
+        .sheet(item: $messageInfoTarget) { message in
+            MessageReadsView(store: store, channel: channel, message: message)
+        }
         .sheet(isPresented: $showThreadsOverview) {
             ChannelThreadsView(store: store, channel: channel)
         }
         .task(id: channel.conversationId) {
             guard let conversationId = channel.conversationId else { return }
+            await store.loadConversationReads(for: channel)
             await typingService.connect(conversationId: conversationId, configuration: store.configuration)
+        }
+        .onChange(of: messages.count) { _, _ in
+            // Al llegar/enviarse mensajes, refresca las marcas de lectura para
+            // que las palomitas se actualicen.
+            Task { await store.loadConversationReads(for: channel) }
         }
         .onDisappear {
             Task { await typingService.disconnect() }
@@ -1356,6 +1494,9 @@ private struct ChatDetailView: View {
             poll: store.polls[message.id],
             hasUnreadThread: hasUnreadThread(message.id),
             isPinned: store.isPinned(message),
+            receipt: message.userId == store.configuration.userId
+                ? store.receipt(for: message, in: channel)
+                : nil,
             onVote: { optionId in
                 if let poll = store.polls[message.id] {
                     Task { await store.votePoll(poll, optionId: optionId) }
@@ -2256,6 +2397,7 @@ private struct MessageBubble: View {
     var poll: CorePoll? = nil
     var hasUnreadThread: Bool = false
     var isPinned: Bool = false
+    var receipt: MessageReceipt? = nil
     var onVote: (String) -> Void = { _ in }
     let onReply: () -> Void
     let onLongPress: () -> Void
@@ -2382,6 +2524,10 @@ private struct MessageBubble: View {
                         Text("(editado)")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
+                    }
+
+                    if isMine, let receipt {
+                        ReceiptTicks(receipt: receipt)
                     }
                 }
 
@@ -2564,6 +2710,126 @@ private struct CommandCardView: View {
     }
 }
 
+/// Detalle de lectura de un mensaje (similar a "Info" de WhatsApp/Meta):
+/// quiénes ya lo leyeron (✓✓ azul) y a quiénes les falta (✓✓ gris).
+private struct MessageReadsView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var store: CoreChannelsStore
+    let channel: CoreChannel
+    let message: CoreMessage
+
+    private var readers: [CoreUserLite] {
+        store.readers(of: message, in: channel)
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    private var pending: [CoreUserLite] {
+        let readerIds = Set(readers.map(\.id))
+        return store.members(for: channel)
+            .filter { $0.id != message.userId && !readerIds.contains($0.id) }
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    private var reads: [String: Date] {
+        store.conversationReads[message.conversationId] ?? [:]
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    MessageContextPreview(message: message, isMine: message.userId == store.configuration.userId)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .listRowBackground(Color.clear)
+                }
+
+                Section {
+                    if readers.isEmpty {
+                        Text("Aún nadie lo ha leído.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(readers) { member in
+                            HStack(spacing: 10) {
+                                AvatarView(name: member.displayName, avatarURL: member.avatarURL)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(member.displayName)
+                                    if let readAt = reads[member.id] {
+                                        Text("Visto \(CoreFormat.relativeTime(readAt))")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                ReceiptTicks(receipt: .readByAll)
+                            }
+                        }
+                    }
+                } header: {
+                    Label("Leído por", systemImage: "checkmark.circle.fill")
+                }
+
+                if !pending.isEmpty {
+                    Section {
+                        ForEach(pending) { member in
+                            HStack(spacing: 10) {
+                                AvatarView(name: member.displayName, avatarURL: member.avatarURL)
+                                Text(member.displayName)
+                                Spacer()
+                                ReceiptTicks(receipt: .sent)
+                            }
+                        }
+                    } header: {
+                        Label("Pendientes", systemImage: "clock")
+                    }
+                }
+            }
+            .navigationTitle("Vistos por")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Listo") { dismiss() }
+                }
+            }
+            .task {
+                await store.loadConversationReads(for: channel)
+            }
+            .refreshable {
+                await store.loadConversationReads(for: channel)
+            }
+        }
+    }
+}
+
+/// Palomitas de estado de un mensaje propio (estilo WhatsApp):
+/// ✓ enviado · ✓✓ gris leído por algunos · ✓✓ azul leído por todos.
+struct ReceiptTicks: View {
+    let receipt: MessageReceipt
+
+    private var color: Color {
+        receipt == .readByAll ? Color(red: 0.20, green: 0.55, blue: 0.97) : .secondary
+    }
+
+    var body: some View {
+        HStack(spacing: -5) {
+            Image(systemName: "checkmark")
+            if receipt != .sent {
+                Image(systemName: "checkmark")
+            }
+        }
+        .font(.system(size: 10, weight: .bold))
+        .foregroundStyle(color)
+        .accessibilityLabel(accessibilityText)
+    }
+
+    private var accessibilityText: String {
+        switch receipt {
+        case .sent: return "Enviado"
+        case .readBySome: return "Leído por algunos"
+        case .readByAll: return "Leído por todos"
+        }
+    }
+}
+
 private struct MessageActionOverlay: View {
     let message: CoreMessage
     let isMine: Bool
@@ -2576,6 +2842,8 @@ private struct MessageActionOverlay: View {
     let onCopy: () -> Void
     let onThread: () -> Void
     let onTogglePin: () -> Void
+    var onInfo: (() -> Void)? = nil
+    var onSaveSticker: (() -> Void)? = nil
     let onReact: (String) -> Void
 
     private let reactions = ["👍", "❤️", "😂", "😮", "😢", "🙏"]
@@ -2621,6 +2889,14 @@ private struct MessageActionOverlay: View {
                         systemImage: isPinned ? "pin.slash" : "pin",
                         action: onTogglePin
                     )
+                    if let onInfo {
+                        Divider().padding(.leading, 16)
+                        MessageActionRow(title: "Vistos por", systemImage: "checkmark.circle", action: onInfo)
+                    }
+                    if let onSaveSticker {
+                        Divider().padding(.leading, 16)
+                        MessageActionRow(title: "Guardar sticker", systemImage: "square.and.arrow.down", action: onSaveSticker)
+                    }
                     if isMine, let onEdit {
                         Divider().padding(.leading, 16)
                         MessageActionRow(title: "Editar", systemImage: "pencil", action: onEdit)
@@ -3048,6 +3324,75 @@ private struct ChannelThreadsView: View {
     }
 }
 
+/// Fila del filtro "Hilos" del index: título del thread arriba y, debajo,
+/// el icono + nombre del canal al que pertenece.
+private struct IndexThreadRow: View {
+    let item: ChannelThreadItem
+    let isUnread: Bool
+
+    private static let unreadGreen = Color(red: 0.08, green: 0.65, blue: 0.42)
+
+    private var title: String {
+        let content = item.summary.root.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !content.isEmpty { return content }
+        if let attachment = item.summary.root.attachments?.first {
+            if attachment.isAudio { return "🎤 Nota de voz" }
+            if attachment.isGIF { return "GIF" }
+            if attachment.isImage { return "📷 Foto" }
+            return attachment.fileName
+        }
+        return "Mensaje"
+    }
+
+    private var replyText: String {
+        item.summary.replyCount == 1 ? "1 respuesta" : "\(item.summary.replyCount) respuestas"
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title)
+                    .font(.subheadline.weight(isUnread ? .semibold : .regular))
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+
+                HStack(spacing: 6) {
+                    ChannelLogoView(channel: item.channel, size: 18)
+                    Text(item.channel.displayName)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Text("·")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(replyText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            VStack(alignment: .trailing, spacing: 6) {
+                Text(CoreFormat.relativeTime(item.summary.lastReplyAt))
+                    .font(.caption2)
+                    .foregroundStyle(isUnread ? Self.unreadGreen : .secondary)
+                if isUnread {
+                    Text("Nuevo")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Self.unreadGreen)
+                        .clipShape(Capsule())
+                }
+            }
+        }
+        .padding(.vertical, 6)
+    }
+}
+
 private struct ThreadSummaryRow: View {
     let summary: CoreThreadSummary
     let isUnread: Bool
@@ -3343,6 +3688,16 @@ private struct ComposerView: View {
                     showMediaEditor = false
                     mediaEditorItems = []
                     sendEditedMedia(editedAttachments, caption: caption)
+                },
+                onSaveSticker: { data in
+                    let format = StickerImageFormat.detect(data)
+                    let fileName = "sticker-\(Int(Date().timeIntervalSince1970 * 1000)).\(format.fileExtension)"
+                    return await store.uploadSticker(
+                        name: "Sticker",
+                        data: data,
+                        fileName: fileName,
+                        mimeType: format.mimeType
+                    ) != nil
                 }
             )
         }

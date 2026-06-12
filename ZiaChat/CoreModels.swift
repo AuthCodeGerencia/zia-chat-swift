@@ -709,11 +709,61 @@ struct CoreSticker: Identifiable, Codable, Hashable {
     var id: String
     var name: String
     var imageURL: String
+    /// Quién subió el sticker (para filtrar "Mis stickers" vs stock global).
+    /// `nil` en stickers antiguos o si la migración created_by no está aplicada.
+    var createdBy: String?
 
     enum CodingKeys: String, CodingKey {
         case id
         case name
         case imageURL = "image_url"
+        case createdBy = "created_by"
+    }
+}
+
+/// Marca de lectura de un usuario en una conversación (recibos de lectura,
+/// tabla `core_message_reads`).
+struct CoreConversationRead: Codable, Hashable {
+    var userId: String
+    var lastReadAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case userId = "user_id"
+        case lastReadAt = "last_read_at"
+    }
+}
+
+/// Estado de entrega/lectura de un mensaje propio (palomitas estilo WhatsApp).
+enum MessageReceipt {
+    /// ✓ Llegó al servidor; nadie lo ha leído todavía.
+    case sent
+    /// ✓✓ (gris) Lo leyeron algunos miembros.
+    case readBySome
+    /// ✓✓ (azul) Lo leyeron todos los miembros.
+    case readByAll
+}
+
+/// Detecta el formato real de una imagen por sus "magic bytes".
+/// WhatsApp exporta stickers como WebP; Fotos suele entregar PNG/JPEG/GIF.
+/// Vive en CoreModels para que la Share Extension también pueda usarlo.
+enum StickerImageFormat {
+    static func detect(_ data: Data) -> (mimeType: String, fileExtension: String) {
+        let bytes = [UInt8](data.prefix(12))
+        if bytes.count >= 12,
+           Array(bytes[0...3]) == [0x52, 0x49, 0x46, 0x46],
+           Array(bytes[8...11]) == [0x57, 0x45, 0x42, 0x50] {
+            return ("image/webp", "webp")
+        }
+        if bytes.count >= 4, Array(bytes[0...3]) == [0x89, 0x50, 0x4E, 0x47] {
+            return ("image/png", "png")
+        }
+        if bytes.count >= 3, Array(bytes[0...2]) == [0xFF, 0xD8, 0xFF] {
+            return ("image/jpeg", "jpg")
+        }
+        if bytes.count >= 4, Array(bytes[0...3]) == [0x47, 0x49, 0x46, 0x38] {
+            return ("image/gif", "gif")
+        }
+        return ("image/png", "png")
     }
 }
 
