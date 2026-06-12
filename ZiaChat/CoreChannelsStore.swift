@@ -8,7 +8,12 @@ final class CoreChannelsStore: ObservableObject {
     @Published var directMessages: [CoreDirectMessage] = []
     @Published var messages: [String: [CoreMessage]] = CorePreviewData.messages
     @Published var channelPreviews: [String: CoreMessage] = [:]
+    @Published var polls: [String: CorePoll] = [:]
     @Published var mentionableUsers: [CoreUserLite] = []
+    @Published var internalCompanies: [CoreInternalCompany] = []
+    @Published var mutedChannelIds: Set<CoreChannel.ID> = Set(
+        UserDefaults.standard.stringArray(forKey: CoreChannelsStore.mutedChannelsDefaultsKey) ?? []
+    )
     @Published var channelMembers: [String: [CoreUserLite]] = [:]
     @Published var selectedChannelId: CoreChannel.ID?
     @Published var favoriteChannelIds: Set<CoreChannel.ID> = []
@@ -21,6 +26,8 @@ final class CoreChannelsStore: ObservableObject {
     @Published var hasOlderMessages: [String: Bool] = [:]
     @Published var threadReplies: [String: [CoreMessage]] = [:]
     @Published var isLoadingThread: [String: Bool] = [:]
+    @Published var channelThreads: [String: [CoreThreadSummary]] = [:]
+    @Published var isLoadingChannelThreads: [String: Bool] = [:]
     @Published var channelSearchQuery = ""
     @Published var channelSearchResults: [CoreChannelSearchHit] = []
     @Published var isSearchingChannels = false
@@ -65,7 +72,95 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     func channel(with id: CoreChannel.ID) -> CoreChannel? {
-        channels.first { $0.id == id } ?? directMessages.first { $0.id == id }?.chatTarget
+        if let channel = channels.first(where: { $0.id == id }) {
+            return channel
+        }
+        if let dm = directMessages.first(where: { $0.id == id }) {
+            return dmChannel(for: dm)
+        }
+        return nil
+    }
+
+    /// Canal "fantasma" para reutilizar ChatDetailView con un DM.
+    func dmChannel(for dm: CoreDirectMessage) -> CoreChannel {
+        CoreChannel(
+            id: dm.id,
+            empresaId: dm.empresaId,
+            name: dm.peer.displayName,
+            slug: "dm-\(dm.id)",
+            description: "Mensaje directo",
+            visibility: .private,
+            metadata: CoreChannelMetadata(
+                channelType: "dm",
+                iconImage: dm.peer.avatarURLString
+            ),
+            conversationId: dm.id,
+            unreadCount: dm.unreadCount,
+            mentionCount: dm.mentionCount
+        )
+    }
+
+    func loadDirectMessages() async {
+        guard configuration.isUsable else {
+            directMessages = []
+            return
+        }
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            directMessages = try await client.listDirectMessages()
+        } catch {
+            // RPC no desplegado u otro error: los DMs simplemente quedan vacíos.
+        }
+    }
+
+    /// Encuentra o crea el DM con otra persona (POST /api/core/dms, igual que
+    /// la web) y devuelve el canal fantasma listo para abrir.
+    func startDirectMessage(with user: CoreUserLite) async -> CoreChannel? {
+        guard configuration.isUsable, user.id != configuration.userId else { return nil }
+        lastError = nil
+        do {
+            let payload = try await coreAPIRequest(
+                path: "/api/core/dms",
+                method: "POST",
+                body: ["peerUserId": user.id]
+            )
+            guard payload["ok"] as? Bool == true,
+                  let dmPayload = payload["dm"] as? [String: Any],
+                  let conversationId = dmPayload["id"] as? String else {
+                lastError = (payload["error"] as? String) ?? "No se pudo iniciar el DM."
+                return nil
+            }
+            let empresaId = (dmPayload["empresa_id"] as? Int) ?? configuration.empresaId ?? 0
+            var peer = user
+            if let peerPayload = dmPayload["peer"] as? [String: Any] {
+                peer = CoreUserLite(
+                    id: (peerPayload["id"] as? String) ?? user.id,
+                    fullName: (peerPayload["full_name"] as? String) ?? user.fullName,
+                    avatarURLString: (peerPayload["avatar_url"] as? String) ?? user.avatarURLString,
+                    roleId: peerPayload["rol_id"] as? Int
+                )
+            }
+            let dm = CoreDirectMessage(
+                id: conversationId,
+                empresaId: empresaId,
+                dmKey: dmPayload["dm_key"] as? String,
+                peer: peer
+            )
+            if !directMessages.contains(where: { $0.id == dm.id }) {
+                directMessages.insert(dm, at: 0)
+            }
+            return dmChannel(for: dm)
+        } catch {
+            lastError = error.localizedDescription
+            return nil
+        }
+    }
+
+    func clearDMUnread(_ dmId: String) {
+        guard let index = directMessages.firstIndex(where: { $0.id == dmId }) else { return }
+        directMessages[index].unreadCount = 0
+        directMessages[index].mentionCount = 0
     }
 
     func save(configuration: CoreAppConfiguration) {
@@ -171,6 +266,38 @@ final class CoreChannelsStore: ObservableObject {
         }
     }
 
+    // MARK: - Silenciar canal (local, persiste en UserDefaults)
+
+    static let mutedChannelsDefaultsKey = "zia.mutedChannelIds"
+
+    func isMuted(_ channelId: CoreChannel.ID) -> Bool {
+        mutedChannelIds.contains(channelId)
+    }
+
+    func toggleMuted(_ channelId: CoreChannel.ID) {
+        if mutedChannelIds.contains(channelId) {
+            mutedChannelIds.remove(channelId)
+        } else {
+            mutedChannelIds.insert(channelId)
+        }
+        UserDefaults.standard.set(Array(mutedChannelIds), forKey: Self.mutedChannelsDefaultsKey)
+    }
+
+    /// Marca todo el canal como leído sin abrirlo (upsert en core_message_reads,
+    /// igual que la web).
+    func markChannelAsRead(_ channel: CoreChannel) async {
+        guard configuration.isUsable, let conversationId = channel.conversationId else { return }
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let lastMessageId = channelPreviews[conversationId]?.id ?? messages[conversationId]?.last?.id
+            try await client.markRead(conversationId: conversationId, lastReadMessageId: lastMessageId)
+            clearUnread(for: channel.id)
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
     func updateChannelSearch(_ query: String) {
         channelSearchQuery = query
         channelSearchTask?.cancel()
@@ -238,6 +365,9 @@ final class CoreChannelsStore: ObservableObject {
                 if let users = try? await client.listMentionableUsers() {
                     mentionableUsers = users
                 }
+                if let dms = try? await client.listDirectMessages() {
+                    directMessages = dms
+                }
 
                 Task { @MainActor [weak self] in
                     guard let self, self.configuration.isUsable else { return }
@@ -257,9 +387,33 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     private func applyChannels(_ loadedChannels: [CoreChannel]) {
-        channels = loadedChannels
+        // The fast list RPC (core_list_zia_channels) does not return channel
+        // metadata, so the icon (metadata.iconImage) would be lost on the quick
+        // render until the enriched fetch arrives. Carry the previously known
+        // icon forward so it does not flash or disappear.
+        let previousIcons = Dictionary(
+            channels.compactMap { channel -> (String, String)? in
+                guard let icon = channel.metadata?.iconImage, !icon.isEmpty else { return nil }
+                return (channel.id, icon)
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+
+        let mergedChannels = loadedChannels.map { channel -> CoreChannel in
+            guard channel.metadata?.iconImage?.isEmpty != false,
+                  let previousIcon = previousIcons[channel.id] else {
+                return channel
+            }
+            var updated = channel
+            var metadata = updated.metadata ?? CoreChannelMetadata()
+            metadata.iconImage = previousIcon
+            updated.metadata = metadata
+            return updated
+        }
+
+        channels = mergedChannels
         selectedChannelId = selectedChannelId.flatMap(channel(with:))?.id ?? channels.first?.id
-        CoreChannelCache.save(loadedChannels, userId: configuration.userId)
+        CoreChannelCache.save(mergedChannels, userId: configuration.userId)
     }
 
     private func loadChannelPreviews(using client: SupabaseCoreClient) async {
@@ -411,7 +565,8 @@ final class CoreChannelsStore: ObservableObject {
         _ text: String,
         attachments: [CorePendingAttachment] = [],
         in channel: CoreChannel,
-        parentMessageId: String? = nil
+        parentMessageId: String? = nil,
+        replyTo quotedMessage: CoreMessage? = nil
     ) async {
         let content = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !content.isEmpty || !attachments.isEmpty,
@@ -423,13 +578,32 @@ final class CoreChannelsStore: ObservableObject {
             return
         }
 
-        let optimisticMessage = makeOptimisticMessage(
+        // Igual que la web: la cita (metadata.replyTo) solo aplica a mensajes
+        // del timeline, no a respuestas dentro de un thread.
+        let replyQuote: CoreMessageReplyTo? = (parentMessageId == nil)
+            ? quotedMessage.map { quoted in
+                CoreMessageReplyTo(
+                    messageId: quoted.id,
+                    authorId: quoted.userId,
+                    authorName: quoted.author?.displayName ?? "Usuario Core",
+                    content: String(quoted.content.prefix(240)),
+                    createdAt: ISO8601DateFormatter().string(from: quoted.createdAt),
+                    hasAttachments: quoted.attachments?.isEmpty == false
+                )
+            }
+            : nil
+
+        var optimisticMessage = makeOptimisticMessage(
             content: content,
             channel: channel,
             conversationId: conversationId,
             parentMessageId: parentMessageId
         )
-        let insertedOptimisticMessage = !content.isEmpty
+        if let replyQuote {
+            optimisticMessage.metadata = CoreMessageMetadata(replyTo: replyQuote)
+        }
+        // Thread replies must not be inserted into the main channel timeline.
+        let insertedOptimisticMessage = !content.isEmpty && parentMessageId == nil
         if insertedOptimisticMessage {
             upsertMessage(optimisticMessage)
         }
@@ -442,17 +616,25 @@ final class CoreChannelsStore: ObservableObject {
             var message = try await client.sendMessage(
                 empresaId: channel.empresaId,
                 conversationId: conversationId,
-                channelId: channel.isDirect ? nil : channel.id,
+                // Los DMs no tienen canal: el mensaje va solo a la conversación.
+                channelId: channel.isDirectMessage ? nil : channel.id,
                 parentMessageId: parentMessageId,
                 content: content,
-                attachments: attachments
+                attachments: attachments,
+                replyTo: replyQuote
             )
             message.author = optimisticMessage.author
             if insertedOptimisticMessage {
                 removeMessage(id: optimisticMessage.id, conversationId: conversationId)
             }
-            upsertMessage(message)
-            updateChannelPreview(with: message)
+            if let parentMessageId {
+                if upsertThreadReply(message, parentMessageId: parentMessageId) {
+                    incrementReplyCount(for: parentMessageId, conversationId: conversationId)
+                }
+            } else {
+                upsertMessage(message)
+                updateChannelPreview(with: message)
+            }
             Task {
                 try? await client.markRead(conversationId: conversationId, lastReadMessageId: message.id)
             }
@@ -478,6 +660,23 @@ final class CoreChannelsStore: ObservableObject {
                 conversationId: message.conversationId,
                 parentMessageId: message.id
             )
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// Loads the list of threads (root messages with replies) for a channel.
+    func loadChannelThreads(for channel: CoreChannel, force: Bool = false) async {
+        guard let conversationId = channel.conversationId else { return }
+        if !force, channelThreads[conversationId] != nil { return }
+        guard configuration.isUsable else { return }
+
+        isLoadingChannelThreads[conversationId] = true
+        defer { isLoadingChannelThreads[conversationId] = false }
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            channelThreads[conversationId] = try await client.listChannelThreads(conversationId: conversationId)
         } catch {
             lastError = error.localizedDescription
         }
@@ -541,14 +740,52 @@ final class CoreChannelsStore: ObservableObject {
         }
     }
 
-    func createChannel(name: String, description: String, visibility: CoreChannelVisibility) async {
+    func createChannel(
+        name: String,
+        description: String,
+        visibility: CoreChannelVisibility,
+        channelType: String = "text",
+        iconImage: String? = nil,
+        theme: CoreChannelTheme? = nil,
+        businessUnitId: Int? = nil,
+        memberIds: [String] = [],
+        adminIds: [String] = []
+    ) async {
         guard configuration.isUsable else { return }
         isCreatingChannel = true
         lastError = nil
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try SupabaseCoreClient(configuration: activeConfiguration)
-            let channel = try await client.createChannel(name: name, description: description, visibility: visibility)
+            let trimmedIcon = iconImage?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let metadata = CoreChannelMetadata(
+                channelType: channelType,
+                iconImage: (trimmedIcon?.isEmpty == false) ? trimmedIcon : nil,
+                theme: theme,
+                businessUnitId: businessUnitId
+            )
+            let channel = try await client.createChannel(
+                name: name,
+                description: description,
+                visibility: visibility,
+                channelType: channelType,
+                metadata: metadata
+            )
+            // Same as the web: after creating, sync the selected members/admins.
+            let allMemberIds = Array(Set(memberIds + [configuration.userId])).filter { !$0.isEmpty }
+            let allAdminIds = Array(Set(adminIds + [configuration.userId])).filter { !$0.isEmpty }
+            if allMemberIds.count > 1 || allAdminIds.count > 1 {
+                do {
+                    try await client.syncChannelMembers(
+                        channelId: channel.id,
+                        userIds: allMemberIds,
+                        adminIds: allAdminIds
+                    )
+                } catch {
+                    // The channel exists; member sync failure should not hide it.
+                    lastError = "Canal creado, pero no se pudieron sincronizar los miembros: \(error.localizedDescription)"
+                }
+            }
             channels.append(channel)
             channels.sort { $0.slug < $1.slug }
             selectedChannelId = channel.id
@@ -556,6 +793,264 @@ final class CoreChannelsStore: ObservableObject {
             lastError = error.localizedDescription
         }
         isCreatingChannel = false
+    }
+
+    /// Actualiza un canal con la misma lógica del modal "Configurar canal" de la
+    /// web: update de la fila + merge de metadata + sincronización de miembros.
+    /// Devuelve true si todo salió bien.
+    @discardableResult
+    func updateChannel(
+        _ channel: CoreChannel,
+        name: String,
+        description: String,
+        visibility: CoreChannelVisibility,
+        iconImage: String?,
+        theme: CoreChannelTheme?,
+        businessUnitId: Int?,
+        memberIds: [String],
+        adminIds: [String]
+    ) async -> Bool {
+        guard configuration.isUsable else { return false }
+        isCreatingChannel = true
+        lastError = nil
+        defer { isCreatingChannel = false }
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+
+            // Partimos de la metadata fresca del servidor (la lista rápida no la
+            // trae) para no pisar claves como el token de invitación.
+            var metadata = (try? await client.fetchChannelMetadata(channelId: channel.id))
+                ?? channel.metadata
+                ?? CoreChannelMetadata()
+            metadata.theme = theme
+            metadata.iconImage = (iconImage?.isEmpty == false) ? iconImage : nil
+            metadata.channelType = metadata.channelType ?? (channel.isVoice ? "voice" : "text")
+            metadata.businessUnitId = businessUnitId
+
+            try await client.updateChannel(
+                channelId: channel.id,
+                name: name,
+                description: description,
+                visibility: visibility,
+                metadata: metadata
+            )
+
+            let allMemberIds = Array(Set(memberIds + [configuration.userId])).filter { !$0.isEmpty }
+            let allAdminIds = Array(Set(adminIds + [configuration.userId])).filter { !$0.isEmpty }
+            do {
+                try await client.syncChannelMembers(
+                    channelId: channel.id,
+                    userIds: allMemberIds,
+                    adminIds: allAdminIds
+                )
+            } catch {
+                lastError = "Canal actualizado, pero no se pudieron sincronizar los miembros: \(error.localizedDescription)"
+            }
+
+            // Refleja el cambio localmente de inmediato.
+            if let index = channels.firstIndex(where: { $0.id == channel.id }) {
+                var updated = channels[index]
+                updated.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                updated.slug = SupabaseCoreClient.slugifyCoreName(name)
+                updated.description = description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? nil
+                    : description.trimmingCharacters(in: .whitespacesAndNewlines)
+                updated.visibility = visibility
+                updated.metadata = metadata
+                channels[index] = updated
+                channels.sort { $0.slug < $1.slug }
+            }
+            channelMembers[channel.id] = nil
+            return lastError == nil
+        } catch {
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Elimina (archiva) un canal igual que la web y limpia el estado local.
+    @discardableResult
+    func deleteChannel(_ channel: CoreChannel) async -> Bool {
+        guard configuration.isUsable else { return false }
+        lastError = nil
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            try await client.archiveChannel(channel)
+            channels.removeAll { $0.id == channel.id }
+            favoriteChannelIds.remove(channel.id)
+            if selectedChannelId == channel.id {
+                selectedChannelId = nil
+            }
+            return true
+        } catch {
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
+    func fetchChannelMetadata(_ channel: CoreChannel) async -> CoreChannelMetadata? {
+        guard configuration.isUsable else { return nil }
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            return try await client.fetchChannelMetadata(channelId: channel.id)
+        } catch {
+            return nil
+        }
+    }
+
+    /// Busca mensajes dentro de un canal específico (para la búsqueda in-channel).
+    func searchMessages(in channel: CoreChannel, keyword: String) async -> [CoreMessage] {
+        let trimmed = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard configuration.isUsable, !trimmed.isEmpty else { return [] }
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            return try await client.searchChannelMessages(keyword: trimmed, channelIds: [channel.id])
+        } catch {
+            return []
+        }
+    }
+
+    func loadChannelMemberRoles(channelId: String) async -> [CoreChannelMemberRole] {
+        guard configuration.isUsable else { return [] }
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            return try await client.listChannelMemberRoles(channelId: channelId)
+        } catch {
+            return []
+        }
+    }
+
+    /// Llama un endpoint del backend Next.js (mismo que usa la web) con el
+    /// token de la sesión. Devuelve el JSON de respuesta.
+    @discardableResult
+    func coreAPIRequest(path: String, method: String, body: [String: Any]? = nil) async throws -> [String: Any] {
+        let activeConfiguration = try await ensureFreshSession()
+        let environment = CoreEnvironment.load()
+        guard let baseURL = URL(string: environment.appURL),
+              let url = URL(string: path, relativeTo: baseURL) else {
+            throw SupabaseCoreError.invalidURL
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(activeConfiguration.accessToken)", forHTTPHeaderField: "Authorization")
+        if let body {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let payload = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let message = (payload["error"] as? String)
+                ?? "Error del servidor (\((response as? HTTPURLResponse)?.statusCode ?? 0))"
+            throw SupabaseCoreError.attachmentUpload(message)
+        }
+        return payload
+    }
+
+    /// Crea y devuelve el link de invitación del canal usando el mismo endpoint
+    /// de la web (/api/core/channels/invite).
+    func createChannelInviteLink(_ channel: CoreChannel) async -> String? {
+        guard configuration.isUsable else { return nil }
+        do {
+            let payload = try await coreAPIRequest(
+                path: "/api/core/channels/invite",
+                method: "POST",
+                body: ["action": "create", "channelId": channel.id]
+            )
+            guard payload["ok"] as? Bool == true, let inviteUrl = payload["inviteUrl"] as? String else {
+                lastError = "No se pudo crear el link de invitación."
+                return nil
+            }
+            return inviteUrl
+        } catch {
+            lastError = error.localizedDescription
+            return nil
+        }
+    }
+
+    /// Edita un mensaje propio (PATCH /api/core/messages/:id, igual que la web).
+    @discardableResult
+    func editMessage(_ message: CoreMessage, newContent: String) async -> Bool {
+        let content = newContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !content.isEmpty, configuration.isUsable else { return false }
+        lastError = nil
+        do {
+            try await coreAPIRequest(
+                path: "/api/core/messages/\(message.id)",
+                method: "PATCH",
+                body: ["content": content]
+            )
+            applyLocalMessageEdit(messageId: message.id, conversationId: message.conversationId, content: content)
+            return true
+        } catch {
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Elimina (soft delete) un mensaje propio (DELETE /api/core/messages/:id).
+    @discardableResult
+    func deleteMessage(_ message: CoreMessage) async -> Bool {
+        guard configuration.isUsable else { return false }
+        lastError = nil
+        do {
+            try await coreAPIRequest(path: "/api/core/messages/\(message.id)", method: "DELETE")
+            removeMessage(id: message.id, conversationId: message.conversationId)
+            for (rootId, replies) in threadReplies where replies.contains(where: { $0.id == message.id }) {
+                threadReplies[rootId] = replies.filter { $0.id != message.id }
+            }
+            return true
+        } catch {
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
+    private func applyLocalMessageEdit(messageId: String, conversationId: String, content: String) {
+        if var list = messages[conversationId],
+           let index = list.firstIndex(where: { $0.id == messageId }) {
+            list[index].content = content
+            list[index].editedAt = Date()
+            messages[conversationId] = list
+        }
+        for (rootId, replies) in threadReplies {
+            guard let index = replies.firstIndex(where: { $0.id == messageId }) else { continue }
+            var copy = replies
+            copy[index].content = content
+            copy[index].editedAt = Date()
+            threadReplies[rootId] = copy
+        }
+        if var preview = channelPreviews[conversationId], preview.id == messageId {
+            preview.content = content
+            channelPreviews[conversationId] = preview
+        }
+    }
+
+    func loadMentionableUsersIfNeeded() async {
+        guard configuration.isUsable, mentionableUsers.isEmpty else { return }
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            mentionableUsers = try await client.listMentionableUsers()
+        } catch {
+            // Non-fatal: the member picker simply stays empty.
+        }
+    }
+
+    func loadInternalCompanies() async {
+        guard configuration.isUsable else { return }
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            internalCompanies = try await client.listInternalCompanies()
+        } catch {
+            internalCompanies = []
+        }
     }
 
     func react(to message: CoreMessage, emoji: String) async {
@@ -661,9 +1156,11 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     private func clearUnread(for channelId: CoreChannel.ID) {
-        guard let index = channels.firstIndex(where: { $0.id == channelId }) else { return }
-        channels[index].unreadCount = 0
-        channels[index].mentionCount = 0
+        if let index = channels.firstIndex(where: { $0.id == channelId }) {
+            channels[index].unreadCount = 0
+            channels[index].mentionCount = 0
+        }
+        clearDMUnread(channelId)
     }
 
     private func appendPreviewMessage(_ content: String, channel: CoreChannel, parentMessageId: String?) {
@@ -760,6 +1257,11 @@ final class CoreChannelsStore: ObservableObject {
                 if upsertThreadReply(enriched, parentMessageId: parentMessageId) {
                     incrementReplyCount(for: parentMessageId, conversationId: message.conversationId)
                 }
+            } else {
+                // Thread not loaded locally: still refresh counts and the
+                // threads overview so unread indicators stay accurate.
+                incrementReplyCount(for: parentMessageId, conversationId: message.conversationId)
+                bumpThreadSummary(with: message, parentMessageId: parentMessageId)
             }
             return
         }
@@ -781,6 +1283,14 @@ final class CoreChannelsStore: ObservableObject {
                 upsertMessage(enriched)
                 updateChannelPreview(with: enriched)
             }
+        }
+
+        // Poll announcements ("📊 …") need their poll loaded so the voting UI
+        // renders instead of plain text.
+        if message.content.hasPrefix("📊"),
+           polls[message.id] == nil,
+           let channel = channels.first(where: { $0.conversationId == message.conversationId }) {
+            await loadPolls(for: channel)
         }
     }
 
@@ -912,17 +1422,15 @@ final class CoreChannelsStore: ObservableObject {
     private func updateChannelPreview(with message: CoreMessage) {
         guard message.parentMessageId == nil, message.deletedAt == nil else { return }
         if let index = directMessages.firstIndex(where: { $0.id == message.conversationId }) {
-            if let currentDate = directMessages[index].lastMessageCreatedAt,
+            if let currentDate = directMessages[index].lastMessageAt,
                currentDate > message.createdAt {
                 return
             }
-            directMessages[index].lastMessageId = message.id
             directMessages[index].lastMessageUserId = message.userId
             directMessages[index].lastMessageContent = message.content
-            directMessages[index].lastMessageCreatedAt = message.createdAt
-            directMessages[index].updatedAt = message.createdAt
-            directMessages.sort {
-                ($0.lastMessageCreatedAt ?? $0.updatedAt) > ($1.lastMessageCreatedAt ?? $1.updatedAt)
+            directMessages[index].lastMessageAt = message.createdAt
+            directMessages.sort { first, second in
+                (first.lastMessageAt ?? .distantPast) > (second.lastMessageAt ?? .distantPast)
             }
             return
         }
@@ -950,7 +1458,156 @@ final class CoreChannelsStore: ObservableObject {
         replies.append(reply)
         replies.sort { $0.createdAt < $1.createdAt }
         threadReplies[parentMessageId] = replies
+        bumpThreadSummary(with: reply, parentMessageId: parentMessageId)
         return true
+    }
+
+    /// Keeps the channel threads overview in sync when a new reply arrives
+    /// (sent locally or received via realtime).
+    private func bumpThreadSummary(with reply: CoreMessage, parentMessageId: String) {
+        var summaries = channelThreads[reply.conversationId] ?? []
+        if let index = summaries.firstIndex(where: { $0.id == parentMessageId }) {
+            summaries[index].replyCount += 1
+            if reply.createdAt >= summaries[index].lastReplyAt {
+                summaries[index].lastReplyAt = reply.createdAt
+                summaries[index].lastReplyUserId = reply.userId
+            }
+        } else if let root = messages[reply.conversationId]?.first(where: { $0.id == parentMessageId }) {
+            summaries.append(
+                CoreThreadSummary(
+                    root: root,
+                    replyCount: max(root.replyCount ?? 0, 1),
+                    lastReplyAt: reply.createdAt,
+                    lastReplyUserId: reply.userId
+                )
+            )
+        } else {
+            return
+        }
+        summaries.sort { $0.lastReplyAt > $1.lastReplyAt }
+        channelThreads[reply.conversationId] = summaries
+    }
+}
+
+// MARK: - Polls
+
+extension CoreChannelsStore {
+    /// Creates a poll, posts an announcement message it's linked to, and shows
+    /// the voting UI inline.
+    func createPoll(question: String, options: [String], in channel: CoreChannel) async {
+        let trimmedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanOptions = options
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !trimmedQuestion.isEmpty, cleanOptions.count >= 2,
+              let conversationId = channel.conversationId else { return }
+        guard configuration.isUsable else { return }
+
+        let announcementText = "📊 \(trimmedQuestion)"
+        let optimistic = makeOptimisticMessage(
+            content: announcementText,
+            channel: channel,
+            conversationId: conversationId,
+            parentMessageId: nil
+        )
+        upsertMessage(optimistic)
+        polls[optimistic.id] = CorePoll(
+            id: "local-\(optimistic.id)",
+            messageId: optimistic.id,
+            question: trimmedQuestion,
+            options: cleanOptions.enumerated().map { index, label in
+                CorePollOption(id: "local-\(index)", label: label, sortOrder: index, votesCount: 0, votedByMe: false)
+            }
+        )
+
+        isSending = true
+        lastError = nil
+        do {
+            let config = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: config)
+            var message = try await client.sendMessage(
+                empresaId: channel.empresaId,
+                conversationId: conversationId,
+                channelId: channel.id,
+                parentMessageId: nil,
+                content: announcementText
+            )
+            message.author = optimistic.author
+            _ = try await client.createPoll(
+                channelId: channel.id,
+                messageId: message.id,
+                question: trimmedQuestion,
+                options: cleanOptions
+            )
+
+            if let staged = polls[optimistic.id] {
+                polls[message.id] = CorePoll(
+                    id: staged.id,
+                    messageId: message.id,
+                    question: staged.question,
+                    options: staged.options
+                )
+            }
+            polls[optimistic.id] = nil
+            removeMessage(id: optimistic.id, conversationId: conversationId)
+            upsertMessage(message)
+            updateChannelPreview(with: message)
+            Task {
+                try? await client.markRead(conversationId: conversationId, lastReadMessageId: message.id)
+            }
+            await loadPolls(for: channel)
+        } catch {
+            polls[optimistic.id] = nil
+            removeMessage(id: optimistic.id, conversationId: conversationId)
+            lastError = error.localizedDescription
+        }
+        isSending = false
+    }
+
+    /// Loads the channel's polls and indexes them by their linked message id.
+    func loadPolls(for channel: CoreChannel) async {
+        guard configuration.isUsable else { return }
+        do {
+            let config = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: config)
+            let loaded = try await client.listPolls(channelId: channel.id)
+            for poll in loaded {
+                if let messageId = poll.messageId {
+                    polls[messageId] = poll
+                }
+            }
+        } catch {
+            // Non-fatal: polls simply won't render.
+        }
+    }
+
+    /// Registers the current user's vote with an optimistic local update.
+    func votePoll(_ poll: CorePoll, optionId: String) async {
+        guard let messageId = poll.messageId else { return }
+
+        if var current = polls[messageId] {
+            for index in current.options.indices {
+                let isTarget = current.options[index].id == optionId
+                let wasVoted = current.options[index].votedByMe
+                if isTarget, !wasVoted {
+                    current.options[index].votesCount += 1
+                    current.options[index].votedByMe = true
+                } else if !isTarget, wasVoted {
+                    current.options[index].votesCount = max(0, current.options[index].votesCount - 1)
+                    current.options[index].votedByMe = false
+                }
+            }
+            polls[messageId] = current
+        }
+
+        guard configuration.isUsable, !poll.id.hasPrefix("local-") else { return }
+        do {
+            let config = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: config)
+            try await client.votePoll(pollId: poll.id, optionId: optionId)
+        } catch {
+            lastError = error.localizedDescription
+        }
     }
 }
 

@@ -82,9 +82,27 @@ struct CoreAppConfiguration: Codable, Equatable {
 enum CoreConfigurationStore {
     private static let key = "zia-chat.core.configuration"
 
+    /// App Group compartido entre la app y la Share Extension. Debe estar
+    /// habilitado en ambos targets (Signing & Capabilities) y en el portal
+    /// de Apple Developer.
+    static let appGroupIdentifier = "group.authcode.ZiaChat"
+
+    private static var sharedDefaults: UserDefaults? {
+        UserDefaults(suiteName: appGroupIdentifier)
+    }
+
     static func load() -> CoreAppConfiguration {
         let environmentDefaults = CoreEnvironment.load()
-        guard let data = UserDefaults.standard.data(forKey: key),
+        // Lee primero del contenedor compartido (extensión + app); cae al
+        // standard para sesiones guardadas antes de introducir el App Group.
+        let sharedData = sharedDefaults?.data(forKey: key)
+        let stored = sharedData ?? UserDefaults.standard.data(forKey: key)
+        // Migra sesiones previas al contenedor compartido para que la
+        // Share Extension pueda verlas sin esperar a un nuevo login.
+        if sharedData == nil, let legacy = stored {
+            sharedDefaults?.set(legacy, forKey: key)
+        }
+        guard let data = stored,
               var configuration = try? JSONDecoder().decode(CoreAppConfiguration.self, from: data) else {
             return CoreAppConfiguration(
                 supabaseURL: environmentDefaults.supabaseURL,
@@ -103,6 +121,7 @@ enum CoreConfigurationStore {
 
     static func save(_ configuration: CoreAppConfiguration) {
         guard let data = try? JSONEncoder().encode(configuration) else { return }
+        sharedDefaults?.set(data, forKey: key)
         UserDefaults.standard.set(data, forKey: key)
     }
 }

@@ -91,7 +91,16 @@ final class PushNotificationService: NSObject, ObservableObject, UNUserNotificat
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        [.banner, .list, .sound, .badge]
+        // Canales silenciados por el usuario: sin banner ni sonido.
+        let destination = Self.destination(from: notification.request.content.userInfo)
+        let muted = Set(UserDefaults.standard.stringArray(forKey: "zia.mutedChannelIds") ?? [])
+        if let channelId = destination.channelId, muted.contains(channelId) {
+            return [.list]
+        }
+        if let conversationId = destination.conversationId, muted.contains(conversationId) {
+            return [.list]
+        }
+        return [.banner, .list, .sound, .badge]
     }
 
     nonisolated func userNotificationCenter(

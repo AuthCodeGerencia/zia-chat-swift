@@ -9,16 +9,76 @@
 /* Begin PBXBuildFile section */
 		F4B032352FD88A0100921463 /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = F4B032362FD88A0100921463 /* Supabase */; };
 		F4B032382FD88A0100921463 /* LiveKit in Frameworks */ = {isa = PBXBuildFile; productRef = F4B032392FD88A0100921463 /* LiveKit */; };
+		F4E5A00D2FD9AA000000000D /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = F4E5A00C2FD9AA000000000C /* Supabase */; };
+		F4E5A00F2FD9AA000000000F /* ZiaShareExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F4E5A0012FD9AA0000000001 /* ZiaShareExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		F4E5A0112FD9AA0000000011 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = F4B032202FD8854400921463 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = F4E5A0022FD9AA0000000002;
+			remoteInfo = ZiaShareExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		F4E5A00E2FD9AA000000000E /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				F4E5A00F2FD9AA000000000F /* ZiaShareExtension.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		F4B032282FD8854400921463 /* ZiaChat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ZiaChat.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F4E5A0012FD9AA0000000001 /* ZiaShareExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = ZiaShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		F4E5A00A2FD9AA000000000A /* Exceptions for "ZiaShareExtension" folder in "ZiaShareExtension" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = F4E5A0022FD9AA0000000002 /* ZiaShareExtension */;
+		};
+		F4E5A00B2FD9AA000000000B /* Exceptions for "ZiaChat" folder in "ZiaShareExtension" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				CoreAppConfiguration.swift,
+				CoreAuthService.swift,
+				CoreEnvironment.swift,
+				CoreModels.swift,
+				SupabaseCoreClient.swift,
+				ZenitTheme.swift,
+			);
+			target = F4E5A0022FD9AA0000000002 /* ZiaShareExtension */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		F4B0322A2FD8854400921463 /* ZiaChat */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				F4E5A00B2FD9AA000000000B /* Exceptions for "ZiaChat" folder in "ZiaShareExtension" target */,
+			);
 			path = ZiaChat;
+			sourceTree = "<group>";
+		};
+		F4E5A0092FD9AA0000000009 /* ZiaShareExtension */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				F4E5A00A2FD9AA000000000A /* Exceptions for "ZiaShareExtension" folder in "ZiaShareExtension" target */,
+			);
+			path = ZiaShareExtension;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -33,6 +93,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F4E5A0042FD9AA0000000004 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F4E5A00D2FD9AA000000000D /* Supabase in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -40,6 +108,7 @@
 			isa = PBXGroup;
 			children = (
 				F4B0322A2FD8854400921463 /* ZiaChat */,
+				F4E5A0092FD9AA0000000009 /* ZiaShareExtension */,
 				F4B032292FD8854400921463 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -48,6 +117,7 @@
 			isa = PBXGroup;
 			children = (
 				F4B032282FD8854400921463 /* ZiaChat.app */,
+				F4E5A0012FD9AA0000000001 /* ZiaShareExtension.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -62,10 +132,12 @@
 				F4B032242FD8854400921463 /* Sources */,
 				F4B032252FD8854400921463 /* Frameworks */,
 				F4B032262FD8854400921463 /* Resources */,
+				F4E5A00E2FD9AA000000000E /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				F4E5A0102FD9AA0000000010 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				F4B0322A2FD8854400921463 /* ZiaChat */,
@@ -79,6 +151,29 @@
 			productReference = F4B032282FD8854400921463 /* ZiaChat.app */;
 			productType = "com.apple.product-type.application";
 		};
+		F4E5A0022FD9AA0000000002 /* ZiaShareExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F4E5A0062FD9AA0000000006 /* Build configuration list for PBXNativeTarget "ZiaShareExtension" */;
+			buildPhases = (
+				F4E5A0032FD9AA0000000003 /* Sources */,
+				F4E5A0042FD9AA0000000004 /* Frameworks */,
+				F4E5A0052FD9AA0000000005 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				F4E5A0092FD9AA0000000009 /* ZiaShareExtension */,
+			);
+			name = ZiaShareExtension;
+			packageProductDependencies = (
+				F4E5A00C2FD9AA000000000C /* Supabase */,
+			);
+			productName = ZiaShareExtension;
+			productReference = F4E5A0012FD9AA0000000001 /* ZiaShareExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -90,6 +185,9 @@
 				LastUpgradeCheck = 2630;
 				TargetAttributes = {
 					F4B032272FD8854400921463 = {
+						CreatedOnToolsVersion = 26.3;
+					};
+					F4E5A0022FD9AA0000000002 = {
 						CreatedOnToolsVersion = 26.3;
 					};
 				};
@@ -113,12 +211,20 @@
 			projectRoot = "";
 			targets = (
 				F4B032272FD8854400921463 /* ZiaChat */,
+				F4E5A0022FD9AA0000000002 /* ZiaShareExtension */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		F4B032262FD8854400921463 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F4E5A0052FD9AA0000000005 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -135,7 +241,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F4E5A0032FD9AA0000000003 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		F4E5A0102FD9AA0000000010 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = F4E5A0022FD9AA0000000002 /* ZiaShareExtension */;
+			targetProxy = F4E5A0112FD9AA0000000011 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		F4B032312FD8854600921463 /* Debug */ = {
@@ -346,6 +467,70 @@
 			};
 			name = Release;
 		};
+		F4E5A0072FD9AA0000000007 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ZiaShareExtension/ZiaShareExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 87DK3Z664S;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = ZiaShareExtension/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Zia Chat";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = authcode.ZiaChat.ShareExtension;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		F4E5A0082FD9AA0000000008 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ZiaShareExtension/ZiaShareExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 87DK3Z664S;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = ZiaShareExtension/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Zia Chat";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = authcode.ZiaChat.ShareExtension;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -367,17 +552,18 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		F4E5A0062FD9AA0000000006 /* Build configuration list for PBXNativeTarget "ZiaShareExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F4E5A0072FD9AA0000000007 /* Debug */,
+				F4E5A0082FD9AA0000000008 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
-		F4B0323A2FD88A0100921463 /* XCRemoteSwiftPackageReference "client-sdk-swift" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/livekit/client-sdk-swift.git";
-			requirement = {
-				kind = exactVersion;
-				version = 2.14.1;
-			};
-		};
 		F4B032372FD88A0100921463 /* XCRemoteSwiftPackageReference "supabase-swift" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/supabase/supabase-swift.git";
@@ -386,15 +572,28 @@
 				minimumVersion = 2.0.0;
 			};
 		};
+		F4B0323A2FD88A0100921463 /* XCRemoteSwiftPackageReference "client-sdk-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/livekit/client-sdk-swift.git";
+			requirement = {
+				kind = exactVersion;
+				version = 2.14.1;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		F4B032362FD88A0100921463 /* Supabase */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = F4B032372FD88A0100921463 /* XCRemoteSwiftPackageReference "supabase-swift" */;
+			productName = Supabase;
+		};
 		F4B032392FD88A0100921463 /* LiveKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = F4B0323A2FD88A0100921463 /* XCRemoteSwiftPackageReference "client-sdk-swift" */;
 			productName = LiveKit;
 		};
-		F4B032362FD88A0100921463 /* Supabase */ = {
+		F4E5A00C2FD9AA000000000C /* Supabase */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = F4B032372FD88A0100921463 /* XCRemoteSwiftPackageReference "supabase-swift" */;
 			productName = Supabase;

@@ -2,6 +2,7 @@ import AVFoundation
 import Combine
 import Foundation
 import LiveKit
+import SwiftUI
 
 struct CoreVoiceParticipant: Identifiable, Equatable {
     var id: String
@@ -66,7 +67,13 @@ final class CoreVoiceRoomStore: NSObject, ObservableObject, RoomDelegate, @unche
     @Published private(set) var connectedChannel: CoreChannel?
     @Published private(set) var isMuted = false
     @Published private(set) var isSpeakerEnabled = true
+    @Published private(set) var screenShareTrack: VideoTrack?
+    @Published private(set) var screenShareOwnerName: String?
     @Published var lastError: String?
+
+    var isScreenSharing: Bool {
+        screenShareTrack != nil
+    }
 
     private var room: Room?
 
@@ -75,7 +82,8 @@ final class CoreVoiceRoomStore: NSObject, ObservableObject, RoomDelegate, @unche
     }
 
     func join(channel: CoreChannel, configuration: CoreAppConfiguration) async {
-        guard channel.isVoice else { return }
+        // Igual que la web: cualquier canal (texto o voz) tiene una sala de voz.
+        // El room se deriva en el servidor: core-voice-{empresaId}-{channelId}.
         if connectedChannel?.id == channel.id, isConnected { return }
 
         await leave()
@@ -117,6 +125,8 @@ final class CoreVoiceRoomStore: NSObject, ObservableObject, RoomDelegate, @unche
         room = nil
         connectedChannel = nil
         participants = []
+        screenShareTrack = nil
+        screenShareOwnerName = nil
         isMuted = false
         connectionState = .disconnected
         if let activeRoom {
@@ -193,12 +203,36 @@ final class CoreVoiceRoomStore: NSObject, ObservableObject, RoomDelegate, @unche
         }
     }
 
+    nonisolated func room(
+        _ room: Room,
+        participant: RemoteParticipant,
+        trackPublication: RemoteTrackPublication,
+        didSubscribe track: Track
+    ) {
+        Task { @MainActor [weak self] in
+            self?.refreshParticipants(room)
+        }
+    }
+
+    nonisolated func room(
+        _ room: Room,
+        participant: RemoteParticipant,
+        trackPublication: RemoteTrackPublication,
+        didUnsubscribe track: Track
+    ) {
+        Task { @MainActor [weak self] in
+            self?.refreshParticipants(room)
+        }
+    }
+
     nonisolated func room(_ room: Room, didDisconnectWithError error: LiveKitError?) {
         Task { @MainActor [weak self] in
             guard let self, self.room === room else { return }
             self.room = nil
             self.connectedChannel = nil
             self.participants = []
+            self.screenShareTrack = nil
+            self.screenShareOwnerName = nil
             self.connectionState = .disconnected
             if let error {
                 self.lastError = error.localizedDescription
@@ -225,6 +259,25 @@ final class CoreVoiceRoomStore: NSObject, ObservableObject, RoomDelegate, @unche
             if $0.isSpeaking != $1.isSpeaking { return $0.isSpeaking }
             return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
+        refreshScreenShare(room)
+    }
+
+    private func refreshScreenShare(_ room: Room) {
+        for participant in room.remoteParticipants.values {
+            guard let publication = participant.videoTracks.first(where: { $0.source == .screenShareVideo }),
+                  let track = publication.track as? VideoTrack else {
+                continue
+            }
+            screenShareOwnerName = participant.name?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank ?? "Participante"
+            if screenShareTrack !== track {
+                screenShareTrack = track
+            }
+            return
+        }
+        screenShareTrack = nil
+        screenShareOwnerName = nil
     }
 
     private func participantRow(
@@ -290,5 +343,41 @@ private extension String {
     var nilIfBlank: String? {
         let value = trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? nil : value
+    }
+}
+
+// MARK: - Pantalla compartida
+
+/// Renderiza el track de pantalla compartida activo de la sala de voz.
+/// Vive aquí (y no en ContentView) para que solo este archivo importe LiveKit.
+struct VoiceScreenShareView: View {
+    @ObservedObject var voiceStore: CoreVoiceRoomStore
+    var layoutMode: VideoView.LayoutMode = .fit
+
+    var body: some View {
+        if let track = voiceStore.screenShareTrack {
+            LiveKitVideoView(track: track, layoutMode: layoutMode)
+        } else {
+            Color.black
+        }
+    }
+}
+
+private struct LiveKitVideoView: UIViewRepresentable {
+    let track: VideoTrack
+    var layoutMode: VideoView.LayoutMode
+
+    func makeUIView(context: Context) -> VideoView {
+        let view = VideoView()
+        view.layoutMode = layoutMode
+        view.track = track
+        return view
+    }
+
+    func updateUIView(_ uiView: VideoView, context: Context) {
+        uiView.layoutMode = layoutMode
+        if uiView.track !== track {
+            uiView.track = track
+        }
     }
 }

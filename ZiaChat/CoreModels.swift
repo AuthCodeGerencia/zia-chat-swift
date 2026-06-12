@@ -6,9 +6,174 @@ enum CoreChannelVisibility: String, Codable, CaseIterable, Hashable {
     case `private`
 }
 
+struct CoreChannelTheme: Codable, Hashable {
+    var preset: String? = nil
+    var background: String? = nil
+    var backgroundImage: String? = nil
+    var backgroundImageOpacity: Double? = nil
+    var accent: String? = nil
+    var titleColor: String? = nil
+    var surface: String? = nil
+    var bubbleMine: String? = nil
+    var bubbleOther: String? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case preset
+        case background
+        case backgroundImage
+        case backgroundImageOpacity
+        case accent
+        case titleColor
+        case surface
+        case bubbleMine
+        case bubbleOther
+    }
+
+    init(
+        preset: String? = nil,
+        background: String? = nil,
+        backgroundImage: String? = nil,
+        backgroundImageOpacity: Double? = nil,
+        accent: String? = nil,
+        titleColor: String? = nil,
+        surface: String? = nil,
+        bubbleMine: String? = nil,
+        bubbleOther: String? = nil
+    ) {
+        self.preset = preset
+        self.background = background
+        self.backgroundImage = backgroundImage
+        self.backgroundImageOpacity = backgroundImageOpacity
+        self.accent = accent
+        self.titleColor = titleColor
+        self.surface = surface
+        self.bubbleMine = bubbleMine
+        self.bubbleOther = bubbleOther
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        preset = try? container.decodeIfPresent(String.self, forKey: .preset)
+        background = try? container.decodeIfPresent(String.self, forKey: .background)
+        backgroundImage = try? container.decodeIfPresent(String.self, forKey: .backgroundImage)
+        if let value = try? container.decodeIfPresent(Double.self, forKey: .backgroundImageOpacity) {
+            backgroundImageOpacity = value
+        } else if let value = try? container.decodeIfPresent(Int.self, forKey: .backgroundImageOpacity) {
+            backgroundImageOpacity = Double(value)
+        }
+        accent = try? container.decodeIfPresent(String.self, forKey: .accent)
+        titleColor = try? container.decodeIfPresent(String.self, forKey: .titleColor)
+        surface = try? container.decodeIfPresent(String.self, forKey: .surface)
+        bubbleMine = try? container.decodeIfPresent(String.self, forKey: .bubbleMine)
+        bubbleOther = try? container.decodeIfPresent(String.self, forKey: .bubbleOther)
+    }
+}
+
 struct CoreChannelMetadata: Codable, Hashable {
-    var channelType: String?
-    var iconImage: String?
+    var channelType: String? = nil
+    var iconImage: String? = nil
+    var theme: CoreChannelTheme? = nil
+    var businessUnitId: Int? = nil
+    // Claves que la web guarda en metadata y deben sobrevivir a una edición.
+    var inviteToken: String? = nil
+    var inviteTokenCreatedAt: String? = nil
+    var inviteTokenCreatedBy: String? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case channelType
+        case iconImage
+        case theme
+        case businessUnitId
+        case inviteToken
+        case inviteTokenCreatedAt
+        case inviteTokenCreatedBy
+    }
+
+    init(
+        channelType: String? = nil,
+        iconImage: String? = nil,
+        theme: CoreChannelTheme? = nil,
+        businessUnitId: Int? = nil,
+        inviteToken: String? = nil,
+        inviteTokenCreatedAt: String? = nil,
+        inviteTokenCreatedBy: String? = nil
+    ) {
+        self.channelType = channelType
+        self.iconImage = iconImage
+        self.theme = theme
+        self.businessUnitId = businessUnitId
+        self.inviteToken = inviteToken
+        self.inviteTokenCreatedAt = inviteTokenCreatedAt
+        self.inviteTokenCreatedBy = inviteTokenCreatedBy
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        channelType = try? container.decodeIfPresent(String.self, forKey: .channelType)
+        iconImage = try? container.decodeIfPresent(String.self, forKey: .iconImage)
+        theme = try? container.decodeIfPresent(CoreChannelTheme.self, forKey: .theme)
+        if let value = try? container.decodeIfPresent(Int.self, forKey: .businessUnitId) {
+            businessUnitId = value
+        } else if let value = try? container.decodeIfPresent(String.self, forKey: .businessUnitId) {
+            businessUnitId = Int(value)
+        }
+        inviteToken = try? container.decodeIfPresent(String.self, forKey: .inviteToken)
+        inviteTokenCreatedAt = try? container.decodeIfPresent(String.self, forKey: .inviteTokenCreatedAt)
+        inviteTokenCreatedBy = try? container.decodeIfPresent(String.self, forKey: .inviteTokenCreatedBy)
+    }
+}
+
+struct CoreChannelMemberRole: Codable, Hashable {
+    var userId: String
+    var role: String?
+
+    enum CodingKeys: String, CodingKey {
+        case userId = "user_id"
+        case role
+    }
+}
+
+struct CoreInternalCompany: Identifiable, Codable, Hashable {
+    var id: Int
+    var name: String
+}
+
+/// Mensaje directo (conversación type='dm' de la web). `id` = conversation id.
+struct CoreDirectMessage: Identifiable, Hashable {
+    var id: String
+    var empresaId: Int
+    var dmKey: String?
+    var peer: CoreUserLite
+    var unreadCount: Int = 0
+    var mentionCount: Int = 0
+    var lastMessageContent: String?
+    var lastMessageAt: Date?
+    var lastMessageUserId: String?
+}
+
+extension CoreChannel {
+    /// Canal "fantasma" que representa un DM para reutilizar las vistas de chat.
+    var isDirectMessage: Bool {
+        metadata?.channelType == "dm"
+    }
+}
+
+extension CoreDirectMessage {
+    /// Alias del canal fantasma (compatibilidad con código que usa chatTarget).
+    var chatTarget: CoreChannel {
+        CoreChannel(
+            id: id,
+            empresaId: empresaId,
+            name: peer.displayName,
+            slug: "dm-\(id)",
+            description: "Mensaje directo",
+            visibility: .private,
+            metadata: CoreChannelMetadata(channelType: "dm", iconImage: peer.avatarURLString),
+            conversationId: id,
+            unreadCount: unreadCount,
+            mentionCount: mentionCount
+        )
+    }
 }
 
 struct CoreChannel: Identifiable, Codable, Hashable {
@@ -116,70 +281,9 @@ struct CoreChannel: Identifiable, Codable, Hashable {
     }
 
     var tint: Color {
-        if isVoice { return .blue }
-        return visibility == .private ? .purple : .teal
-    }
-}
-
-struct CoreDirectMessage: Identifiable, Codable, Hashable {
-    var id: String
-    var empresaId: Int
-    var dmKey: String
-    var createdAt: Date
-    var updatedAt: Date
-    var peerId: String
-    var peerFullName: String?
-    var peerAvatarURLString: String?
-    var peerRoleId: Int?
-    var unreadCount: Int
-    var mentionCount: Int
-    var lastMessageId: String?
-    var lastMessageUserId: String?
-    var lastMessageContent: String?
-    var lastMessageCreatedAt: Date?
-
-    enum CodingKeys: String, CodingKey {
-        case id
-        case empresaId = "empresa_id"
-        case dmKey = "dm_key"
-        case createdAt = "created_at"
-        case updatedAt = "updated_at"
-        case peerId = "peer_id"
-        case peerFullName = "peer_full_name"
-        case peerAvatarURLString = "peer_avatar_url"
-        case peerRoleId = "peer_rol_id"
-        case unreadCount = "unread_count"
-        case mentionCount = "mention_count"
-        case lastMessageId = "last_message_id"
-        case lastMessageUserId = "last_message_user_id"
-        case lastMessageContent = "last_message_content"
-        case lastMessageCreatedAt = "last_message_created_at"
-    }
-
-    var peer: CoreUserLite {
-        CoreUserLite(
-            id: peerId,
-            fullName: peerFullName,
-            avatarURLString: peerAvatarURLString,
-            roleId: peerRoleId
-        )
-    }
-
-    var chatTarget: CoreChannel {
-        CoreChannel(
-            id: id,
-            empresaId: empresaId,
-            name: peer.displayName,
-            slug: "dm-\(peerId)",
-            description: "Direct message",
-            visibility: .private,
-            createdAt: createdAt,
-            updatedAt: updatedAt,
-            metadata: CoreChannelMetadata(channelType: "dm", iconImage: nil),
-            conversationId: id,
-            unreadCount: unreadCount,
-            mentionCount: mentionCount
-        )
+        // Paleta Grupo Zenit: teal corporativo, oliva y khaki.
+        if isVoice { return ZenitBrand.khaki }
+        return visibility == .private ? ZenitBrand.olive : ZenitBrand.teal
     }
 }
 
@@ -290,6 +394,7 @@ struct CoreAttachment: Identifiable, Codable, Hashable {
     }
 
     var systemImage: String {
+        if isVideo { return "video" }
         guard let mimeType else { return "paperclip" }
         if mimeType.hasPrefix("image/") { return "photo" }
         if mimeType.contains("pdf") { return "doc.richtext" }
@@ -303,6 +408,18 @@ struct CoreAttachment: Identifiable, Codable, Hashable {
     var isGIF: Bool {
         mimeType?.lowercased() == "image/gif" ||
         fileName.lowercased().hasSuffix(".gif")
+    }
+
+    var isAudio: Bool {
+        if mimeType?.hasPrefix("audio/") == true { return true }
+        let ext = (fileName as NSString).pathExtension.lowercased()
+        return ["m4a", "mp3", "wav", "aac", "caf", "ogg"].contains(ext)
+    }
+
+    var isVideo: Bool {
+        if mimeType?.hasPrefix("video/") == true { return true }
+        let ext = (fileName as NSString).pathExtension.lowercased()
+        return ["mp4", "mov", "m4v", "webm", "avi"].contains(ext)
     }
 }
 
@@ -328,8 +445,45 @@ struct CorePendingAttachment: Identifiable, Hashable {
     }
 }
 
+/// Cita de respuesta (paridad con metadata.replyTo de la web).
+struct CoreMessageReplyTo: Codable, Hashable {
+    var messageId: String
+    var authorId: String?
+    var authorName: String?
+    var content: String?
+    var createdAt: String?
+    var hasAttachments: Bool?
+
+    var displayAuthor: String {
+        authorName?.isEmpty == false ? authorName! : "Usuario Core"
+    }
+
+    var preview: String {
+        let text = (content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty { return text }
+        return hasAttachments == true ? "Mensaje con adjuntos" : "Mensaje"
+    }
+}
+
 struct CoreMessageMetadata: Codable, Hashable {
     var attachments: [CoreMetadataAttachment]?
+    var replyTo: CoreMessageReplyTo?
+
+    enum CodingKeys: String, CodingKey {
+        case attachments
+        case replyTo
+    }
+
+    init(attachments: [CoreMetadataAttachment]? = nil, replyTo: CoreMessageReplyTo? = nil) {
+        self.attachments = attachments
+        self.replyTo = replyTo
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        attachments = try? container.decodeIfPresent([CoreMetadataAttachment].self, forKey: .attachments)
+        replyTo = try? container.decodeIfPresent(CoreMessageReplyTo.self, forKey: .replyTo)
+    }
 }
 
 struct CoreMetadataAttachment: Codable, Hashable {
@@ -420,6 +574,46 @@ struct CoreMessageQuote: Identifiable, Hashable {
     var id: String
     var content: String
     var authorName: String
+}
+
+/// Summary of one thread (root message + reply stats) used by the channel
+/// threads overview.
+struct CoreThreadSummary: Identifiable, Hashable {
+    var root: CoreMessage
+    var replyCount: Int
+    var lastReplyAt: Date
+    var lastReplyUserId: String?
+
+    var id: String { root.id }
+}
+
+struct CoreSticker: Identifiable, Codable, Hashable {
+    var id: String
+    var name: String
+    var imageURL: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case imageURL = "image_url"
+    }
+}
+
+struct CorePoll: Identifiable, Hashable {
+    let id: String
+    let messageId: String?
+    let question: String
+    var options: [CorePollOption]
+
+    var totalVotes: Int { options.reduce(0) { $0 + $1.votesCount } }
+}
+
+struct CorePollOption: Identifiable, Hashable {
+    let id: String
+    let label: String
+    let sortOrder: Int
+    var votesCount: Int
+    var votedByMe: Bool
 }
 
 extension Array where Element == CoreReaction {

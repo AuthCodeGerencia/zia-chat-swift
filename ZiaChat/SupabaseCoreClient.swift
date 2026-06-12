@@ -5,6 +5,7 @@ enum SupabaseCoreError: LocalizedError {
     case notConfigured
     case invalidURL
     case emptyResponse
+    case attachmentUpload(String)
 
     var errorDescription: String? {
         switch self {
@@ -14,6 +15,8 @@ enum SupabaseCoreError: LocalizedError {
             return "Invalid Supabase project URL."
         case .emptyResponse:
             return "Supabase returned an empty response."
+        case .attachmentUpload(let message):
+            return message
         }
     }
 }
@@ -78,8 +81,10 @@ final class SupabaseCoreClient {
         return channels.filter { $0.empresaId == empresaId }
     }
 
+    /// Lista los mensajes directos del usuario (RPC core_list_user_dms, igual
+    /// que la web).
     func listDirectMessages() async throws -> [CoreDirectMessage] {
-        let directMessages: [CoreDirectMessage] = try await client
+        let rows: [CoreDMRpcRow] = try await client
             .rpc(
                 "core_list_user_dms",
                 params: ListChannelsParams(pDisplayName: configuration.displayName.nilIfBlank)
@@ -87,8 +92,35 @@ final class SupabaseCoreClient {
             .execute()
             .value
 
-        guard let empresaId = configuration.empresaId else { return directMessages }
-        return directMessages.filter { $0.empresaId == empresaId }
+        let filtered: [CoreDMRpcRow]
+        if let empresaId = configuration.empresaId {
+            filtered = rows.filter { $0.empresaId == empresaId }
+        } else {
+            filtered = rows
+        }
+
+        return filtered.map { row in
+            let peer = normalizedAvatarUser(
+                CoreUserLite(
+                    id: row.peerId,
+                    fullName: row.peerFullName,
+                    avatarURLString: row.peerAvatarUrl,
+                    roleId: row.peerRolId
+                )
+            )
+            return CoreDirectMessage(
+                id: row.id,
+                empresaId: row.empresaId,
+                dmKey: row.dmKey,
+                peer: peer,
+                unreadCount: row.unreadCount ?? 0,
+                mentionCount: row.mentionCount ?? 0,
+                lastMessageContent: row.lastMessageContent,
+                lastMessageAt: row.lastMessageCreatedAt,
+                lastMessageUserId: row.lastMessageUserId
+            )
+        }
+        .sorted { ($0.lastMessageAt ?? .distantPast) > ($1.lastMessageAt ?? .distantPast) }
     }
 
     func listMentionableUsers() async throws -> [CoreUserLite] {
@@ -130,18 +162,43 @@ final class SupabaseCoreClient {
         return users.map(normalizedAvatarUser)
     }
 
-    func createChannel(name: String, description: String, visibility: CoreChannelVisibility) async throws -> CoreChannel {
-        let rows: [CoreChannelCreateResponse] = try await client
-            .rpc(
-                "core_create_channel",
-                params: CreateChannelParams(
-                    pName: name,
-                    pDescription: description.nilIfBlank,
-                    pVisibility: visibility.rawValue
+    func createChannel(
+        name: String,
+        description: String,
+        visibility: CoreChannelVisibility,
+        channelType: String = "text",
+        metadata: CoreChannelMetadata? = nil
+    ) async throws -> CoreChannel {
+        let rows: [CoreChannelCreateResponse]
+        do {
+            rows = try await client
+                .rpc(
+                    "core_create_channel",
+                    params: CreateChannelParams(
+                        pName: name,
+                        pDescription: description.nilIfBlank,
+                        pVisibility: visibility.rawValue,
+                        pChannelType: channelType,
+                        pMetadata: metadata
+                    )
                 )
-            )
-            .execute()
-            .value
+                .execute()
+                .value
+        } catch {
+            // Fallback for backends without the v2 RPC (extra params not deployed yet).
+            guard "\(error)".contains("core_create_channel") else { throw error }
+            rows = try await client
+                .rpc(
+                    "core_create_channel",
+                    params: LegacyCreateChannelParams(
+                        pName: name,
+                        pDescription: description.nilIfBlank,
+                        pVisibility: visibility.rawValue
+                    )
+                )
+                .execute()
+                .value
+        }
 
         guard let row = rows.first else { throw SupabaseCoreError.emptyResponse }
         return CoreChannel(
@@ -151,8 +208,115 @@ final class SupabaseCoreClient {
             slug: row.slug,
             description: row.description,
             visibility: row.visibility,
+            metadata: row.metadata ?? metadata,
             conversationId: row.conversationId
         )
+    }
+
+    /// Réplica de slugifyCoreName de la web (services/core/client).
+    static func slugifyCoreName(_ value: String) -> String {
+        let folded = value
+            .folding(options: .diacriticInsensitive, locale: Locale(identifier: "en_US"))
+            .lowercased()
+        var result = ""
+        var lastWasDash = false
+        for character in folded {
+            if character.isASCII, character.isLetter || character.isNumber {
+                result.append(character)
+                lastWasDash = false
+            } else if !lastWasDash {
+                result.append("-")
+                lastWasDash = true
+            }
+        }
+        let trimmed = result.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return String(trimmed.prefix(64))
+    }
+
+    /// Actualiza un canal igual que la web (update directo a core_channels:
+    /// nombre, slug, descripción, visibilidad y metadata completa).
+    func updateChannel(
+        channelId: String,
+        name: String,
+        description: String,
+        visibility: CoreChannelVisibility,
+        metadata: CoreChannelMetadata
+    ) async throws {
+        let slug = Self.slugifyCoreName(name)
+        guard !slug.isEmpty else {
+            throw SupabaseCoreError.attachmentUpload("Nombre de canal inválido")
+        }
+        try await client
+            .from("core_channels")
+            .update(
+                ChannelUpdateRow(
+                    name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+                    slug: slug,
+                    description: description.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
+                    visibility: visibility.rawValue,
+                    metadata: metadata
+                )
+            )
+            .eq("id", value: channelId)
+            .execute()
+    }
+
+    /// Metadata fresca del canal directo de la tabla (la lista rápida no la trae).
+    func fetchChannelMetadata(channelId: String) async throws -> CoreChannelMetadata? {
+        let rows: [ChannelMetadataRow] = try await client
+            .from("core_channels")
+            .select("metadata")
+            .eq("id", value: channelId)
+            .limit(1)
+            .execute()
+            .value
+        return rows.first?.metadata
+    }
+
+    func listChannelMemberRoles(channelId: String) async throws -> [CoreChannelMemberRole] {
+        try await client
+            .from("core_channel_members")
+            .select("user_id, role")
+            .eq("channel_id", value: channelId)
+            .execute()
+            .value
+    }
+
+    /// "Eliminar" canal con la misma semántica de la web: archivar
+    /// (is_archived + slug renombrado) para que deje de aparecer a todos.
+    func archiveChannel(_ channel: CoreChannel) async throws {
+        try await client
+            .from("core_channels")
+            .update(
+                ChannelArchiveRow(
+                    isArchived: true,
+                    slug: "\(channel.slug)-archived-\(Int(Date().timeIntervalSince1970 * 1_000))"
+                )
+            )
+            .eq("id", value: channel.id)
+            .execute()
+    }
+
+    func syncChannelMembers(channelId: String, userIds: [String], adminIds: [String]) async throws {
+        _ = try await client
+            .rpc(
+                "core_sync_channel_members",
+                params: SyncChannelMembersParams(
+                    pChannelId: channelId,
+                    pUserIds: userIds,
+                    pAdminIds: adminIds
+                )
+            )
+            .execute()
+    }
+
+    func listInternalCompanies() async throws -> [CoreInternalCompany] {
+        try await client
+            .from("internal_companies")
+            .select("id,name")
+            .order("name", ascending: true)
+            .execute()
+            .value
     }
 
     func searchChannelMessages(keyword: String, channelIds: [String]) async throws -> [CoreMessage] {
@@ -293,6 +457,57 @@ final class SupabaseCoreClient {
         return try await enrich(replies)
     }
 
+    /// Lists every thread in a conversation (root messages that have replies),
+    /// with reply count and the timestamp/author of the latest reply.
+    func listChannelThreads(conversationId: String) async throws -> [CoreThreadSummary] {
+        let replies: [ThreadReplyMeta] = try await client
+            .from("core_messages")
+            .select("parent_message_id,user_id,created_at")
+            .eq("conversation_id", value: conversationId)
+            .not("parent_message_id", operator: .is, value: "null")
+            .is("deleted_at", value: nil)
+            .order("created_at", ascending: false)
+            .limit(1_000)
+            .execute()
+            .value
+
+        guard !replies.isEmpty else { return [] }
+
+        var counts: [String: Int] = [:]
+        var lastReplyAt: [String: Date] = [:]
+        var lastReplyUser: [String: String] = [:]
+        for reply in replies {
+            guard let parentId = reply.parentMessageId else { continue }
+            counts[parentId, default: 0] += 1
+            // Replies arrive newest-first, so the first one wins.
+            if lastReplyAt[parentId] == nil {
+                lastReplyAt[parentId] = reply.createdAt
+                lastReplyUser[parentId] = reply.userId
+            }
+        }
+
+        let roots: [CoreMessage] = try await client
+            .from("core_messages")
+            .select(Self.messageColumns)
+            .in("id", values: Array(counts.keys))
+            .is("deleted_at", value: nil)
+            .execute()
+            .value
+        let enriched = (try? await enrich(roots)) ?? roots
+
+        return enriched
+            .compactMap { root -> CoreThreadSummary? in
+                guard let count = counts[root.id], let lastAt = lastReplyAt[root.id] else { return nil }
+                return CoreThreadSummary(
+                    root: root,
+                    replyCount: count,
+                    lastReplyAt: lastAt,
+                    lastReplyUserId: lastReplyUser[root.id]
+                )
+            }
+            .sorted { $0.lastReplyAt > $1.lastReplyAt }
+    }
+
     func forwardMessage(_ source: CoreMessage, to channel: CoreChannel) async throws -> CoreMessage {
         guard let conversationId = channel.conversationId else {
             throw SupabaseCoreError.emptyResponse
@@ -372,7 +587,8 @@ final class SupabaseCoreClient {
         channelId: String?,
         parentMessageId: String?,
         content: String,
-        attachments: [CorePendingAttachment] = []
+        attachments: [CorePendingAttachment] = [],
+        replyTo: CoreMessageReplyTo? = nil
     ) async throws -> CoreMessage {
         try await ensureMembership(conversationId: conversationId, channelId: channelId)
 
@@ -382,7 +598,8 @@ final class SupabaseCoreClient {
             channelId: channelId,
             parentMessageId: parentMessageId,
             userId: configuration.userId,
-            content: content
+            content: content,
+            metadata: replyTo.map { CoreMessageMetadata(replyTo: $0) }
         )
 
         let inserted: [CoreMessage] = try await client
@@ -418,8 +635,151 @@ final class SupabaseCoreClient {
                 .update(["deleted_at": ISO8601DateFormatter().string(from: Date())])
                 .eq("id", value: message.id)
                 .execute()
-            throw error
+            throw Self.mapAttachmentError(error)
         }
+    }
+
+    // MARK: - Polls
+
+    /// Creates a poll (core_polls + core_poll_options), mirroring the web app's
+    /// direct-insert flow. Returns the new poll id.
+    @discardableResult
+    func createPoll(channelId: String?, messageId: String?, question: String, options: [String]) async throws -> String {
+        guard let empresaId = configuration.empresaId else { throw SupabaseCoreError.notConfigured }
+        let cleanQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanOptions = options
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !cleanQuestion.isEmpty, cleanOptions.count >= 2 else {
+            throw SupabaseCoreError.emptyResponse
+        }
+
+        let pollRows: [PollIDRow] = try await client
+            .from("core_polls")
+            .insert(
+                PollInsert(
+                    empresaId: empresaId,
+                    channelId: channelId,
+                    messageId: messageId,
+                    question: cleanQuestion,
+                    createdBy: configuration.userId
+                )
+            )
+            .select("id")
+            .execute()
+            .value
+        guard let pollId = pollRows.first?.id else { throw SupabaseCoreError.emptyResponse }
+
+        let optionRows = cleanOptions.enumerated().map { index, label in
+            PollOptionInsert(pollId: pollId, label: label, sortOrder: index)
+        }
+        try await client
+            .from("core_poll_options")
+            .insert(optionRows)
+            .execute()
+
+        return pollId
+    }
+
+    /// Lists the channel's polls with their options and aggregated vote counts.
+    func listPolls(channelId: String) async throws -> [CorePoll] {
+        let pollRows: [PollRowDTO] = try await client
+            .from("core_polls")
+            .select("id,message_id,question,options:core_poll_options(id,label,sort_order)")
+            .eq("channel_id", value: channelId)
+            .order("created_at", ascending: false)
+            .limit(60)
+            .execute()
+            .value
+
+        let optionIds = pollRows.flatMap { $0.options.map(\.id) }
+        var votes: [PollVoteDTO] = []
+        if !optionIds.isEmpty {
+            votes = try await client
+                .from("core_poll_votes")
+                .select("option_id,user_id")
+                .in("option_id", values: optionIds)
+                .execute()
+                .value
+        }
+
+        let me = configuration.userId
+        return pollRows.map { row in
+            let options = row.options
+                .sorted { $0.sortOrder < $1.sortOrder }
+                .map { option -> CorePollOption in
+                    let optionVotes = votes.filter { $0.optionId == option.id }
+                    return CorePollOption(
+                        id: option.id,
+                        label: option.label,
+                        sortOrder: option.sortOrder,
+                        votesCount: optionVotes.count,
+                        votedByMe: optionVotes.contains { $0.userId == me }
+                    )
+                }
+            return CorePoll(id: row.id, messageId: row.messageId, question: row.question, options: options)
+        }
+    }
+
+    /// Records the current user's vote, replacing any previous vote on the poll.
+    func votePoll(pollId: String, optionId: String) async throws {
+        try await client
+            .from("core_poll_votes")
+            .delete()
+            .eq("poll_id", value: pollId)
+            .eq("user_id", value: configuration.userId)
+            .execute()
+
+        try await client
+            .from("core_poll_votes")
+            .insert(PollVoteInsert(pollId: pollId, optionId: optionId, userId: configuration.userId))
+            .execute()
+    }
+
+    // MARK: - Stickers
+
+    func listStickers() async throws -> [CoreSticker] {
+        guard let empresaId = configuration.empresaId else { return [] }
+        let rows: [CoreSticker] = try await client
+            .from("core_stickers")
+            .select("id,name,image_url")
+            .eq("empresa_id", value: empresaId)
+            .order("name", ascending: true)
+            .execute()
+            .value
+        return rows
+    }
+
+    /// Uploads a sticker via the web app's `/api/core/stickers` route (same
+    /// endpoint the React client uses), authenticating with the current bearer
+    /// token.
+    func uploadSticker(name: String, data: Data, fileName: String, mimeType: String) async throws -> CoreSticker {
+        let base = CoreEnvironment.load().appURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let url = URL(string: "\(base)/api/core/stickers") else { throw SupabaseCoreError.invalidURL }
+
+        let boundary = "Boundary-\(UUID().uuidString)"
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(configuration.accessToken)", forHTTPHeaderField: "Authorization")
+
+        var body = Data()
+        func appendString(_ string: String) { body.append(Data(string.utf8)) }
+        appendString("--\(boundary)\r\n")
+        appendString("Content-Disposition: form-data; name=\"name\"\r\n\r\n")
+        appendString("\(name)\r\n")
+        appendString("--\(boundary)\r\n")
+        appendString("Content-Disposition: form-data; name=\"file\"; filename=\"\(fileName)\"\r\n")
+        appendString("Content-Type: \(mimeType)\r\n\r\n")
+        body.append(data)
+        appendString("\r\n--\(boundary)--\r\n")
+        request.httpBody = body
+
+        let (responseData, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw SupabaseCoreError.emptyResponse
+        }
+        return try JSONDecoder().decode(StickerUploadResponse.self, from: responseData).sticker
     }
 
     func react(empresaId: Int, conversationId: String, messageId: String, emoji: String) async throws {
@@ -622,13 +982,17 @@ final class SupabaseCoreClient {
         for (index, attachment) in attachments.enumerated() {
             let safeName = Self.safeFileName(attachment.fileName)
             let path = "core-attachments/\(empresaId)/\(conversationId)/\(messageId)/\(Int(Date().timeIntervalSince1970 * 1_000))-\(index)-\(safeName)"
-            try await client.storage
-                .from(Self.attachmentsBucket)
-                .upload(
-                    path,
-                    data: attachment.data,
-                    options: FileOptions(contentType: attachment.mimeType)
-                )
+            do {
+                try await client.storage
+                    .from(Self.attachmentsBucket)
+                    .upload(
+                        path,
+                        data: attachment.data,
+                        options: FileOptions(contentType: attachment.mimeType)
+                    )
+            } catch {
+                throw Self.mapAttachmentError(error)
+            }
             rows.append(
                 CoreAttachmentInsert(
                     empresaId: empresaId,
@@ -643,6 +1007,31 @@ final class SupabaseCoreClient {
             )
         }
         return rows
+    }
+
+    /// Convierte errores crudos de Storage/PostgREST (p. ej. "status code 404
+    /// body {}") en mensajes accionables. El 404 al subir adjuntos casi siempre
+    /// significa que falta el bucket `core-attachments` o la tabla
+    /// `core_attachments` (migración 20260611143000_zia_chat_attachments.sql).
+    private static func mapAttachmentError(_ error: Error) -> Error {
+        if let coreError = error as? SupabaseCoreError { return coreError }
+        let raw = "\(error) \(error.localizedDescription)".lowercased()
+        if raw.contains("core_attachments") && (raw.contains("does not exist") || raw.contains("schema cache") || raw.contains("could not find")) {
+            return SupabaseCoreError.attachmentUpload(
+                "Falta la tabla core_attachments. Ejecuta la migración 20260611143000_zia_chat_attachments.sql en el SQL Editor."
+            )
+        }
+        if raw.contains("bucket not found") || raw.contains("404") {
+            return SupabaseCoreError.attachmentUpload(
+                "No existe el bucket 'core-attachments' en Supabase Storage. Ejecuta la migración 20260611143000_zia_chat_attachments.sql en el SQL Editor y vuelve a intentar."
+            )
+        }
+        if raw.contains("row-level security") || raw.contains("violates") || raw.contains("403") {
+            return SupabaseCoreError.attachmentUpload(
+                "Supabase rechazó la subida del archivo por permisos (RLS). Verifica las políticas del bucket core-attachments de la migración 20260611143000."
+            )
+        }
+        return SupabaseCoreError.attachmentUpload("No se pudo subir el archivo adjunto: \(error.localizedDescription)")
     }
 
     private func signAttachments(_ attachments: [CoreAttachment]) async throws -> [CoreAttachment] {
@@ -766,6 +1155,63 @@ private struct ListMessagesParams: Encodable {
     }
 }
 
+private struct CoreDMRpcRow: Decodable {
+    var id: String
+    var empresaId: Int
+    var dmKey: String?
+    var peerId: String
+    var peerFullName: String?
+    var peerAvatarUrl: String?
+    var peerRolId: Int?
+    var unreadCount: Int?
+    var mentionCount: Int?
+    var lastMessageId: String?
+    var lastMessageUserId: String?
+    var lastMessageContent: String?
+    var lastMessageCreatedAt: Date?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case empresaId = "empresa_id"
+        case dmKey = "dm_key"
+        case peerId = "peer_id"
+        case peerFullName = "peer_full_name"
+        case peerAvatarUrl = "peer_avatar_url"
+        case peerRolId = "peer_rol_id"
+        case unreadCount = "unread_count"
+        case mentionCount = "mention_count"
+        case lastMessageId = "last_message_id"
+        case lastMessageUserId = "last_message_user_id"
+        case lastMessageContent = "last_message_content"
+        case lastMessageCreatedAt = "last_message_created_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        empresaId = try container.decode(Int.self, forKey: .empresaId)
+        dmKey = try? container.decodeIfPresent(String.self, forKey: .dmKey)
+        peerId = try container.decode(String.self, forKey: .peerId)
+        peerFullName = try? container.decodeIfPresent(String.self, forKey: .peerFullName)
+        peerAvatarUrl = try? container.decodeIfPresent(String.self, forKey: .peerAvatarUrl)
+        peerRolId = try? container.decodeIfPresent(Int.self, forKey: .peerRolId)
+        if let value = try? container.decodeIfPresent(Int.self, forKey: .unreadCount) {
+            unreadCount = value
+        } else if let value = try? container.decodeIfPresent(String.self, forKey: .unreadCount) {
+            unreadCount = Int(value)
+        }
+        if let value = try? container.decodeIfPresent(Int.self, forKey: .mentionCount) {
+            mentionCount = value
+        } else if let value = try? container.decodeIfPresent(String.self, forKey: .mentionCount) {
+            mentionCount = Int(value)
+        }
+        lastMessageId = try? container.decodeIfPresent(String.self, forKey: .lastMessageId)
+        lastMessageUserId = try? container.decodeIfPresent(String.self, forKey: .lastMessageUserId)
+        lastMessageContent = try? container.decodeIfPresent(String.self, forKey: .lastMessageContent)
+        lastMessageCreatedAt = try? container.decodeIfPresent(Date.self, forKey: .lastMessageCreatedAt)
+    }
+}
+
 private struct ListChannelsParams: Encodable {
     var pDisplayName: String?
 
@@ -778,11 +1224,79 @@ private struct CreateChannelParams: Encodable {
     var pName: String
     var pDescription: String?
     var pVisibility: String
+    var pChannelType: String
+    var pMetadata: CoreChannelMetadata?
 
     enum CodingKeys: String, CodingKey {
         case pName = "p_name"
         case pDescription = "p_description"
         case pVisibility = "p_visibility"
+        case pChannelType = "p_channel_type"
+        case pMetadata = "p_metadata"
+    }
+}
+
+private struct LegacyCreateChannelParams: Encodable {
+    var pName: String
+    var pDescription: String?
+    var pVisibility: String
+
+    enum CodingKeys: String, CodingKey {
+        case pName = "p_name"
+        case pDescription = "p_description"
+        case pVisibility = "p_visibility"
+    }
+}
+
+private struct ChannelUpdateRow: Encodable {
+    var name: String
+    var slug: String
+    var description: String?
+    var visibility: String
+    var metadata: CoreChannelMetadata
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case slug
+        case description
+        case visibility
+        case metadata
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(name, forKey: .name)
+        try container.encode(slug, forKey: .slug)
+        // null explícito para poder limpiar la descripción, igual que la web.
+        try container.encode(description, forKey: .description)
+        try container.encode(visibility, forKey: .visibility)
+        try container.encode(metadata, forKey: .metadata)
+    }
+}
+
+private struct ChannelMetadataRow: Decodable {
+    var metadata: CoreChannelMetadata?
+}
+
+private struct ChannelArchiveRow: Encodable {
+    var isArchived: Bool
+    var slug: String
+
+    enum CodingKeys: String, CodingKey {
+        case isArchived = "is_archived"
+        case slug
+    }
+}
+
+private struct SyncChannelMembersParams: Encodable {
+    var pChannelId: String
+    var pUserIds: [String]
+    var pAdminIds: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case pChannelId = "p_channel_id"
+        case pUserIds = "p_user_ids"
+        case pAdminIds = "p_admin_ids"
     }
 }
 
@@ -793,7 +1307,8 @@ private struct CoreChannelCreateResponse: Codable {
     var slug: String
     var description: String?
     var visibility: CoreChannelVisibility
-    var conversationId: String
+    var metadata: CoreChannelMetadata?
+    var conversationId: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -802,6 +1317,7 @@ private struct CoreChannelCreateResponse: Codable {
         case slug
         case description
         case visibility
+        case metadata
         case conversationId = "conversation_id"
     }
 }
@@ -813,6 +1329,7 @@ private struct CoreMessageInsert: Encodable {
     var parentMessageId: String?
     var userId: String
     var content: String
+    var metadata: CoreMessageMetadata?
 
     enum CodingKeys: String, CodingKey {
         case empresaId = "empresa_id"
@@ -821,6 +1338,7 @@ private struct CoreMessageInsert: Encodable {
         case parentMessageId = "parent_message_id"
         case userId = "user_id"
         case content
+        case metadata
     }
 }
 
@@ -864,11 +1382,107 @@ private struct ReactionID: Decodable {
     var id: String
 }
 
+private struct PollInsert: Encodable {
+    var empresaId: Int
+    var channelId: String?
+    var messageId: String?
+    var question: String
+    var createdBy: String
+
+    enum CodingKeys: String, CodingKey {
+        case empresaId = "empresa_id"
+        case channelId = "channel_id"
+        case messageId = "message_id"
+        case question
+        case createdBy = "created_by"
+    }
+}
+
+private struct PollOptionInsert: Encodable {
+    var pollId: String
+    var label: String
+    var sortOrder: Int
+
+    enum CodingKeys: String, CodingKey {
+        case pollId = "poll_id"
+        case label
+        case sortOrder = "sort_order"
+    }
+}
+
+private struct PollIDRow: Decodable {
+    var id: String
+}
+
+private struct PollRowDTO: Decodable {
+    var id: String
+    var messageId: String?
+    var question: String
+    var options: [PollOptionDTO]
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case messageId = "message_id"
+        case question
+        case options
+    }
+}
+
+private struct PollOptionDTO: Decodable {
+    var id: String
+    var label: String
+    var sortOrder: Int
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case label
+        case sortOrder = "sort_order"
+    }
+}
+
+private struct PollVoteDTO: Decodable {
+    var optionId: String
+    var userId: String
+
+    enum CodingKeys: String, CodingKey {
+        case optionId = "option_id"
+        case userId = "user_id"
+    }
+}
+
+private struct PollVoteInsert: Encodable {
+    var pollId: String
+    var optionId: String
+    var userId: String
+
+    enum CodingKeys: String, CodingKey {
+        case pollId = "poll_id"
+        case optionId = "option_id"
+        case userId = "user_id"
+    }
+}
+
+private struct StickerUploadResponse: Decodable {
+    var sticker: CoreSticker
+}
+
 private struct ParentMessageID: Decodable {
     var parentMessageId: String?
 
     enum CodingKeys: String, CodingKey {
         case parentMessageId = "parent_message_id"
+    }
+}
+
+private struct ThreadReplyMeta: Decodable {
+    var parentMessageId: String?
+    var userId: String
+    var createdAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case parentMessageId = "parent_message_id"
+        case userId = "user_id"
+        case createdAt = "created_at"
     }
 }
 
