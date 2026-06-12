@@ -53,6 +53,7 @@ async function sendPush(input: {
   authorization: string;
   title: string;
   body: string;
+  badge: number;
   message: MessageRow;
 }) {
   const production = Deno.env.get("APNS_PRODUCTION") !== "false";
@@ -72,7 +73,7 @@ async function sendPush(input: {
       aps: {
         alert: { title: input.title, body: input.body },
         sound: "default",
-        badge: 1,
+        badge: input.badge,
         "thread-id": input.message.channel_id || input.message.conversation_id,
       },
       kind: input.message.parent_message_id ? "thread_message" : "channel_message",
@@ -87,6 +88,55 @@ async function sendPush(input: {
   const payload = await response.json().catch(() => ({}));
   console.error("[zia-chat-apns] APNs rejected token", response.status, payload);
   return { invalid: invalidTokenReasons.has(payload?.reason) };
+}
+
+async function unreadBadgeCount(supabase: ReturnType<typeof createClient>, userId: string) {
+  const [{ data: channelMemberships, error: channelError }, { data: conversationMemberships, error: conversationError }] =
+    await Promise.all([
+      supabase.from("core_channel_members").select("channel_id").eq("user_id", userId),
+      supabase.from("core_conversation_members").select("conversation_id").eq("user_id", userId),
+    ]);
+  if (channelError) throw channelError;
+  if (conversationError) throw conversationError;
+
+  const channelIds = [...new Set((channelMemberships || []).map((row) => row.channel_id))];
+  const { data: channelConversations, error: channelConversationError } = channelIds.length
+    ? await supabase.from("core_conversations").select("id").in("channel_id", channelIds)
+    : { data: [], error: null };
+  if (channelConversationError) throw channelConversationError;
+
+  const conversationIds = [...new Set([
+    ...(conversationMemberships || []).map((row) => row.conversation_id),
+    ...(channelConversations || []).map((row) => row.id),
+  ])];
+  if (conversationIds.length === 0) return 0;
+
+  const { data: reads, error: readsError } = await supabase
+    .from("core_message_reads")
+    .select("conversation_id,last_read_at")
+    .eq("user_id", userId)
+    .in("conversation_id", conversationIds);
+  if (readsError) throw readsError;
+
+  const readAtByConversation = new Map(
+    (reads || []).map((row) => [row.conversation_id, row.last_read_at]),
+  );
+  const counts = await Promise.all(conversationIds.map(async (conversationId) => {
+    let query = supabase
+      .from("core_messages")
+      .select("id", { count: "exact", head: true })
+      .eq("conversation_id", conversationId)
+      .neq("user_id", userId)
+      .is("parent_message_id", null)
+      .is("deleted_at", null);
+    const lastReadAt = readAtByConversation.get(conversationId);
+    if (lastReadAt) query = query.gt("created_at", lastReadAt);
+    const { count, error } = await query;
+    if (error) throw error;
+    return count || 0;
+  }));
+
+  return counts.reduce((total, count) => total + count, 0);
 }
 
 Deno.serve(async (request) => {
@@ -131,7 +181,7 @@ Deno.serve(async (request) => {
     const [{ data: tokens, error: tokenError }, { data: sender }, { data: channel }] = await Promise.all([
       supabase
         .from("core_push_tokens")
-        .select("token")
+        .select("token,user_id")
         .eq("platform", "zia_chat_apns")
         .in("user_id", recipientIds),
       supabase.from("profiles").select("full_name").eq("id", message.user_id).maybeSingle(),
@@ -149,16 +199,25 @@ Deno.serve(async (request) => {
       ? `${channelLabel.emoji} #${channelLabel.name}`
       : author;
     const authorization = await providerToken();
-    const results = await Promise.all(tokens.map(async ({ token }) => ({
-      token,
-      ...(await sendPush({
+    const badgeByUser = new Map<string, number>();
+    const results = await Promise.all(tokens.map(async ({ token, user_id }) => {
+      let badge = badgeByUser.get(user_id);
+      if (badge == null) {
+        badge = await unreadBadgeCount(supabase, user_id);
+        badgeByUser.set(user_id, badge);
+      }
+      return {
         token,
-        authorization,
-        title,
-        body: `${author}: ${preview}`,
-        message,
-      })),
-    })));
+        ...(await sendPush({
+          token,
+          authorization,
+          title,
+          body: `${author}: ${preview}`,
+          badge,
+          message,
+        })),
+      };
+    }));
     const invalidTokens = results.filter((result) => result.invalid).map((result) => result.token);
     if (invalidTokens.length > 0) {
       await supabase.from("core_push_tokens").delete().in("token", invalidTokens);

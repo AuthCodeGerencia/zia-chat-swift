@@ -58,11 +58,15 @@ struct ContentView: View {
         .onChange(of: store.configuration.isUsable) { _, isUsable in
             if !isUsable {
                 navigationPath.removeAll()
-                Task { await voiceStore.leave() }
+                Task {
+                    await voiceStore.leave()
+                    await pushService.updateBadgeCount(0)
+                }
             } else {
                 Task {
                     await pushService.requestAuthorizationAndRegister()
                     await pushService.registerCurrentToken(configuration: store.configuration)
+                    await syncAppBadge()
                     schedulePendingPushNavigation()
                 }
             }
@@ -77,15 +81,24 @@ struct ContentView: View {
         }
         .onChange(of: store.channels) { _, _ in
             schedulePendingPushNavigation()
+            Task { await syncAppBadge() }
+        }
+        .onChange(of: store.directMessages) { _, _ in
+            Task { await syncAppBadge() }
         }
         .onChange(of: store.configuration.accessToken) { _, _ in
             Task { await pushService.registerCurrentToken(configuration: store.configuration) }
         }
         .onChange(of: scenePhase) { _, phase in
-            guard phase == .active, store.configuration.isUsable else { return }
+            guard phase == .active else { return }
             Task {
+                guard store.configuration.isUsable else {
+                    await pushService.updateBadgeCount(0)
+                    return
+                }
                 _ = try? await store.ensureFreshSession()
                 store.reconnectRealtimeIfNeeded()
+                await syncAppBadge()
                 schedulePendingPushNavigation()
             }
         }
@@ -94,15 +107,24 @@ struct ContentView: View {
             await store.maintainSession()
         }
         .task {
-            if store.configuration.isUsable {
-                _ = try? await store.ensureFreshSession()
-                await store.refresh()
-                await pushService.requestAuthorizationAndRegister()
-                await pushService.registerCurrentToken(configuration: store.configuration)
-                schedulePendingPushNavigation()
+            guard store.configuration.isUsable else {
+                await pushService.updateBadgeCount(0)
+                return
             }
+            _ = try? await store.ensureFreshSession()
+            await store.refresh()
+            await pushService.requestAuthorizationAndRegister()
+            await pushService.registerCurrentToken(configuration: store.configuration)
+            await syncAppBadge()
+            schedulePendingPushNavigation()
         }
         .preferredColorScheme(.light)
+    }
+
+    private func syncAppBadge() async {
+        let unreadCount = store.textChannels.reduce(0) { $0 + $1.unreadCount }
+            + store.directMessages.reduce(0) { $0 + $1.unreadCount }
+        await pushService.updateBadgeCount(unreadCount)
     }
 
     private func schedulePendingPushNavigation() {
@@ -166,6 +188,12 @@ private struct LoginView: View {
     @Binding var showingSettings: Bool
     @State private var email = ""
     @State private var password = ""
+    @FocusState private var focusedField: LoginField?
+
+    private enum LoginField {
+        case email
+        case password
+    }
 
     private var canLogin: Bool {
         !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
@@ -175,53 +203,211 @@ private struct LoginView: View {
 
     var body: some View {
         NavigationStack {
-            Form {
-                Section {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("ZiaChat")
-                            .font(.largeTitle.weight(.bold))
-                        Text("Sign in with your Azank account to load Core channels.")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.vertical, 8)
-                }
+            ZStack {
+                LinearGradient(
+                    colors: [
+                        Color(zenitHex: 0x071A24),
+                        Color(zenitHex: 0x0B5362),
+                        Color(zenitHex: 0x13B7AA)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .ignoresSafeArea()
 
-                Section("Azank Login") {
-                    TextField("Email", text: $email)
-                        .textInputAutocapitalization(.never)
-                        .keyboardType(.emailAddress)
-                        .textContentType(.username)
-                    SecureField("Password", text: $password)
-                        .textContentType(.password)
-                }
+                Circle()
+                    .fill(Color.white.opacity(0.08))
+                    .frame(width: 280, height: 280)
+                    .offset(x: 150, y: -250)
 
-                Section {
-                    Button {
-                        Task { await store.login(email: email, password: password) }
-                    } label: {
-                        HStack {
-                            if store.isLoggingIn {
-                                ProgressView()
-                            }
-                            Text(store.isLoggingIn ? "Signing in" : "Sign In")
+                Circle()
+                    .fill(ZenitBrand.khaki.opacity(0.18))
+                    .frame(width: 220, height: 220)
+                    .offset(x: -150, y: 310)
+
+                ScrollView {
+                    VStack(spacing: 24) {
+                        VStack(spacing: 14) {
+                            ZiaLoginLogo()
+
+                            Text("Zia Chat")
+                                .font(ZenitFont.font(size: 34, weight: .bold))
+                                .foregroundStyle(.white)
+
+                            Text("Tu equipo, tus conversaciones y todo lo importante en un solo lugar.")
+                                .font(.subheadline)
+                                .foregroundStyle(.white.opacity(0.78))
+                                .multilineTextAlignment(.center)
+                                .frame(maxWidth: 310)
                         }
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!canLogin)
-                }
 
-                if let error = store.lastError {
-                    Section {
-                        Text(error)
-                            .font(.footnote)
-                            .foregroundStyle(.orange)
+                        VStack(alignment: .leading, spacing: 18) {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("Bienvenido")
+                                    .font(ZenitFont.font(size: 24, weight: .bold))
+                                    .foregroundStyle(ZenitBrand.ink)
+                                Text("Ingresa con tu cuenta de Azank")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            loginField(title: "Correo electrónico", systemImage: "envelope.fill") {
+                                TextField("nombre@empresa.com", text: $email)
+                                    .textInputAutocapitalization(.never)
+                                    .keyboardType(.emailAddress)
+                                    .textContentType(.username)
+                                    .submitLabel(.next)
+                                    .focused($focusedField, equals: .email)
+                                    .onSubmit { focusedField = .password }
+                            }
+
+                            loginField(title: "Contraseña", systemImage: "lock.fill") {
+                                SecureField("Tu contraseña", text: $password)
+                                    .textContentType(.password)
+                                    .submitLabel(.go)
+                                    .focused($focusedField, equals: .password)
+                                    .onSubmit { signIn() }
+                            }
+
+                            Button(action: signIn) {
+                                HStack(spacing: 10) {
+                                    if store.isLoggingIn {
+                                        ProgressView()
+                                            .tint(.white)
+                                    }
+                                    Text(store.isLoggingIn ? "Ingresando..." : "Entrar a Zia")
+                                        .font(.headline)
+                                    if !store.isLoggingIn {
+                                        Image(systemName: "arrow.right")
+                                            .font(.subheadline.weight(.bold))
+                                    }
+                                }
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 52)
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.white)
+                            .background(canLogin ? ZenitBrand.accent : Color.gray.opacity(0.45))
+                            .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                            .disabled(!canLogin)
+
+                            if let error = store.lastError {
+                                Label(error, systemImage: "exclamationmark.circle.fill")
+                                    .font(.footnote)
+                                    .foregroundStyle(Color.red.opacity(0.85))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+
+                            Text("Usa las mismas credenciales con las que accedes a Azank.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                        }
+                        .padding(24)
+                        .background(Color.white.opacity(0.97))
+                        .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+                        .shadow(color: Color.black.opacity(0.18), radius: 24, y: 14)
                     }
+                    .padding(.horizontal, 22)
+                    .padding(.top, 34)
+                    .padding(.bottom, 30)
                 }
             }
-            .navigationTitle("Login")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showingSettings = true
+                    } label: {
+                        Image(systemName: "gearshape.fill")
+                            .frame(width: 38, height: 38)
+                            .background(Color.white.opacity(0.14))
+                            .clipShape(Circle())
+                    }
+                    .foregroundStyle(.white)
+                    .accessibilityLabel("Configuración")
+                }
+            }
+            .toolbarBackground(.hidden, for: .navigationBar)
         }
+    }
+
+    private func signIn() {
+        guard canLogin else { return }
+        focusedField = nil
+        Task { await store.login(email: email, password: password) }
+    }
+
+    private func loginField<Field: View>(
+        title: String,
+        systemImage: String,
+        @ViewBuilder field: () -> Field
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(ZenitBrand.olive)
+
+            HStack(spacing: 12) {
+                Image(systemName: systemImage)
+                    .foregroundStyle(ZenitBrand.accent)
+                    .frame(width: 20)
+                field()
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 52)
+            .background(Color(zenitHex: 0xF2F6F6))
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.black.opacity(0.07), lineWidth: 1)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+    }
+}
+
+private struct ZiaLoginLogo: View {
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            RoundedRectangle(cornerRadius: 27, style: .continuous)
+                .fill(Color.white.opacity(0.94))
+                .frame(width: 108, height: 94)
+
+            Text("Z")
+                .font(.system(size: 58, weight: .black, design: .rounded))
+                .foregroundStyle(Color(zenitHex: 0x07364B))
+                .frame(width: 108, height: 94)
+
+            LoginLogoTail()
+                .fill(Color.white.opacity(0.94))
+                .frame(width: 28, height: 24)
+                .rotationEffect(.degrees(-18))
+                .offset(x: 12, y: 11)
+        }
+        .padding(13)
+        .background(
+            LinearGradient(
+                colors: [Color(zenitHex: 0x16A8E0), Color(zenitHex: 0x1BD6A8)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 34, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 34, style: .continuous)
+                .stroke(Color.white.opacity(0.24), lineWidth: 1)
+        }
+        .shadow(color: Color.black.opacity(0.22), radius: 18, y: 10)
+    }
+}
+
+private struct LoginLogoTail: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        path.closeSubpath()
+        return path
     }
 }
 
@@ -389,7 +575,15 @@ private struct ChannelListView: View {
 
                 ChannelBottomBar(
                     onSettings: { showingSettings = true },
-                    onSignOut: { store.signOut() }
+                    onSignOut: {
+                        let configuration = store.configuration
+                        Task {
+                            await PushNotificationService.shared.unregisterCurrentUser(
+                                configuration: configuration
+                            )
+                            store.signOut()
+                        }
+                    }
                 )
             }
         }
@@ -827,7 +1021,9 @@ private struct DirectMessageRow: View {
         guard let content = dm.lastMessageContent, !content.isEmpty else {
             return "Inicia la conversación"
         }
-        let prefix = dm.lastMessageUserId == currentUserId ? "Tú: " : ""
+        let firstName = dm.peer.displayName.split(whereSeparator: \.isWhitespace).first.map(String.init)
+            ?? dm.peer.displayName
+        let prefix = dm.lastMessageUserId == currentUserId ? "Tú: " : "\(firstName): "
         return prefix + content
     }
 
@@ -993,6 +1189,7 @@ private struct ChannelNavigationRow: View {
         ChannelRowView(
             channel: channel,
             preview: channel.conversationId.flatMap { store.channelPreviews[$0] },
+            currentUserId: store.configuration.userId,
             isFavorite: store.favoriteChannelIds.contains(channel.id),
             isMuted: store.isMuted(channel.id)
         )
@@ -1063,6 +1260,7 @@ private struct ChannelNavigationRow: View {
 private struct ChannelRowView: View {
     let channel: CoreChannel
     let preview: CoreMessage?
+    let currentUserId: String
     let isFavorite: Bool
     var isMuted: Bool = false
 
@@ -1090,7 +1288,11 @@ private struct ChannelRowView: View {
                     }
                 }
 
-                ChannelPreviewText(preview: preview, fallback: channel.subtitle)
+                ChannelPreviewText(
+                    preview: preview,
+                    fallback: channel.subtitle,
+                    currentUserId: currentUserId
+                )
             }
 
             Spacer(minLength: 4)
@@ -1131,17 +1333,35 @@ private struct ChannelRowView: View {
 private struct ChannelPreviewText: View {
     let preview: CoreMessage?
     let fallback: String
+    let currentUserId: String
+
+    private var authorPrefix: String {
+        guard let preview else { return "" }
+        if preview.userId == currentUserId {
+            return "Tú: "
+        }
+        let displayName = preview.author?.displayName ?? "Usuario"
+        let name = displayName.split(whereSeparator: \.isWhitespace).first.map(String.init)
+            ?? displayName
+        return "\(name): "
+    }
 
     var body: some View {
         if let preview {
             HStack(spacing: 5) {
+                Text(authorPrefix)
+                    .fontWeight(.semibold)
                 if preview.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                    let attachment = preview.attachments?.first {
                     Image(systemName: attachment.isGIF ? "sparkles.rectangle.stack" : attachment.systemImage)
                         .font(.caption)
                     Text(attachment.isGIF ? "GIF" : attachment.isImage ? "Photo" : attachment.fileName)
                 } else {
-                    Text(preview.content)
+                    Text(
+                        preview.metadata?.isCommandCard == true
+                            ? "/\(preview.metadata?.command ?? "comando")"
+                            : preview.content
+                    )
                 }
             }
             .font(.subheadline)
@@ -1431,7 +1651,7 @@ private struct ChatDetailView: View {
 
     private var messagesScroll: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 12) {
+            LazyVStack(alignment: .leading, spacing: 0) {
                 Color.clear
                     .frame(height: 1)
                     .id(bottomID)
@@ -1515,7 +1735,8 @@ private struct ChatDetailView: View {
                 Task { await store.react(to: message, emoji: emoji) }
             }
         )
-        .padding(6)
+        .padding(.horizontal, 6)
+        .padding(.vertical, showAuthorInfo ? 6 : 1)
         .background(rowBackground)
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .id(message.id)

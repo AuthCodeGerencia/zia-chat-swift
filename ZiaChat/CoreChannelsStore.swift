@@ -38,10 +38,13 @@ final class CoreChannelsStore: ObservableObject {
     @Published var lastError: String?
 
     private var realtimeService: CoreRealtimeService?
+    private var companyRealtimeService: CoreRealtimeService?
     private var channelSearchTask: Task<Void, Never>?
     private var realtimeConversationId: String?
     private var realtimeReconnectTask: Task<Void, Never>?
     private var realtimeMessageRefreshTask: Task<Void, Never>?
+    private var companyRealtimeReconnectTask: Task<Void, Never>?
+    private var chatListRefreshTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
     private var sessionRefreshTask: Task<CoreAppConfiguration, Error>?
     private let optimisticMessagePrefix = "local-pending-"
@@ -52,6 +55,11 @@ final class CoreChannelsStore: ObservableObject {
            let cachedChannels = CoreChannelCache.load(userId: configuration.userId),
            !cachedChannels.isEmpty {
             self.channels = cachedChannels
+        }
+        if configuration.isUsable,
+           let cachedList = CoreChatListCache.load(userId: configuration.userId) {
+            self.directMessages = cachedList.directMessages
+            self.channelPreviews = cachedList.channelPreviews
         }
         self.selectedChannelId = channels.first?.id
     }
@@ -113,9 +121,9 @@ final class CoreChannelsStore: ObservableObject {
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try SupabaseCoreClient(configuration: activeConfiguration)
-            directMessages = try await client.listDirectMessages()
+            applyDirectMessages(try await fetchDirectMessages(using: client))
         } catch {
-            // RPC no desplegado u otro error: los DMs simplemente quedan vacíos.
+            lastError = error.localizedDescription
         }
     }
 
@@ -154,6 +162,7 @@ final class CoreChannelsStore: ObservableObject {
             )
             if !directMessages.contains(where: { $0.id == dm.id }) {
                 directMessages.insert(dm, at: 0)
+                saveChatListCache()
             }
             return dmChannel(for: dm)
         } catch {
@@ -166,6 +175,7 @@ final class CoreChannelsStore: ObservableObject {
         guard let index = directMessages.firstIndex(where: { $0.id == dmId }) else { return }
         directMessages[index].unreadCount = 0
         directMessages[index].mentionCount = 0
+        saveChatListCache()
     }
 
     func save(configuration: CoreAppConfiguration) {
@@ -199,6 +209,7 @@ final class CoreChannelsStore: ObservableObject {
         sessionRefreshTask?.cancel()
         sessionRefreshTask = nil
         stopRealtime()
+        stopCompanyRealtime()
         var next = configuration
         next.clearSession()
         save(configuration: next)
@@ -245,6 +256,8 @@ final class CoreChannelsStore: ObservableObject {
                 stopRealtime()
                 startRealtime(for: activeChannel)
             }
+            stopCompanyRealtime()
+            startCompanyRealtime()
             return refreshedConfiguration
         } catch {
             sessionRefreshTask = nil
@@ -363,13 +376,14 @@ final class CoreChannelsStore: ObservableObject {
                     fastChannels = try await client.listChannels()
                 }
                 applyChannels(fastChannels)
-                if let loadedDirectMessages = try? await client.listDirectMessages() {
-                    directMessages = loadedDirectMessages
+                if let loadedDirectMessages = try? await fetchDirectMessages(using: client) {
+                    applyDirectMessages(loadedDirectMessages)
                 }
                 await loadChannelPreviews(using: client)
                 if let users = try? await client.listMentionableUsers() {
                     mentionableUsers = users
                 }
+                startCompanyRealtime()
 
                 Task { @MainActor [weak self] in
                     guard let self, self.configuration.isUsable else { return }
@@ -393,6 +407,9 @@ final class CoreChannelsStore: ObservableObject {
         // metadata, so the icon (metadata.iconImage) would be lost on the quick
         // render until the enriched fetch arrives. Carry the previously known
         // icon forward so it does not flash or disappear.
+        let previousChannels = Dictionary(
+            uniqueKeysWithValues: channels.map { ($0.id, $0) }
+        )
         let previousIcons = Dictionary(
             channels.compactMap { channel -> (String, String)? in
                 guard let icon = channel.metadata?.iconImage, !icon.isEmpty else { return nil }
@@ -402,14 +419,17 @@ final class CoreChannelsStore: ObservableObject {
         )
 
         let mergedChannels = loadedChannels.map { channel -> CoreChannel in
-            guard channel.metadata?.iconImage?.isEmpty != false,
-                  let previousIcon = previousIcons[channel.id] else {
-                return channel
-            }
             var updated = channel
-            var metadata = updated.metadata ?? CoreChannelMetadata()
-            metadata.iconImage = previousIcon
-            updated.metadata = metadata
+            if let previous = previousChannels[channel.id] {
+                updated.unreadCount = max(updated.unreadCount, previous.unreadCount)
+                updated.mentionCount = max(updated.mentionCount, previous.mentionCount)
+            }
+            if updated.metadata?.iconImage?.isEmpty != false,
+               let previousIcon = previousIcons[channel.id] {
+                var metadata = updated.metadata ?? CoreChannelMetadata()
+                metadata.iconImage = previousIcon
+                updated.metadata = metadata
+            }
             return updated
         }
 
@@ -426,8 +446,94 @@ final class CoreChannelsStore: ObservableObject {
         }
 
         if let previews = try? await client.listChannelPreviews(conversationIds: conversationIds) {
-            channelPreviews = previews
+            channelPreviews.merge(previews) { current, incoming in
+                incoming.createdAt >= current.createdAt ? incoming : current
+            }
+            saveChatListCache()
         }
+    }
+
+    private func applyDirectMessages(_ loaded: [CoreDirectMessage]) {
+        let cachedByID = Dictionary(
+            uniqueKeysWithValues: directMessages.map { ($0.id, $0) }
+        )
+        directMessages = loaded.map { incoming in
+            guard let cached = cachedByID[incoming.id] else {
+                return incoming
+            }
+            var merged = incoming
+            merged.unreadCount = max(incoming.unreadCount, cached.unreadCount)
+            merged.mentionCount = max(incoming.mentionCount, cached.mentionCount)
+            if (cached.lastMessageAt ?? .distantPast) > (incoming.lastMessageAt ?? .distantPast) {
+                merged.lastMessageContent = cached.lastMessageContent
+                merged.lastMessageAt = cached.lastMessageAt
+                merged.lastMessageUserId = cached.lastMessageUserId
+            }
+            return merged
+        }
+        .sorted {
+            ($0.lastMessageAt ?? .distantPast) > ($1.lastMessageAt ?? .distantPast)
+        }
+        saveChatListCache()
+    }
+
+    private func fetchDirectMessages(using client: SupabaseCoreClient) async throws -> [CoreDirectMessage] {
+        do {
+            return try await client.listDirectMessages()
+        } catch {
+            let response = try await coreAPIRequest(path: "/api/core/dms", method: "GET")
+            guard let rawDirectMessages = response["dms"] as? [[String: Any]] else {
+                throw SupabaseCoreError.emptyResponse
+            }
+            return rawDirectMessages.compactMap(decodeDirectMessageAPI).sorted {
+                ($0.lastMessageAt ?? .distantPast) > ($1.lastMessageAt ?? .distantPast)
+            }
+        }
+    }
+
+    private func decodeDirectMessageAPI(_ raw: [String: Any]) -> CoreDirectMessage? {
+        guard let id = raw["id"] as? String,
+              let empresaId = (raw["empresa_id"] as? NSNumber)?.intValue,
+              let peer = raw["peer"] as? [String: Any],
+              let peerId = peer["id"] as? String else {
+            return nil
+        }
+
+        let lastMessage = raw["last_message"] as? [String: Any]
+        return CoreDirectMessage(
+            id: id,
+            empresaId: empresaId,
+            dmKey: raw["dm_key"] as? String,
+            peer: CoreUserLite(
+                id: peerId,
+                fullName: peer["full_name"] as? String,
+                avatarURLString: peer["avatar_url"] as? String,
+                roleId: (peer["rol_id"] as? NSNumber)?.intValue
+            ),
+            unreadCount: (raw["unread_count"] as? NSNumber)?.intValue ?? 0,
+            mentionCount: (raw["mention_count"] as? NSNumber)?.intValue ?? 0,
+            lastMessageContent: lastMessage?["content"] as? String,
+            lastMessageAt: (lastMessage?["created_at"] as? String).flatMap(Self.parseAPIDate),
+            lastMessageUserId: lastMessage?["user_id"] as? String
+        )
+    }
+
+    private nonisolated static func parseAPIDate(_ value: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: value) {
+            return date
+        }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: value)
+    }
+
+    private func saveChatListCache() {
+        CoreChatListCache.save(
+            directMessages: directMessages,
+            channelPreviews: channelPreviews,
+            userId: configuration.userId
+        )
     }
 
     func channelForNotification(channelId: String?, conversationId: String?) async throws -> CoreChannel? {
@@ -670,17 +776,31 @@ final class CoreChannelsStore: ObservableObject {
             }
             : nil
 
+        let isDiceCommand = content.range(
+            of: #"^/dado(?:\s|$)"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil && parentMessageId == nil && attachments.isEmpty
         var optimisticMessage = makeOptimisticMessage(
-            content: content,
+            content: isDiceCommand ? "" : content,
             channel: channel,
             conversationId: conversationId,
             parentMessageId: parentMessageId
         )
-        if let replyQuote {
+        if isDiceCommand {
+            optimisticMessage.metadata = CoreMessageMetadata(
+                kind: "command_card",
+                cardId: optimisticMessage.id,
+                command: "dado",
+                status: "rolling",
+                payload: [:],
+                initiatedBy: configuration.userId
+            )
+        }
+        if let replyQuote, !isDiceCommand {
             optimisticMessage.metadata = CoreMessageMetadata(replyTo: replyQuote)
         }
         // Thread replies must not be inserted into the main channel timeline.
-        let insertedOptimisticMessage = !content.isEmpty && parentMessageId == nil
+        let insertedOptimisticMessage = (!content.isEmpty || isDiceCommand) && parentMessageId == nil
         if insertedOptimisticMessage {
             upsertMessage(optimisticMessage)
         }
@@ -718,6 +838,7 @@ final class CoreChannelsStore: ObservableObject {
                 updateChannelPreview(with: message)
             }
             await realtimeService?.broadcast(message: message)
+            await companyRealtimeService?.broadcast(message: message)
             Task {
                 try? await client.markRead(conversationId: conversationId, lastReadMessageId: message.id)
             }
@@ -749,12 +870,13 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     private func sendSlashCommand(_ content: String, conversationId: String) async throws -> CoreMessage {
+        let normalizedContent = normalizePendingCommand(content)
         let response = try await coreAPIRequest(
             path: "/api/core/messages/send",
             method: "POST",
             body: [
                 "conversationId": conversationId,
-                "content": content,
+                "content": normalizedContent,
                 "metadata": [:],
                 "attachments": []
             ]
@@ -779,6 +901,41 @@ final class CoreChannelsStore: ObservableObject {
             throw DecodingError.dataCorruptedError(in: container, debugDescription: "Fecha inválida")
         }
         return try decoder.decode(CoreMessage.self, from: data)
+    }
+
+    private func normalizePendingCommand(_ content: String) -> String {
+        let prefix = "/pendiente "
+        guard content.lowercased().hasPrefix(prefix),
+              let mentionStart = content.index(
+                content.startIndex,
+                offsetBy: prefix.count,
+                limitedBy: content.endIndex
+              ),
+              mentionStart < content.endIndex,
+              content[mentionStart] == "@" else {
+            return content
+        }
+
+        let arguments = String(content[mentionStart...])
+        let candidates = mentionableUsers.sorted {
+            $0.displayName.count > $1.displayName.count
+        }
+        for user in candidates {
+            let mention = "@\(user.displayName)"
+            guard arguments.count > mention.count,
+                  arguments.prefix(mention.count).caseInsensitiveCompare(mention) == .orderedSame else {
+                continue
+            }
+
+            let taskStart = arguments.index(arguments.startIndex, offsetBy: mention.count)
+            guard arguments[taskStart].isWhitespace else { continue }
+            let task = arguments[taskStart...]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !task.isEmpty else { return content }
+            return "/pendiente \(user.displayName) tiene pendiente \(task)"
+        }
+
+        return content
     }
 
     /// Loads the list of threads (root messages with replies) for a channel.
@@ -854,6 +1011,7 @@ final class CoreChannelsStore: ObservableObject {
                 incrementReplyCount(for: root.id, conversationId: conversationId)
             }
             await realtimeService?.broadcast(message: reply)
+            await companyRealtimeService?.broadcast(message: reply)
         } catch {
             lastError = error.localizedDescription
         }
@@ -1129,6 +1287,7 @@ final class CoreChannelsStore: ObservableObject {
             updatedMessage.content = content
             updatedMessage.editedAt = Date()
             await realtimeService?.broadcast(message: updatedMessage)
+            await companyRealtimeService?.broadcast(message: updatedMessage)
             return true
         } catch {
             lastError = error.localizedDescription
@@ -1151,6 +1310,7 @@ final class CoreChannelsStore: ObservableObject {
             var deletedMessage = message
             deletedMessage.deletedAt = Date()
             await realtimeService?.broadcast(message: deletedMessage)
+            await companyRealtimeService?.broadcast(message: deletedMessage)
             return true
         } catch {
             lastError = error.localizedDescription
@@ -1419,12 +1579,119 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     func reconnectRealtimeIfNeeded() {
+        startCompanyRealtime(force: true)
         guard let conversationId = realtimeConversationId,
               let channel = channels.first(where: { $0.conversationId == conversationId })
                 ?? directMessages.first(where: { $0.id == conversationId })?.chatTarget else {
             return
         }
         startRealtime(for: channel, force: true)
+    }
+
+    private func startCompanyRealtime(force: Bool = false) {
+        guard configuration.isUsable, let empresaId = configuration.empresaId else { return }
+        guard force || companyRealtimeService == nil else { return }
+
+        stopCompanyRealtime()
+        Task {
+            do {
+                let service = try CoreRealtimeService(configuration: configuration)
+                companyRealtimeService = service
+                try await service.subscribeToCompany(
+                    empresaId: empresaId,
+                    onMessage: { [weak self] message in
+                        await self?.handleCompanyRealtimeMessage(message)
+                    },
+                    onMessageSignal: { [weak self] in
+                        await self?.scheduleChatListRefresh()
+                    },
+                    onError: { [weak self] message in
+                        await self?.setRealtimeError(message)
+                    },
+                    onDisconnect: { [weak self] in
+                        await self?.scheduleCompanyRealtimeReconnect()
+                    }
+                )
+            } catch {
+                if self.configuration.empresaId == empresaId {
+                    self.companyRealtimeService = nil
+                }
+                self.scheduleCompanyRealtimeReconnect()
+            }
+        }
+    }
+
+    private func stopCompanyRealtime() {
+        companyRealtimeReconnectTask?.cancel()
+        companyRealtimeReconnectTask = nil
+        chatListRefreshTask?.cancel()
+        chatListRefreshTask = nil
+        guard let companyRealtimeService else { return }
+        self.companyRealtimeService = nil
+        Task {
+            await companyRealtimeService.stop()
+        }
+    }
+
+    private func scheduleCompanyRealtimeReconnect() {
+        guard configuration.isUsable else { return }
+        companyRealtimeReconnectTask?.cancel()
+        companyRealtimeReconnectTask = Task {
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled, self.configuration.isUsable else { return }
+            self.startCompanyRealtime(force: true)
+        }
+    }
+
+    private func handleCompanyRealtimeMessage(_ message: CoreMessage) {
+        guard message.empresaId == configuration.empresaId,
+              message.parentMessageId == nil,
+              message.deletedAt == nil else {
+            return
+        }
+
+        updateChannelPreview(with: message)
+        guard message.conversationId != realtimeConversationId,
+              message.userId != configuration.userId else {
+            return
+        }
+
+        if let channelIndex = channels.firstIndex(where: {
+            $0.conversationId == message.conversationId
+        }) {
+            channels[channelIndex].unreadCount += 1
+        } else if let directIndex = directMessages.firstIndex(where: {
+            $0.id == message.conversationId
+        }) {
+            directMessages[directIndex].unreadCount += 1
+        }
+    }
+
+    private func scheduleChatListRefresh() {
+        chatListRefreshTask?.cancel()
+        chatListRefreshTask = Task {
+            try? await Task.sleep(for: .milliseconds(220))
+            guard !Task.isCancelled, self.configuration.isUsable else { return }
+            await self.refreshChatListActivity()
+        }
+    }
+
+    private func refreshChatListActivity() async {
+        guard let client = try? SupabaseCoreClient(configuration: configuration) else { return }
+        async let loadedDirectMessages = try? fetchDirectMessages(using: client)
+        async let loadedPreviews = try? client.listChannelPreviews(
+            conversationIds: channels.compactMap(\.conversationId)
+        )
+
+        if let directMessages = await loadedDirectMessages {
+            applyDirectMessages(directMessages)
+        }
+        if let previews = await loadedPreviews {
+            channelPreviews.merge(previews) { current, incoming in
+                incoming.createdAt >= current.createdAt ? incoming : current
+            }
+            saveChatListCache()
+        }
     }
 
     private func scheduleRealtimeReconnect(for channel: CoreChannel) {
@@ -1502,6 +1769,7 @@ final class CoreChannelsStore: ObservableObject {
         }
         removeMatchingOptimisticMessage(for: message)
         let isAttachmentOnly = message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && message.metadata?.isCommandCard != true
         if !isAttachmentOnly {
             upsertMessage(message)
         }
@@ -1706,6 +1974,7 @@ final class CoreChannelsStore: ObservableObject {
             directMessages.sort { first, second in
                 (first.lastMessageAt ?? .distantPast) > (second.lastMessageAt ?? .distantPast)
             }
+            saveChatListCache()
             return
         }
         if let current = channelPreviews[message.conversationId],
@@ -1713,6 +1982,7 @@ final class CoreChannelsStore: ObservableObject {
             return
         }
         channelPreviews[message.conversationId] = message
+        saveChatListCache()
     }
 
     private func incrementReplyCount(for messageId: String, conversationId: String) {
@@ -1898,6 +2168,37 @@ private enum CoreChannelCache {
 
     static func save(_ channels: [CoreChannel], userId: String) {
         guard !userId.isEmpty, let data = try? JSONEncoder().encode(channels) else { return }
+        UserDefaults.standard.set(data, forKey: keyPrefix + userId)
+    }
+}
+
+private struct CoreChatListCachePayload: Codable {
+    var directMessages: [CoreDirectMessage]
+    var channelPreviews: [String: CoreMessage]
+}
+
+private enum CoreChatListCache {
+    private static let keyPrefix = "zia-chat.chat-list."
+
+    static func load(userId: String) -> CoreChatListCachePayload? {
+        guard !userId.isEmpty,
+              let data = UserDefaults.standard.data(forKey: keyPrefix + userId) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(CoreChatListCachePayload.self, from: data)
+    }
+
+    static func save(
+        directMessages: [CoreDirectMessage],
+        channelPreviews: [String: CoreMessage],
+        userId: String
+    ) {
+        guard !userId.isEmpty else { return }
+        let payload = CoreChatListCachePayload(
+            directMessages: directMessages,
+            channelPreviews: channelPreviews
+        )
+        guard let data = try? JSONEncoder().encode(payload) else { return }
         UserDefaults.standard.set(data, forKey: keyPrefix + userId)
     }
 }

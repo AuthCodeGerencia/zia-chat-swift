@@ -361,6 +361,11 @@ final class SupabaseCoreClient {
             previews[message.conversationId] = message
         }
 
+        let enrichedPreviews = (try? await enrich(Array(previews.values))) ?? Array(previews.values)
+        previews = Dictionary(
+            uniqueKeysWithValues: enrichedPreviews.map { ($0.conversationId, $0) }
+        )
+
         let previewIDs = previews.values.map(\.id)
         let attachments = (try? await fetchAttachments(messageIds: previewIDs)) ?? []
         let attachmentMap = Dictionary(grouping: attachments, by: { $0.messageId ?? "" })
@@ -427,46 +432,11 @@ final class SupabaseCoreClient {
         before: Date? = nil,
         limit: Int = 21
     ) async throws -> [CoreMessage] {
-        let loaded: [CoreMessage]
-        if let before {
-            loaded = try await messagePageQuery(
-                conversationId: conversationId,
-                before: before,
-                limit: limit
-            )
-        } else {
-            do {
-                let fromRPC: [CoreMessage] = try await client
-                    .rpc(
-                        "core_list_zia_messages",
-                        params: ListMessagesParams(
-                            conversationId: conversationId,
-                            limit: limit
-                        )
-                    )
-                    .execute()
-                    .value
-                // El RPC hace JOIN con core_channels, así que para los DMs
-                // (channel_id NULL) devuelve vacío sin error. Si no trae nada,
-                // reintenta con la consulta directa (RLS) antes de asumir que
-                // la conversación está realmente vacía.
-                if fromRPC.isEmpty {
-                    loaded = try await messagePageQuery(
-                        conversationId: conversationId,
-                        before: nil,
-                        limit: limit
-                    )
-                } else {
-                    loaded = fromRPC
-                }
-            } catch {
-                loaded = try await messagePageQuery(
-                    conversationId: conversationId,
-                    before: nil,
-                    limit: limit
-                )
-            }
-        }
+        let loaded = try await messagePageQuery(
+            conversationId: conversationId,
+            before: before,
+            limit: limit
+        )
 
         return Array(loaded.reversed())
     }
@@ -930,6 +900,15 @@ final class SupabaseCoreClient {
             .execute()
     }
 
+    func unregisterPushTokens() async throws {
+        try await client
+            .from("core_push_tokens")
+            .delete()
+            .eq("user_id", value: configuration.userId)
+            .eq("platform", value: "zia_chat_apns")
+            .execute()
+    }
+
     private func ensureMembership(conversationId: String, channelId: String?) async throws {
         let conversationMember = ConversationMemberUpsert(
             conversationId: conversationId,
@@ -1223,16 +1202,6 @@ final class SupabaseCoreClient {
         formatter.formatOptions = [.withInternetDateTime]
         if let date = formatter.date(from: value) { return date }
         throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid date: \(value)")
-    }
-}
-
-private struct ListMessagesParams: Encodable {
-    var conversationId: String
-    var limit: Int
-
-    enum CodingKeys: String, CodingKey {
-        case conversationId = "p_conversation_id"
-        case limit = "p_limit"
     }
 }
 

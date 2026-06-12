@@ -139,7 +139,7 @@ struct CoreInternalCompany: Identifiable, Codable, Hashable {
 }
 
 /// Mensaje directo (conversación type='dm' de la web). `id` = conversation id.
-struct CoreDirectMessage: Identifiable, Hashable {
+struct CoreDirectMessage: Identifiable, Codable, Hashable {
     var id: String
     var empresaId: Int
     var dmKey: String?

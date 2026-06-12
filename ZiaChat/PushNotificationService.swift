@@ -87,6 +87,21 @@ final class PushNotificationService: NSObject, ObservableObject, UNUserNotificat
         }
     }
 
+    func unregisterCurrentUser(configuration: CoreAppConfiguration) async {
+        guard configuration.isUsable else {
+            await updateBadgeCount(0)
+            return
+        }
+        if let client = try? SupabaseCoreClient(configuration: configuration) {
+            try? await client.unregisterPushTokens()
+        }
+        await updateBadgeCount(0)
+    }
+
+    func updateBadgeCount(_ count: Int) async {
+        try? await UNUserNotificationCenter.current().setBadgeCount(max(0, count))
+    }
+
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
@@ -116,7 +131,6 @@ final class PushNotificationService: NSObject, ObservableObject, UNUserNotificat
             try? await Task.sleep(for: .milliseconds(750))
             guard !Task.isCancelled else { return }
             await PushNotificationService.shared.receive(destination: destination)
-            try? await UNUserNotificationCenter.current().setBadgeCount(0)
         }
     }
 
@@ -147,6 +161,9 @@ final class ZiaChatAppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         PushNotificationService.shared.configure()
+        Task {
+            try? await UNUserNotificationCenter.current().setBadgeCount(0)
+        }
         return true
     }
 

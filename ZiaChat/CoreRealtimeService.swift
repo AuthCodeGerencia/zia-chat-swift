@@ -195,6 +195,81 @@ final class CoreRealtimeService {
         try await channel.subscribeWithError()
     }
 
+    func subscribeToCompany(
+        empresaId: Int,
+        onMessage: @escaping @Sendable (CoreMessage) async -> Void,
+        onMessageSignal: @escaping @Sendable () async -> Void,
+        onError: @escaping @Sendable (String) async -> Void,
+        onDisconnect: @escaping @Sendable () async -> Void
+    ) async throws {
+        await stop()
+
+        let channel = client.channel("core:empresa:\(empresaId)")
+        let messageBroadcastStream = channel.broadcastStream(event: "message:new")
+        let messageStream = channel.postgresChange(
+            AnyAction.self,
+            schema: "public",
+            table: "core_messages",
+            filter: .eq("empresa_id", value: empresaId)
+        )
+
+        tasks = [
+            Task { [decoder] in
+                for await payload in messageBroadcastStream {
+                    await onMessageSignal()
+                    let layer = payload["payload"]?.objectValue ?? payload
+                    guard let messageObject = layer["message"]?.objectValue else { continue }
+                    do {
+                        await onMessage(
+                            try messageObject.decode(as: CoreMessage.self, decoder: decoder)
+                        )
+                    } catch {
+                        await onError("Realtime lista de chats: \(error.localizedDescription)")
+                    }
+                }
+            },
+            Task { [decoder] in
+                for await action in messageStream {
+                    await onMessageSignal()
+                    do {
+                        switch action {
+                        case let .insert(insert):
+                            await onMessage(
+                                try insert.decodeRecord(as: CoreMessage.self, decoder: decoder)
+                            )
+                        case let .update(update):
+                            await onMessage(
+                                try update.decodeRecord(as: CoreMessage.self, decoder: decoder)
+                            )
+                        case .delete:
+                            break
+                        }
+                    } catch {
+                        await onError("Realtime lista de chats: \(error.localizedDescription)")
+                    }
+                }
+            },
+            Task {
+                var wasSubscribed = false
+                for await status in channel.statusChange {
+                    switch status {
+                    case .subscribed:
+                        wasSubscribed = true
+                    case .unsubscribed where wasSubscribed:
+                        await onDisconnect()
+                        return
+                    default:
+                        break
+                    }
+                }
+            }
+        ]
+
+        self.channel = channel
+        await client.realtimeV2.setAuth(accessToken)
+        try await channel.subscribeWithError()
+    }
+
     func broadcast(message: CoreMessage) async {
         guard let channel else { return }
         try? await channel.broadcast(
