@@ -468,21 +468,121 @@ struct CoreMessageReplyTo: Codable, Hashable {
 struct CoreMessageMetadata: Codable, Hashable {
     var attachments: [CoreMetadataAttachment]?
     var replyTo: CoreMessageReplyTo?
+    var kind: String?
+    var cardId: String?
+    var command: String?
+    var status: String?
+    var payload: [String: CoreJSONValue]?
+    var initiatedBy: String?
+    var expiresAt: String?
 
     enum CodingKeys: String, CodingKey {
         case attachments
         case replyTo
+        case kind
+        case cardId
+        case command
+        case status
+        case payload
+        case initiatedBy
+        case expiresAt
     }
 
-    init(attachments: [CoreMetadataAttachment]? = nil, replyTo: CoreMessageReplyTo? = nil) {
+    init(
+        attachments: [CoreMetadataAttachment]? = nil,
+        replyTo: CoreMessageReplyTo? = nil,
+        kind: String? = nil,
+        cardId: String? = nil,
+        command: String? = nil,
+        status: String? = nil,
+        payload: [String: CoreJSONValue]? = nil,
+        initiatedBy: String? = nil,
+        expiresAt: String? = nil
+    ) {
         self.attachments = attachments
         self.replyTo = replyTo
+        self.kind = kind
+        self.cardId = cardId
+        self.command = command
+        self.status = status
+        self.payload = payload
+        self.initiatedBy = initiatedBy
+        self.expiresAt = expiresAt
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         attachments = try? container.decodeIfPresent([CoreMetadataAttachment].self, forKey: .attachments)
         replyTo = try? container.decodeIfPresent(CoreMessageReplyTo.self, forKey: .replyTo)
+        kind = try? container.decodeIfPresent(String.self, forKey: .kind)
+        cardId = try? container.decodeIfPresent(String.self, forKey: .cardId)
+        command = try? container.decodeIfPresent(String.self, forKey: .command)
+        status = try? container.decodeIfPresent(String.self, forKey: .status)
+        payload = try? container.decodeIfPresent([String: CoreJSONValue].self, forKey: .payload)
+        initiatedBy = try? container.decodeIfPresent(String.self, forKey: .initiatedBy)
+        expiresAt = try? container.decodeIfPresent(String.self, forKey: .expiresAt)
+    }
+
+    var isCommandCard: Bool {
+        kind == "command_card" && command?.isEmpty == false
+    }
+}
+
+enum CoreJSONValue: Codable, Hashable {
+    case string(String)
+    case number(Double)
+    case bool(Bool)
+    case object([String: CoreJSONValue])
+    case array([CoreJSONValue])
+    case null
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let value = try? container.decode(Bool.self) {
+            self = .bool(value)
+        } else if let value = try? container.decode(Double.self) {
+            self = .number(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode([String: CoreJSONValue].self) {
+            self = .object(value)
+        } else {
+            self = .array(try container.decode([CoreJSONValue].self))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .string(let value): try container.encode(value)
+        case .number(let value): try container.encode(value)
+        case .bool(let value): try container.encode(value)
+        case .object(let value): try container.encode(value)
+        case .array(let value): try container.encode(value)
+        case .null: try container.encodeNil()
+        }
+    }
+
+    var stringValue: String? {
+        if case .string(let value) = self { return value }
+        return nil
+    }
+
+    var numberValue: Double? {
+        if case .number(let value) = self { return value }
+        return nil
+    }
+
+    var arrayValue: [CoreJSONValue]? {
+        if case .array(let value) = self { return value }
+        return nil
+    }
+
+    var objectValue: [String: CoreJSONValue]? {
+        if case .object(let value) = self { return value }
+        return nil
     }
 }
 
@@ -567,6 +667,24 @@ struct CoreMessage: Identifiable, Codable, Hashable {
 
     var authorName: String {
         author?.displayName ?? "Unknown"
+    }
+}
+
+struct CoreMessagePin: Identifiable, Codable, Hashable {
+    var id: String
+    var empresaId: Int
+    var conversationId: String
+    var messageId: String
+    var pinnedBy: String
+    var createdAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case empresaId = "empresa_id"
+        case conversationId = "conversation_id"
+        case messageId = "message_id"
+        case pinnedBy = "pinned_by"
+        case createdAt = "created_at"
     }
 }
 

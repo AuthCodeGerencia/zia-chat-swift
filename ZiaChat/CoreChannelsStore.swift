@@ -7,6 +7,7 @@ final class CoreChannelsStore: ObservableObject {
     @Published var channels: [CoreChannel] = CorePreviewData.channels
     @Published var directMessages: [CoreDirectMessage] = []
     @Published var messages: [String: [CoreMessage]] = CorePreviewData.messages
+    @Published var messagePins: [String: [CoreMessagePin]] = [:]
     @Published var channelPreviews: [String: CoreMessage] = [:]
     @Published var polls: [String: CorePoll] = [:]
     @Published var mentionableUsers: [CoreUserLite] = []
@@ -36,7 +37,8 @@ final class CoreChannelsStore: ObservableObject {
     private var realtimeService: CoreRealtimeService?
     private var channelSearchTask: Task<Void, Never>?
     private var realtimeConversationId: String?
-    private var reactionRefreshTask: Task<Void, Never>?
+    private var realtimeReconnectTask: Task<Void, Never>?
+    private var realtimeMessageRefreshTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
     private var sessionRefreshTask: Task<CoreAppConfiguration, Error>?
     private let optimisticMessagePrefix = "local-pending-"
@@ -365,9 +367,6 @@ final class CoreChannelsStore: ObservableObject {
                 if let users = try? await client.listMentionableUsers() {
                     mentionableUsers = users
                 }
-                if let dms = try? await client.listDirectMessages() {
-                    directMessages = dms
-                }
 
                 Task { @MainActor [weak self] in
                     guard let self, self.configuration.isUsable else { return }
@@ -561,6 +560,42 @@ final class CoreChannelsStore: ObservableObject {
         }
     }
 
+    func loadMessagePins(for channel: CoreChannel) async {
+        guard configuration.isUsable, let conversationId = channel.conversationId else { return }
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            messagePins[conversationId] = try await client.listMessagePins(conversationId: conversationId)
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func isPinned(_ message: CoreMessage) -> Bool {
+        messagePins[message.conversationId]?.contains(where: { $0.messageId == message.id }) == true
+    }
+
+    func togglePin(_ message: CoreMessage) async {
+        guard configuration.isUsable else { return }
+        lastError = nil
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            if isPinned(message) {
+                try await client.unpinMessage(message)
+                messagePins[message.conversationId]?.removeAll { $0.messageId == message.id }
+            } else {
+                let pin = try await client.pinMessage(message)
+                var pins = messagePins[message.conversationId] ?? []
+                pins.removeAll { $0.messageId == message.id }
+                pins.insert(pin, at: 0)
+                messagePins[message.conversationId] = pins
+            }
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
     func send(
         _ text: String,
         attachments: [CorePendingAttachment] = [],
@@ -613,16 +648,21 @@ final class CoreChannelsStore: ObservableObject {
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try SupabaseCoreClient(configuration: activeConfiguration)
-            var message = try await client.sendMessage(
-                empresaId: channel.empresaId,
-                conversationId: conversationId,
-                // Los DMs no tienen canal: el mensaje va solo a la conversación.
-                channelId: channel.isDirectMessage ? nil : channel.id,
-                parentMessageId: parentMessageId,
-                content: content,
-                attachments: attachments,
-                replyTo: replyQuote
-            )
+            var message: CoreMessage
+            if content.hasPrefix("/"), parentMessageId == nil, attachments.isEmpty {
+                message = try await sendSlashCommand(content, conversationId: conversationId)
+            } else {
+                message = try await client.sendMessage(
+                    empresaId: channel.empresaId,
+                    conversationId: conversationId,
+                    // Los DMs no tienen canal: el mensaje va solo a la conversación.
+                    channelId: channel.isDirectMessage ? nil : channel.id,
+                    parentMessageId: parentMessageId,
+                    content: content,
+                    attachments: attachments,
+                    replyTo: replyQuote
+                )
+            }
             message.author = optimisticMessage.author
             if insertedOptimisticMessage {
                 removeMessage(id: optimisticMessage.id, conversationId: conversationId)
@@ -635,6 +675,7 @@ final class CoreChannelsStore: ObservableObject {
                 upsertMessage(message)
                 updateChannelPreview(with: message)
             }
+            await realtimeService?.broadcast(message: message)
             Task {
                 try? await client.markRead(conversationId: conversationId, lastReadMessageId: message.id)
             }
@@ -663,6 +704,39 @@ final class CoreChannelsStore: ObservableObject {
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    private func sendSlashCommand(_ content: String, conversationId: String) async throws -> CoreMessage {
+        let response = try await coreAPIRequest(
+            path: "/api/core/messages/send",
+            method: "POST",
+            body: [
+                "conversationId": conversationId,
+                "content": content,
+                "metadata": [:],
+                "attachments": []
+            ]
+        )
+        guard let rawMessage = response["message"] as? [String: Any] else {
+            throw SupabaseCoreError.emptyResponse
+        }
+        let data = try JSONSerialization.data(withJSONObject: rawMessage)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let value = try container.decode(String.self)
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = formatter.date(from: value) {
+                return date
+            }
+            formatter.formatOptions = [.withInternetDateTime]
+            if let date = formatter.date(from: value) {
+                return date
+            }
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Fecha inválida")
+        }
+        return try decoder.decode(CoreMessage.self, from: data)
     }
 
     /// Loads the list of threads (root messages with replies) for a channel.
@@ -715,6 +789,7 @@ final class CoreChannelsStore: ObservableObject {
             if upsertThreadReply(reply, parentMessageId: root.id) {
                 incrementReplyCount(for: root.id, conversationId: conversationId)
             }
+            await realtimeService?.broadcast(message: reply)
         } catch {
             lastError = error.localizedDescription
         }
@@ -986,6 +1061,10 @@ final class CoreChannelsStore: ObservableObject {
                 body: ["content": content]
             )
             applyLocalMessageEdit(messageId: message.id, conversationId: message.conversationId, content: content)
+            var updatedMessage = message
+            updatedMessage.content = content
+            updatedMessage.editedAt = Date()
+            await realtimeService?.broadcast(message: updatedMessage)
             return true
         } catch {
             lastError = error.localizedDescription
@@ -1001,9 +1080,13 @@ final class CoreChannelsStore: ObservableObject {
         do {
             try await coreAPIRequest(path: "/api/core/messages/\(message.id)", method: "DELETE")
             removeMessage(id: message.id, conversationId: message.conversationId)
+            messagePins[message.conversationId]?.removeAll { $0.messageId == message.id }
             for (rootId, replies) in threadReplies where replies.contains(where: { $0.id == message.id }) {
                 threadReplies[rootId] = replies.filter { $0.id != message.id }
             }
+            var deletedMessage = message
+            deletedMessage.deletedAt = Date()
+            await realtimeService?.broadcast(message: deletedMessage)
             return true
         } catch {
             lastError = error.localizedDescription
@@ -1201,9 +1284,9 @@ final class CoreChannelsStore: ObservableObject {
         )
     }
 
-    private func startRealtime(for channel: CoreChannel) {
+    private func startRealtime(for channel: CoreChannel, force: Bool = false) {
         guard let conversationId = channel.conversationId else { return }
-        guard realtimeConversationId != conversationId else { return }
+        guard force || realtimeConversationId != conversationId || realtimeService == nil else { return }
 
         stopRealtime()
         realtimeConversationId = conversationId
@@ -1220,29 +1303,113 @@ final class CoreChannelsStore: ObservableObject {
                     onUpdate: { [weak self] message in
                         await self?.handleRealtimeUpdate(message)
                     },
+                    onDelete: { [weak self] message in
+                        await self?.handleRealtimeDelete(message)
+                    },
                     onReactionChange: { [weak self] reaction, deletedReactionId in
                         await self?.handleRealtimeReaction(reaction, deletedReactionId: deletedReactionId)
+                    },
+                    onAttachmentChange: { [weak self] attachment, deletedAttachmentId in
+                        await self?.handleRealtimeAttachment(
+                            attachment,
+                            deletedAttachmentId: deletedAttachmentId
+                        )
+                    },
+                    onPinChange: { [weak self] pin, deletedPinId in
+                        await self?.handleRealtimePin(pin, deletedPinId: deletedPinId)
+                    },
+                    onMessageSignal: { [weak self] in
+                        await self?.scheduleRealtimeMessageRefresh(conversationId: conversationId)
+                    },
+                    onError: { [weak self] message in
+                        await self?.setRealtimeError(message)
+                    },
+                    onDisconnect: { [weak self] in
+                        await self?.scheduleRealtimeReconnect(for: channel)
                     }
                 )
             } catch {
                 await MainActor.run {
                     if self.realtimeConversationId == conversationId {
                         self.lastError = error.localizedDescription
+                        self.realtimeService = nil
                     }
                 }
+                self.scheduleRealtimeReconnect(for: channel)
             }
         }
     }
 
     private func stopRealtime() {
-        reactionRefreshTask?.cancel()
-        reactionRefreshTask = nil
+        realtimeReconnectTask?.cancel()
+        realtimeReconnectTask = nil
+        realtimeMessageRefreshTask?.cancel()
+        realtimeMessageRefreshTask = nil
         realtimeConversationId = nil
 
         guard let realtimeService else { return }
         self.realtimeService = nil
         Task {
             await realtimeService.stop()
+        }
+    }
+
+    func reconnectRealtimeIfNeeded() {
+        guard let conversationId = realtimeConversationId,
+              let channel = channels.first(where: { $0.conversationId == conversationId })
+                ?? directMessages.first(where: { $0.id == conversationId })?.chatTarget else {
+            return
+        }
+        startRealtime(for: channel, force: true)
+    }
+
+    private func scheduleRealtimeReconnect(for channel: CoreChannel) {
+        guard realtimeConversationId == channel.conversationId else { return }
+        realtimeReconnectTask?.cancel()
+        realtimeReconnectTask = Task {
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled,
+                  self.realtimeConversationId == channel.conversationId else { return }
+            self.startRealtime(for: channel, force: true)
+        }
+    }
+
+    private func scheduleRealtimeMessageRefresh(conversationId: String) {
+        guard realtimeConversationId == conversationId else { return }
+        realtimeMessageRefreshTask?.cancel()
+        realtimeMessageRefreshTask = Task {
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled, self.realtimeConversationId == conversationId else { return }
+            await self.resyncRealtimeMessages(conversationId: conversationId)
+        }
+    }
+
+    private func resyncRealtimeMessages(conversationId: String) async {
+        guard realtimeConversationId == conversationId,
+              let client = try? SupabaseCoreClient(configuration: configuration) else {
+            return
+        }
+
+        let limit = max(21, messages[conversationId, default: []].count + 5)
+        guard let loaded = try? await client.listMessagePage(
+            conversationId: conversationId,
+            limit: limit
+        ) else {
+            return
+        }
+
+        if let enriched = try? await client.enrichMessages(loaded) {
+            mergeMessagePage(enriched, conversationId: conversationId)
+        } else {
+            mergeMessagePage(loaded, conversationId: conversationId)
+        }
+        if let latest = loaded.last {
+            updateChannelPreview(with: latest)
+            clearUnreadForActiveConversation(conversationId)
+            try? await client.markRead(
+                conversationId: conversationId,
+                lastReadMessageId: latest.id
+            )
         }
     }
 
@@ -1311,13 +1478,19 @@ final class CoreChannelsStore: ObservableObject {
         }
     }
 
-    private func handleRealtimeReaction(_ reaction: CoreReaction?, deletedReactionId: String?) async {
-        guard let reaction else {
-            scheduleReactionRefresh()
-            return
-        }
+    private func handleRealtimeDelete(_ message: CoreMessage) {
+        guard message.conversationId == realtimeConversationId else { return }
+        removeMessage(id: message.id, conversationId: message.conversationId)
+        messagePins[message.conversationId]?.removeAll { $0.messageId == message.id }
+    }
 
-        var patched = false
+    private func setRealtimeError(_ message: String) {
+        lastError = message
+    }
+
+    private func handleRealtimeReaction(_ reaction: CoreReaction?, deletedReactionId: String?) async {
+        guard let reaction else { return }
+
         for (conversationId, conversationMessages) in messages where conversationId == realtimeConversationId {
             guard let messageIndex = conversationMessages.firstIndex(where: { $0.id == reaction.messageId }) else { continue }
             var nextMessages = conversationMessages
@@ -1333,26 +1506,63 @@ final class CoreChannelsStore: ObservableObject {
 
             nextMessages[messageIndex].reactions = reactions
             messages[conversationId] = nextMessages
-            patched = true
+            return
         }
 
-        if !patched {
-            scheduleReactionRefresh()
+        // The reactions stream is company-wide because the table has no
+        // conversation_id column. Ignore events for messages outside this chat.
+    }
+
+    private func handleRealtimeAttachment(
+        _ attachment: CoreAttachment?,
+        deletedAttachmentId: String?
+    ) async {
+        guard let attachment,
+              let messageId = attachment.messageId,
+              let conversationId = realtimeConversationId,
+              let messageIndex = messages[conversationId]?.firstIndex(where: { $0.id == messageId }) else {
+            return
+        }
+
+        if let deletedAttachmentId {
+            messages[conversationId]?[messageIndex].attachments?.removeAll {
+                $0.id == deletedAttachmentId
+            }
+            return
+        }
+
+        var attachments = messages[conversationId]?[messageIndex].attachments ?? []
+        if let attachmentIndex = attachments.firstIndex(where: { $0.id == attachment.id }) {
+            attachments[attachmentIndex] = attachment
+        } else {
+            attachments.append(attachment)
+        }
+        messages[conversationId]?[messageIndex].attachments = attachments
+
+        // Storage rows may need a short-lived signed URL. Hydrate only this
+        // message after the realtime event, never the full conversation.
+        if attachment.resolvedURL == nil,
+           let client = try? SupabaseCoreClient(configuration: configuration),
+           let message = messages[conversationId]?[messageIndex] {
+            let enriched = await client.enrichRealtimeMessage(message)
+            upsertMessage(enriched)
         }
     }
 
-    private func scheduleReactionRefresh() {
-        reactionRefreshTask?.cancel()
-        reactionRefreshTask = Task {
-            try? await Task.sleep(for: .milliseconds(300))
-            guard !Task.isCancelled else { return }
-            await refreshActiveMessages()
-        }
-    }
+    private func handleRealtimePin(_ pin: CoreMessagePin?, deletedPinId: String?) {
+        guard let pin, pin.conversationId == realtimeConversationId else { return }
+        var pins = messagePins[pin.conversationId] ?? []
 
-    private func refreshActiveMessages() async {
-        guard let selectedChannel else { return }
-        await open(selectedChannel, force: true)
+        if let deletedPinId {
+            pins.removeAll { $0.id == deletedPinId || $0.messageId == pin.messageId }
+        } else if let index = pins.firstIndex(where: { $0.id == pin.id || $0.messageId == pin.messageId }) {
+            pins[index] = pin
+        } else {
+            pins.append(pin)
+        }
+
+        pins.sort { $0.createdAt > $1.createdAt }
+        messagePins[pin.conversationId] = pins
     }
 
     private func upsertMessage(_ message: CoreMessage) {

@@ -99,19 +99,22 @@ struct EmojiAwareText: View {
     let color: Color
     let mentionableUsers: [CoreUserLite]
     let currentUserName: String?
+    let onMentionTap: ((CoreUserLite) -> Void)?
 
     init(
         _ value: String,
         font: Font,
         color: Color,
         mentionableUsers: [CoreUserLite] = [],
-        currentUserName: String? = nil
+        currentUserName: String? = nil,
+        onMentionTap: ((CoreUserLite) -> Void)? = nil
     ) {
         self.value = value
         self.font = font
         self.color = color
         self.mentionableUsers = mentionableUsers
         self.currentUserName = currentUserName
+        self.onMentionTap = onMentionTap
     }
 
     var body: some View {
@@ -119,13 +122,31 @@ struct EmojiAwareText: View {
         if needsInteractiveRendering {
             Text(attributedValue)
                 .fixedSize(horizontal: false, vertical: true)
+                .environment(\.openURL, mentionOpenURLAction)
         } else {
             SimulatorEmojiText(value: value, font: font, color: color)
         }
         #else
         Text(attributedValue)
             .fixedSize(horizontal: false, vertical: true)
+            .environment(\.openURL, mentionOpenURLAction)
         #endif
+    }
+
+    private var mentionOpenURLAction: OpenURLAction {
+        OpenURLAction { url in
+            guard url.scheme == "zia-mention",
+                  let userId = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                    .queryItems?
+                    .first(where: { $0.name == "user" })?
+                    .value,
+                  let user = mentionableUsers.first(where: { $0.id == userId }),
+                  let onMentionTap else {
+                return .systemAction
+            }
+            onMentionTap(user)
+            return .handled
+        }
     }
 
     private var needsInteractiveRendering: Bool {
@@ -185,16 +206,25 @@ struct EmojiAwareText: View {
                     let token = (value as NSString).substring(with: match.range)
                     let mentionedName = String(token.dropFirst())
                     let isCurrentUser = mentionedName.caseInsensitiveCompare(currentUserName ?? "") == .orderedSame
-                    result.addAttributes(
-                        [
-                            .font: UIFont.preferredFont(forTextStyle: .headline),
-                            .foregroundColor: isCurrentUser ? UIColor.white : UIColor.systemBlue,
-                            .backgroundColor: isCurrentUser
-                                ? UIColor.systemBlue
-                                : UIColor.systemBlue.withAlphaComponent(0.12)
-                        ],
-                        range: match.range
-                    )
+                    var attributes: [NSAttributedString.Key: Any] = [
+                        .font: UIFont.preferredFont(forTextStyle: .headline),
+                        .foregroundColor: isCurrentUser ? UIColor.white : UIColor.systemBlue,
+                        .backgroundColor: isCurrentUser
+                            ? UIColor.systemBlue
+                            : UIColor.systemBlue.withAlphaComponent(0.12)
+                    ]
+                    if let user = mentionableUsers.first(where: {
+                        $0.displayName.caseInsensitiveCompare(mentionedName) == .orderedSame
+                    }) {
+                        var components = URLComponents()
+                        components.scheme = "zia-mention"
+                        components.host = "user"
+                        components.queryItems = [URLQueryItem(name: "user", value: user.id)]
+                        if let url = components.url {
+                            attributes[.link] = url
+                        }
+                    }
+                    result.addAttributes(attributes, range: match.range)
                 }
             }
         }

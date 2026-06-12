@@ -4,6 +4,7 @@ import Supabase
 final class CoreRealtimeService {
     private let client: SupabaseClient
     private let decoder: JSONDecoder
+    private let accessToken: String
     private var channel: RealtimeChannelV2?
     private var tasks: [Task<Void, Never>] = []
 
@@ -15,6 +16,7 @@ final class CoreRealtimeService {
 
         decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .custom(Self.decodeDate)
+        accessToken = configuration.accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -41,19 +43,20 @@ final class CoreRealtimeService {
         conversationId: String,
         onInsert: @escaping @Sendable (CoreMessage) async -> Void,
         onUpdate: @escaping @Sendable (CoreMessage) async -> Void,
-        onReactionChange: @escaping @Sendable (CoreReaction?, String?) async -> Void
+        onDelete: @escaping @Sendable (CoreMessage) async -> Void,
+        onReactionChange: @escaping @Sendable (CoreReaction?, String?) async -> Void,
+        onAttachmentChange: @escaping @Sendable (CoreAttachment?, String?) async -> Void,
+        onPinChange: @escaping @Sendable (CoreMessagePin?, String?) async -> Void,
+        onMessageSignal: @escaping @Sendable () async -> Void,
+        onError: @escaping @Sendable (String) async -> Void,
+        onDisconnect: @escaping @Sendable () async -> Void
     ) async throws {
         await stop()
 
         let channel = client.channel("core:conversation:\(conversationId)")
-        let insertStream = channel.postgresChange(
-            InsertAction.self,
-            schema: "public",
-            table: "core_messages",
-            filter: .eq("conversation_id", value: conversationId)
-        )
-        let updateStream = channel.postgresChange(
-            UpdateAction.self,
+        let messageBroadcastStream = channel.broadcastStream(event: "message:new")
+        let messageStream = channel.postgresChange(
+            AnyAction.self,
             schema: "public",
             table: "core_messages",
             filter: .eq("conversation_id", value: conversationId)
@@ -63,19 +66,58 @@ final class CoreRealtimeService {
             schema: "public",
             table: "core_reactions"
         )
+        let attachmentStream = channel.postgresChange(
+            AnyAction.self,
+            schema: "public",
+            table: "core_attachments"
+        )
+        let pinStream = channel.postgresChange(
+            AnyAction.self,
+            schema: "public",
+            table: "core_message_pins",
+            filter: .eq("conversation_id", value: conversationId)
+        )
 
         tasks = [
             Task { [decoder] in
-                for await action in insertStream {
-                    if let message = try? action.decodeRecord(as: CoreMessage.self, decoder: decoder) {
-                        await onInsert(message)
+                for await payload in messageBroadcastStream {
+                    await onMessageSignal()
+                    let layer = payload["payload"]?.objectValue ?? payload
+                    guard let messageObject = layer["message"]?.objectValue else {
+                        continue
+                    }
+                    do {
+                        let message = try messageObject.decode(as: CoreMessage.self, decoder: decoder)
+                        if message.deletedAt != nil {
+                            await onUpdate(message)
+                        } else {
+                            await onInsert(message)
+                        }
+                    } catch {
+                        await onError("Realtime message:new: \(error.localizedDescription)")
                     }
                 }
             },
             Task { [decoder] in
-                for await action in updateStream {
-                    if let message = try? action.decodeRecord(as: CoreMessage.self, decoder: decoder) {
-                        await onUpdate(message)
+                for await action in messageStream {
+                    await onMessageSignal()
+                    do {
+                        switch action {
+                        case let .insert(insert):
+                            await onInsert(
+                                try insert.decodeRecord(as: CoreMessage.self, decoder: decoder)
+                            )
+                        case let .update(update):
+                            await onUpdate(
+                                try update.decodeRecord(as: CoreMessage.self, decoder: decoder)
+                            )
+                        case let .delete(delete):
+                            await onDelete(
+                                try delete.decodeOldRecord(as: CoreMessage.self, decoder: decoder)
+                            )
+                        }
+                    } catch {
+                        await onError("Realtime core_messages: \(error.localizedDescription)")
                     }
                 }
             },
@@ -93,11 +135,72 @@ final class CoreRealtimeService {
                         await onReactionChange(reaction, reaction?.id)
                     }
                 }
+            },
+            Task { [decoder] in
+                for await action in attachmentStream {
+                    switch action {
+                    case let .insert(insert):
+                        await onAttachmentChange(
+                            try? insert.decodeRecord(as: CoreAttachment.self, decoder: decoder),
+                            nil
+                        )
+                    case let .update(update):
+                        await onAttachmentChange(
+                            try? update.decodeRecord(as: CoreAttachment.self, decoder: decoder),
+                            nil
+                        )
+                    case let .delete(delete):
+                        let attachment = try? delete.decodeOldRecord(as: CoreAttachment.self, decoder: decoder)
+                        await onAttachmentChange(attachment, attachment?.id)
+                    }
+                }
+            },
+            Task { [decoder] in
+                for await action in pinStream {
+                    switch action {
+                    case let .insert(insert):
+                        await onPinChange(
+                            try? insert.decodeRecord(as: CoreMessagePin.self, decoder: decoder),
+                            nil
+                        )
+                    case let .update(update):
+                        await onPinChange(
+                            try? update.decodeRecord(as: CoreMessagePin.self, decoder: decoder),
+                            nil
+                        )
+                    case let .delete(delete):
+                        let pin = try? delete.decodeOldRecord(as: CoreMessagePin.self, decoder: decoder)
+                        await onPinChange(pin, pin?.id)
+                    }
+                }
+            },
+            Task {
+                var wasSubscribed = false
+                for await status in channel.statusChange {
+                    switch status {
+                    case .subscribed:
+                        wasSubscribed = true
+                    case .unsubscribed where wasSubscribed:
+                        await onDisconnect()
+                        return
+                    default:
+                        break
+                    }
+                }
             }
         ]
 
         self.channel = channel
-        try await channel.subscribe()
+        await client.realtimeV2.setAuth(accessToken)
+        try await channel.subscribeWithError()
+    }
+
+    func broadcast(message: CoreMessage) async {
+        guard let channel else { return }
+        try? await channel.broadcast(
+            event: "message:new",
+            message: CoreMessageBroadcastEnvelope(message: message)
+        )
     }
 
     func stop() async {
@@ -121,4 +224,8 @@ final class CoreRealtimeService {
         if let date = formatter.date(from: value) { return date }
         throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid date: \(value)")
     }
+}
+
+private struct CoreMessageBroadcastEnvelope: Codable {
+    let message: CoreMessage
 }

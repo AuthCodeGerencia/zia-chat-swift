@@ -380,6 +380,48 @@ final class SupabaseCoreClient {
         return try await enrichMessages(displayOrder)
     }
 
+    func listMessagePins(conversationId: String) async throws -> [CoreMessagePin] {
+        try await client
+            .from("core_message_pins")
+            .select()
+            .eq("conversation_id", value: conversationId)
+            .order("created_at", ascending: false)
+            .execute()
+            .value
+    }
+
+    func pinMessage(_ message: CoreMessage) async throws -> CoreMessagePin {
+        guard let empresaId = configuration.empresaId else {
+            throw SupabaseCoreError.notConfigured
+        }
+
+        let inserted: [CoreMessagePin] = try await client
+            .from("core_message_pins")
+            .insert(
+                CoreMessagePinInsert(
+                    empresaId: empresaId,
+                    conversationId: message.conversationId,
+                    messageId: message.id,
+                    pinnedBy: configuration.userId
+                )
+            )
+            .select()
+            .execute()
+            .value
+
+        guard let pin = inserted.first else { throw SupabaseCoreError.emptyResponse }
+        return pin
+    }
+
+    func unpinMessage(_ message: CoreMessage) async throws {
+        try await client
+            .from("core_message_pins")
+            .delete()
+            .eq("conversation_id", value: message.conversationId)
+            .eq("message_id", value: message.id)
+            .execute()
+    }
+
     func listMessagePage(
         conversationId: String,
         before: Date? = nil,
@@ -1339,6 +1381,20 @@ private struct CoreMessageInsert: Encodable {
         case userId = "user_id"
         case content
         case metadata
+    }
+}
+
+private struct CoreMessagePinInsert: Encodable {
+    var empresaId: Int
+    var conversationId: String
+    var messageId: String
+    var pinnedBy: String
+
+    enum CodingKeys: String, CodingKey {
+        case empresaId = "empresa_id"
+        case conversationId = "conversation_id"
+        case messageId = "message_id"
+        case pinnedBy = "pinned_by"
     }
 }
 
