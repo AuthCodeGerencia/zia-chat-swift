@@ -1498,10 +1498,14 @@ private struct ChatDetailView: View {
                         messageInfoTarget = selectedMessage
                         self.selectedMessage = nil
                     },
-                    onSaveSticker: selectedMessage.attachments?.first(where: { $0.isImage }) == nil ? nil : {
+                    onSaveSticker: selectedMessage.stickerReferences.isEmpty &&
+                        selectedMessage.attachments?.first(where: { $0.isImage }) == nil ? nil : {
+                        let sticker = selectedMessage.stickerReferences.first
                         let attachment = selectedMessage.attachments?.first(where: { $0.isImage })
                         self.selectedMessage = nil
-                        if let attachment {
+                        if let sticker {
+                            Task { _ = await store.saveSticker(name: sticker.name, from: sticker.url) }
+                        } else if let attachment {
                             Task { _ = await store.saveStickerFromAttachment(attachment) }
                         }
                     },
@@ -2609,6 +2613,65 @@ private struct ConnectedVoiceBar: View {
     }
 }
 
+private struct MessageStickerReference: Identifiable, Hashable {
+    let name: String
+    let url: URL
+
+    var id: String { "\(name)|\(url.absoluteString)" }
+}
+
+private extension String {
+    static let stickerReferenceRegex = try! NSRegularExpression(
+        pattern: #"\[sticker:([^\]]+)\]\s+(https?://\S+)"#
+    )
+
+    var stickerReferences: [MessageStickerReference] {
+        let fullRange = NSRange(startIndex..<endIndex, in: self)
+        return Self.stickerReferenceRegex.matches(in: self, range: fullRange).compactMap { match in
+            guard
+                let nameRange = Range(match.range(at: 1), in: self),
+                let urlRange = Range(match.range(at: 2), in: self),
+                let url = URL(string: String(self[urlRange]))
+            else {
+                return nil
+            }
+
+            return MessageStickerReference(
+                name: String(self[nameRange]).trimmingCharacters(in: .whitespacesAndNewlines),
+                url: url
+            )
+        }
+    }
+
+    var removingStickerReferences: String {
+        let fullRange = NSRange(startIndex..<endIndex, in: self)
+        return Self.stickerReferenceRegex
+            .stringByReplacingMatches(in: self, range: fullRange, withTemplate: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+private extension CoreMessage {
+    var stickerReferences: [MessageStickerReference] {
+        content.stickerReferences
+    }
+}
+
+private struct StickerMessageView: View {
+    let stickers: [MessageStickerReference]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(stickers) { sticker in
+                AttachmentMediaView(url: sticker.url, isGIF: true)
+                .frame(width: 170, height: 170)
+                .contentShape(Rectangle())
+                .accessibilityLabel("Sticker \(sticker.name)")
+            }
+        }
+    }
+}
+
 private struct MessageBubble: View {
     let message: CoreMessage
     let isMine: Bool
@@ -2628,6 +2691,10 @@ private struct MessageBubble: View {
 
     private var isVoiceNoteOnly: Bool {
         message.content == "Nota de voz" && (message.attachments?.contains { $0.isAudio } ?? false)
+    }
+
+    private var textContent: String {
+        message.content.removingStickerReferences
     }
 
     var body: some View {
@@ -2681,9 +2748,9 @@ private struct MessageBubble: View {
 
                 if message.metadata?.isCommandCard == true {
                     CommandCardView(message: message)
-                } else if !message.content.isEmpty, !isVoiceNoteOnly {
+                } else if !textContent.isEmpty, !isVoiceNoteOnly {
                     EmojiAwareText(
-                        message.content,
+                        textContent,
                         font: .body,
                         color: .primary,
                         mentionableUsers: mentionableUsers,
@@ -2703,7 +2770,11 @@ private struct MessageBubble: View {
                     .shadow(color: .black.opacity(isMine ? 0.03 : 0.06), radius: 1, y: 1)
                 }
 
-                if !isVoiceNoteOnly, let linkURL = message.content.firstDetectedURL {
+                if !message.stickerReferences.isEmpty {
+                    StickerMessageView(stickers: message.stickerReferences)
+                }
+
+                if !isVoiceNoteOnly, let linkURL = textContent.firstDetectedURL {
                     LinkPreviewCard(url: linkURL)
                 }
 
@@ -4033,12 +4104,9 @@ private struct ComposerView: View {
 
     private func sendSticker(_ sticker: CoreSticker) {
         activePanel = .none
-        let ext = (sticker.imageURL as NSString).pathExtension
-        let fileName = "sticker-\(sticker.id).\(ext.isEmpty ? "png" : ext)"
         Task {
-            await store.sendRemoteMedia(
-                urlString: sticker.imageURL,
-                fileName: fileName,
+            await store.send(
+                "[sticker:\(sticker.name)] \(sticker.imageURL)",
                 in: channel,
                 parentMessageId: threadParentId
             )

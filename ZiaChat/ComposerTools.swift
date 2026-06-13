@@ -265,14 +265,18 @@ extension CoreChannelsStore {
     /// colección de stickers del usuario (visible también en el stock global).
     func saveStickerFromAttachment(_ attachment: CoreAttachment) async -> Bool {
         guard let url = attachment.resolvedURL else { return false }
+        return await saveSticker(name: attachment.fileName, from: url)
+    }
+
+    func saveSticker(name: String, from url: URL) async -> Bool {
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
             let format = StickerImageFormat.detect(data)
-            let base = (attachment.fileName as NSString).deletingPathExtension
-            let name = base.isEmpty ? "Sticker" : base
+            let base = (name as NSString).deletingPathExtension
+            let stickerName = base.isEmpty ? "Sticker" : base
             let fileName = "sticker-\(Int(Date().timeIntervalSince1970 * 1000)).\(format.fileExtension)"
             return await uploadSticker(
-                name: name,
+                name: stickerName,
                 data: data,
                 fileName: fileName,
                 mimeType: format.mimeType
