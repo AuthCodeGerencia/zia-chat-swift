@@ -97,7 +97,7 @@ struct ContentView: View {
                     return
                 }
                 _ = try? await store.ensureFreshSession()
-                store.reconnectRealtimeIfNeeded()
+                await store.reconnectRealtimeIfNeeded()
                 await syncAppBadge()
                 schedulePendingPushNavigation()
             }
@@ -1544,8 +1544,12 @@ private struct ChatDetailView: View {
             Task { await typingService.disconnect() }
         }
         .onChange(of: draft) { oldValue, newValue in
-            guard !newValue.isEmpty, newValue != oldValue else { return }
-            typingService.userIsTyping(configuration: store.configuration)
+            guard newValue != oldValue else { return }
+            if newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                typingService.userStoppedTyping(configuration: store.configuration)
+            } else {
+                typingService.userIsTyping(configuration: store.configuration)
+            }
         }
     }
 
@@ -5154,6 +5158,8 @@ private struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var store: CoreChannelsStore
     @State private var config: CoreAppConfiguration
+    @State private var isTestingPush = false
+    @State private var pushTestMessage: String?
 
     init(store: CoreChannelsStore) {
         self.store = store
@@ -5163,11 +5169,14 @@ private struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Supabase") {
+                Section("Backend") {
                     TextField("Project URL", text: $config.supabaseURL)
                         .textInputAutocapitalization(.never)
                         .keyboardType(.URL)
                     SecureField("Anon key", text: $config.anonKey)
+                    TextField("Convex URL", text: $config.convexURL)
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
                 }
 
                 Section("Session") {
@@ -5179,8 +5188,29 @@ private struct SettingsView: View {
                     TextField("Display name", text: $config.displayName)
                 }
 
+                Section("Push") {
+                    Button {
+                        testPush()
+                    } label: {
+                        HStack {
+                            Label("Probar push", systemImage: "bell.badge")
+                            Spacer()
+                            if isTestingPush {
+                                ProgressView()
+                            }
+                        }
+                    }
+                    .disabled(isTestingPush || !store.configuration.isUsable)
+
+                    if let pushTestMessage {
+                        Text(pushTestMessage)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 Section {
-                    Text("ZiaChat reads Azank React Core channels through `core_list_user_channels`, creates channels through `core_create_channel`, and writes messages to `core_messages`.")
+                    Text("ZiaChat uses Supabase only for login tokens and uses Convex for Core chat data.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -5201,6 +5231,36 @@ private struct SettingsView: View {
             }
         }
     }
+
+    private func testPush() {
+        isTestingPush = true
+        pushTestMessage = nil
+        Task {
+            do {
+                let configuration = try await store.ensureFreshSession()
+                await PushNotificationService.shared.requestAuthorizationAndRegister()
+                await PushNotificationService.shared.registerCurrentToken(configuration: configuration)
+                let client = try ConvexCoreClient(configuration: configuration)
+                let result = try await client.sendTestPush()
+                await MainActor.run {
+                    if result.sent > 0 {
+                        pushTestMessage = "Push enviado (\(result.sent)/\(result.attempted))."
+                    } else if let rejection = result.lastRejection {
+                        let status = rejection.status.map { "HTTP \($0): " } ?? ""
+                        pushTestMessage = "\(status)\(rejection.reason)"
+                    } else {
+                        pushTestMessage = "No se pudo enviar el push."
+                    }
+                    isTestingPush = false
+                }
+            } catch {
+                await MainActor.run {
+                    pushTestMessage = error.localizedDescription
+                    isTestingPush = false
+                }
+            }
+        }
+    }
 }
 
 private struct ConfigurationBanner: View {
@@ -5211,7 +5271,7 @@ private struct ConfigurationBanner: View {
             VStack(alignment: .leading, spacing: 6) {
                 Label("Connect Azank React Core", systemImage: "link.badge.plus")
                     .font(.headline)
-                Text("Add Supabase URL, anon key, access token, user ID, and company ID.")
+                Text("Add Supabase auth, Convex URL, access token, user ID, and company ID.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -5366,7 +5426,7 @@ private struct EmptyChannelSelectionView: View {
         ContentUnavailableView(
             isConfigured ? "Choose a channel" : "Configure Core",
             systemImage: isConfigured ? "number" : "gearshape",
-            description: Text(isConfigured ? "Open an Azank Core channel to start chatting." : "Save your Supabase settings to load channels from Azank React.")
+            description: Text(isConfigured ? "Open an Azank Core channel to start chatting." : "Save your backend settings to load channels from Azank React.")
         )
     }
 }

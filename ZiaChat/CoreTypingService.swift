@@ -1,22 +1,21 @@
 import Combine
 import Foundation
-import Supabase
 
-/// Indicador de "escribiendo…" con paridad a la web (services/core/typing.ts):
-/// canal realtime `core:conversation:{id}:typing`, evento broadcast "typing",
-/// payload {userId, userName, isTyping, parentMessageId}.
+/// Indicador de "escribiendo…" respaldado por Convex (`typing:list` /
+/// `typing:set`). La app Swift usa polling liviano porque no mantiene un
+/// cliente Convex reactivo por WebSocket.
 @MainActor
 final class CoreTypingService: ObservableObject {
     @Published private(set) var typingNames: [String] = []
 
-    private var client: SupabaseClient?
-    private var channel: RealtimeChannelV2?
-    private var listenTask: Task<Void, Never>?
-    private var expiryTasks: [String: Task<Void, Never>] = [:]
-    private var namesByUserId: [String: String] = [:]
+    private var pollTask: Task<Void, Never>?
     private var connectedConversationId: String?
     private var lastTypingSentAt: Date = .distantPast
+    private var isTypingSent = false
     private var idleTask: Task<Void, Never>?
+    private let typingPulseInterval: TimeInterval = 5
+    private let typingIdleStopDelay: Duration = .milliseconds(3500)
+    private let typingPollInterval: Duration = .seconds(4)
 
     var typingLabel: String? {
         guard !typingNames.isEmpty else { return nil }
@@ -27,70 +26,47 @@ final class CoreTypingService: ObservableObject {
     }
 
     func connect(conversationId: String, configuration: CoreAppConfiguration) async {
-        if connectedConversationId == conversationId, channel != nil { return }
+        if connectedConversationId == conversationId, pollTask != nil { return }
         await disconnect()
-        guard configuration.isUsable, let url = URL(string: configuration.supabaseURL) else { return }
-
-        let client = SupabaseClient(
-            supabaseURL: url,
-            supabaseKey: configuration.anonKey,
-            options: SupabaseClientOptions(
-                auth: .init(
-                    accessToken: {
-                        configuration.accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
-                    }
-                )
-            )
-        )
-        self.client = client
+        guard configuration.isUsable else { return }
         connectedConversationId = conversationId
-
-        let channel = client.channel("core:conversation:\(conversationId):typing")
-        self.channel = channel
-        let stream = channel.broadcastStream(event: "typing")
-        let currentUserId = configuration.userId
-        listenTask = Task { [weak self] in
-            for await message in stream {
-                await self?.handle(message, currentUserId: currentUserId)
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.refreshTyping(conversationId: conversationId, configuration: configuration)
+                try? await Task.sleep(for: self?.typingPollInterval ?? .seconds(4))
             }
         }
-        try? await channel.subscribe()
+        await refreshTyping(conversationId: conversationId, configuration: configuration)
     }
 
     func disconnect() async {
-        listenTask?.cancel()
-        listenTask = nil
+        pollTask?.cancel()
+        pollTask = nil
         idleTask?.cancel()
         idleTask = nil
-        expiryTasks.values.forEach { $0.cancel() }
-        expiryTasks.removeAll()
-        namesByUserId.removeAll()
         typingNames = []
         connectedConversationId = nil
-        if let channel {
-            await channel.unsubscribe()
-            if let client {
-                await client.removeChannel(channel)
-            }
-        }
-        channel = nil
-        client = nil
+        lastTypingSentAt = .distantPast
+        isTypingSent = false
     }
 
-    /// Notifica que el usuario está escribiendo (throttle de 2 s) y programa el
-    /// "dejó de escribir" tras 3 s de inactividad.
+    /// Notifica que el usuario está escribiendo con pulsos espaciados y programa
+    /// el "dejó de escribir" tras una pausa corta de inactividad.
     func userIsTyping(configuration: CoreAppConfiguration) {
         let now = Date()
-        if now.timeIntervalSince(lastTypingSentAt) > 2 {
+        if !isTypingSent || now.timeIntervalSince(lastTypingSentAt) >= typingPulseInterval {
             lastTypingSentAt = now
-            send(isTyping: true, configuration: configuration)
+            isTypingSent = true
+            Task { await send(isTyping: true, configuration: configuration) }
         }
         idleTask?.cancel()
         idleTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(3))
+            try? await Task.sleep(for: self?.typingIdleStopDelay ?? .milliseconds(3500))
             guard !Task.isCancelled else { return }
-            self?.send(isTyping: false, configuration: configuration)
-            self?.lastTypingSentAt = .distantPast
+            await self?.sendStopIfNeeded(configuration: configuration)
+            await MainActor.run {
+                self?.lastTypingSentAt = .distantPast
+            }
         }
     }
 
@@ -98,48 +74,35 @@ final class CoreTypingService: ObservableObject {
         idleTask?.cancel()
         idleTask = nil
         lastTypingSentAt = .distantPast
-        send(isTyping: false, configuration: configuration)
+        Task { await sendStopIfNeeded(configuration: configuration) }
     }
 
-    private func send(isTyping: Bool, configuration: CoreAppConfiguration) {
-        guard let channel else { return }
+    private func sendStopIfNeeded(configuration: CoreAppConfiguration) async {
+        guard isTypingSent else { return }
+        isTypingSent = false
+        await send(isTyping: false, configuration: configuration)
+    }
+
+    private func send(isTyping: Bool, configuration: CoreAppConfiguration) async {
+        guard let conversationId = connectedConversationId else { return }
         let name = configuration.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let payload: JSONObject = [
-            "userId": .string(configuration.userId),
-            "userName": .string(name.isEmpty ? "Usuario Core" : name),
-            "isTyping": .bool(isTyping),
-            "parentMessageId": .null
-        ]
-        Task {
-            try? await channel.broadcast(event: "typing", message: payload)
-        }
+        let client = try? ConvexCoreClient(configuration: configuration)
+        try? await client?.setTyping(
+            conversationId: conversationId,
+            userName: name.isEmpty ? "Usuario Core" : name,
+            isTyping: isTyping
+        )
     }
 
-    private func handle(_ message: JSONObject, currentUserId: String) {
-        // Igual de defensivo que la web: el payload puede venir envuelto.
-        let layer = message["payload"]?.objectValue ?? message
-        let data = layer["payload"]?.objectValue ?? layer
-        guard let userId = data["userId"]?.stringValue, !userId.isEmpty, userId != currentUserId else { return }
-        let userName = data["userName"]?.stringValue ?? "Usuario Core"
-        let isTyping = data["isTyping"]?.boolValue ?? false
-
-        expiryTasks[userId]?.cancel()
-        if isTyping {
-            namesByUserId[userId] = userName
-            expiryTasks[userId] = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(4))
-                guard !Task.isCancelled else { return }
-                self?.namesByUserId[userId] = nil
-                self?.publishNames()
-            }
-        } else {
-            namesByUserId[userId] = nil
-            expiryTasks[userId] = nil
+    private func refreshTyping(conversationId: String, configuration: CoreAppConfiguration) async {
+        guard connectedConversationId == conversationId,
+              let client = try? ConvexCoreClient(configuration: configuration),
+              let statuses = try? await client.listTyping(conversationId: conversationId) else {
+            return
         }
-        publishNames()
-    }
-
-    private func publishNames() {
-        typingNames = namesByUserId.values.sorted()
+        typingNames = statuses
+            .filter { $0.isTyping && $0.userId != configuration.userId }
+            .map(\.userName)
+            .sorted()
     }
 }

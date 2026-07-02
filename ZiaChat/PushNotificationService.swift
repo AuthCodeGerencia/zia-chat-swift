@@ -76,7 +76,7 @@ final class PushNotificationService: NSObject, ObservableObject, UNUserNotificat
         guard let deviceToken, configuration.isUsable else { return }
 
         do {
-            let client = try SupabaseCoreClient(configuration: configuration)
+            let client = try ConvexCoreClient(configuration: configuration)
             try await client.registerPushToken(
                 token: deviceToken,
                 deviceName: UIDevice.current.name
@@ -92,7 +92,7 @@ final class PushNotificationService: NSObject, ObservableObject, UNUserNotificat
             await updateBadgeCount(0)
             return
         }
-        if let client = try? SupabaseCoreClient(configuration: configuration) {
+        if let client = try? ConvexCoreClient(configuration: configuration) {
             try? await client.unregisterPushTokens()
         }
         await updateBadgeCount(0)

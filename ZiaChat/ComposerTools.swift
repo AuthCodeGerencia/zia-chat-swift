@@ -7,7 +7,7 @@ import UniformTypeIdentifiers
 
 // MARK: - Models
 // CoreSticker, CorePoll y CorePollOption viven en CoreModels.swift para que
-// la Share Extension pueda compilar SupabaseCoreClient sin este archivo de UI.
+// la Share Extension pueda compilar ConvexCoreClient sin este archivo de UI.
 
 struct CoreSlashCommand: Identifiable, Hashable {
     let id = UUID()
@@ -242,7 +242,7 @@ extension CoreChannelsStore {
         guard configuration.isUsable else { return [] }
         do {
             let config = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: config)
+            let client = try ConvexCoreClient(configuration: config)
             return try await client.listStickers()
         } catch {
             return []
@@ -253,7 +253,7 @@ extension CoreChannelsStore {
         guard configuration.isUsable else { return nil }
         do {
             let config = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: config)
+            let client = try ConvexCoreClient(configuration: config)
             return try await client.uploadSticker(name: name, data: data, fileName: fileName, mimeType: mimeType)
         } catch {
             lastError = error.localizedDescription

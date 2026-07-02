@@ -26,27 +26,46 @@ ZiaChat uses native APNs. It does not use or modify Azank App's Expo push tokens
 
 1. Enable Push Notifications for bundle ID `authcode.ZiaChat` in Apple Developer.
 2. Create an APNs `.p8` key.
-3. Deploy `supabase/functions/zia-chat-apns`.
-4. Configure these Edge Function secrets:
+3. Deploy the Convex functions from `azank-react/convex` to the deployment used
+   by the app.
+4. Configure these Convex environment variables in the same deployment:
 
 ```sh
-supabase secrets set \
+npx convex env set APNS_TEAM_ID ... --prod
+npx convex env set APNS_KEY_ID ... --prod
+npx convex env set APNS_PRIVATE_KEY '-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----' --prod
+npx convex env set APNS_BUNDLE_ID authcode.ZiaChat --prod
+npx convex env set APNS_PRODUCTION true --prod
+```
+
+For the development deployment, omit `--prod`:
+
+```sh
+npx convex env set APNS_TEAM_ID ...
+npx convex env set APNS_KEY_ID ...
+npx convex env set APNS_PRIVATE_KEY '-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----'
+npx convex env set APNS_BUNDLE_ID authcode.ZiaChat
+npx convex env set APNS_PRODUCTION true
+```
+
+The required keys are:
+
+```sh
   APNS_TEAM_ID=... \
   APNS_KEY_ID=... \
   APNS_PRIVATE_KEY='-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----' \
   APNS_BUNDLE_ID=authcode.ZiaChat \
-  APNS_PRODUCTION=true \
-  ZIA_CHAT_PUSH_WEBHOOK_SECRET=...
+  APNS_PRODUCTION=true
 ```
 
-5. Add the trigger secrets in Supabase SQL Editor:
+5. Deploy Convex:
 
-```sql
-select vault.create_secret(
-  'https://supabase.authcode.biz/functions/v1/zia-chat-apns',
-  'zia_chat_push_webhook_url'
-);
-select vault.create_secret('SAME_RANDOM_SECRET', 'zia_chat_push_webhook_secret');
+```sh
+cd ../azank-react
+npx convex deploy
 ```
 
-6. Apply the migrations in `supabase/migrations`.
+The legacy Supabase Edge Function and SQL trigger are no longer part of the
+push path once chat messages are sent through Convex. The app registers APNs
+tokens through `push:registerToken`, and `messages:send` schedules
+`pushActions:sendForMessage`.

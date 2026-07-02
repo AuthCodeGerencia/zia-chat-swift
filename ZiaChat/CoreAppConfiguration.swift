@@ -3,15 +3,28 @@ import Foundation
 struct CoreAppConfiguration: Codable, Equatable {
     var supabaseURL: String
     var anonKey: String
+    var convexURL: String
     var accessToken: String
     var refreshToken: String
     var userId: String
     var empresaId: Int?
     var displayName: String
 
+    enum CodingKeys: String, CodingKey {
+        case supabaseURL
+        case anonKey
+        case convexURL
+        case accessToken
+        case refreshToken
+        case userId
+        case empresaId
+        case displayName
+    }
+
     init(
         supabaseURL: String = "",
         anonKey: String = "",
+        convexURL: String = "",
         accessToken: String = "",
         refreshToken: String = "",
         userId: String = "",
@@ -20,11 +33,24 @@ struct CoreAppConfiguration: Codable, Equatable {
     ) {
         self.supabaseURL = supabaseURL
         self.anonKey = anonKey
+        self.convexURL = convexURL
         self.accessToken = accessToken
         self.refreshToken = refreshToken
         self.userId = userId
         self.empresaId = empresaId
         self.displayName = displayName
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        supabaseURL = try container.decodeIfPresent(String.self, forKey: .supabaseURL) ?? ""
+        anonKey = try container.decodeIfPresent(String.self, forKey: .anonKey) ?? ""
+        convexURL = try container.decodeIfPresent(String.self, forKey: .convexURL) ?? ""
+        accessToken = try container.decodeIfPresent(String.self, forKey: .accessToken) ?? ""
+        refreshToken = try container.decodeIfPresent(String.self, forKey: .refreshToken) ?? ""
+        userId = try container.decodeIfPresent(String.self, forKey: .userId) ?? ""
+        empresaId = try container.decodeIfPresent(Int.self, forKey: .empresaId)
+        displayName = try container.decodeIfPresent(String.self, forKey: .displayName) ?? ""
     }
 
     var isUsable: Bool {
@@ -81,6 +107,9 @@ struct CoreAppConfiguration: Codable, Equatable {
 
 enum CoreConfigurationStore {
     private static let key = "zia-chat.core.configuration"
+    private static let legacyConvexURLs = [
+        "https://calculating-goshawk-157.convex.cloud",
+    ]
 
     /// App Group compartido entre la app y la Share Extension. Debe estar
     /// habilitado en ambos targets (Signing & Capabilities) y en el portal
@@ -106,7 +135,8 @@ enum CoreConfigurationStore {
               var configuration = try? JSONDecoder().decode(CoreAppConfiguration.self, from: data) else {
             return CoreAppConfiguration(
                 supabaseURL: environmentDefaults.supabaseURL,
-                anonKey: environmentDefaults.supabaseAnonKey
+                anonKey: environmentDefaults.supabaseAnonKey,
+                convexURL: environmentDefaults.convexURL
             )
         }
 
@@ -116,6 +146,10 @@ enum CoreConfigurationStore {
         if configuration.anonKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             configuration.anonKey = environmentDefaults.supabaseAnonKey
         }
+        if configuration.convexURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+            legacyConvexURLs.contains(Self.normalizedURL(configuration.convexURL)) {
+            configuration.convexURL = environmentDefaults.convexURL
+        }
         return configuration
     }
 
@@ -123,5 +157,9 @@ enum CoreConfigurationStore {
         guard let data = try? JSONEncoder().encode(configuration) else { return }
         sharedDefaults?.set(data, forKey: key)
         UserDefaults.standard.set(data, forKey: key)
+    }
+
+    private static func normalizedURL(_ value: String) -> String {
+        value.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t/"))
     }
 }

@@ -721,8 +721,7 @@ struct CoreSticker: Identifiable, Codable, Hashable {
     }
 }
 
-/// Marca de lectura de un usuario en una conversación (recibos de lectura,
-/// tabla `core_message_reads`).
+/// Marca de lectura de un usuario en una conversación (recibos de lectura).
 struct CoreConversationRead: Codable, Hashable {
     var userId: String
     var lastReadAt: Date

@@ -3,7 +3,7 @@ import SwiftUI
 import UIKit
 
 /// UI de la Share Extension: muestra lo compartido, deja elegir el canal de
-/// Zia Chat y lo envía reutilizando SupabaseCoreClient (misma lógica que la app).
+/// Zia Chat y lo envía reutilizando ConvexCoreClient (misma lógica que la app).
 struct ShareComposerView: View {
     let extensionItems: [NSExtensionItem]
     var onFinish: () -> Void
@@ -251,14 +251,8 @@ struct ShareComposerView: View {
         configuration = config
 
         do {
-            let client = try SupabaseCoreClient(configuration: config)
-            // El RPC rápido (core_list_zia_channels) no trae metadata, así que
-            // se perderían los iconos de canal. Usa el listado enriquecido y
-            // cae al rápido solo si este falla.
-            var loaded = (try? await client.listChannels()) ?? []
-            if loaded.isEmpty {
-                loaded = try await client.listChannelsFast()
-            }
+            let client = try ConvexCoreClient(configuration: config)
+            let loaded = try await client.listChannels()
             channels = loaded
                 .filter { !$0.isArchived && !$0.isVoice && $0.conversationId != nil }
                 .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
@@ -279,7 +273,7 @@ struct ShareComposerView: View {
         phase = .sending
         errorText = nil
         do {
-            let client = try SupabaseCoreClient(configuration: configuration)
+            let client = try ConvexCoreClient(configuration: configuration)
             _ = try await client.sendMessage(
                 empresaId: channel.empresaId,
                 conversationId: conversationId,
@@ -303,18 +297,13 @@ struct ShareComposerView: View {
         phase = .sending
         errorText = nil
         do {
-            let client = try SupabaseCoreClient(configuration: configuration)
+            let client = try ConvexCoreClient(configuration: configuration)
             for (index, attachment) in imageAttachments.enumerated() {
                 let format = StickerImageFormat.detect(attachment.data)
                 let base = (attachment.fileName as NSString).deletingPathExtension
                 let name = base.isEmpty ? "Sticker \(index + 1)" : base
                 let fileName = "sticker-\(Int(Date().timeIntervalSince1970 * 1000))-\(index).\(format.fileExtension)"
-                _ = try await client.uploadSticker(
-                    name: name,
-                    data: attachment.data,
-                    fileName: fileName,
-                    mimeType: format.mimeType
-                )
+                _ = try await client.uploadSticker(name: name, data: attachment.data, fileName: fileName, mimeType: format.mimeType)
             }
             phase = .sent
             try? await Task.sleep(for: .milliseconds(900))

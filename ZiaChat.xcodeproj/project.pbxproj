@@ -57,7 +57,7 @@
 				CoreAuthService.swift,
 				CoreEnvironment.swift,
 				CoreModels.swift,
-				SupabaseCoreClient.swift,
+				ConvexCoreClient.swift,
 				ZenitTheme.swift,
 			);
 			target = F4E5A0022FD9AA0000000002 /* ZiaShareExtension */;

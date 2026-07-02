@@ -2,7 +2,7 @@ import Foundation
 import Combine
 
 // CoreThreadSummary vive en CoreModels.swift para que la Share Extension
-// pueda compilar SupabaseCoreClient sin este archivo.
+// pueda compilar ConvexCoreClient sin este archivo.
 
 /// Tracks, per thread, when the current user last viewed its replies.
 /// Persisted locally so unread indicators survive app restarts.

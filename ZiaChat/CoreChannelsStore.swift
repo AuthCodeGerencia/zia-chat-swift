@@ -37,8 +37,8 @@ final class CoreChannelsStore: ObservableObject {
     @Published var isSearchingChannels = false
     @Published var lastError: String?
 
-    private var realtimeService: CoreRealtimeService?
-    private var companyRealtimeService: CoreRealtimeService?
+    private var realtimePollingTask: Task<Void, Never>?
+    private var companyPollingTask: Task<Void, Never>?
     private var channelSearchTask: Task<Void, Never>?
     private var realtimeConversationId: String?
     private var realtimeReconnectTask: Task<Void, Never>?
@@ -120,46 +120,25 @@ final class CoreChannelsStore: ObservableObject {
         }
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             applyDirectMessages(try await fetchDirectMessages(using: client))
         } catch {
             lastError = error.localizedDescription
         }
     }
 
-    /// Encuentra o crea el DM con otra persona (POST /api/core/dms, igual que
-    /// la web) y devuelve el canal fantasma listo para abrir.
+    /// Encuentra o crea el DM con otra persona en Convex y devuelve el canal
+    /// fantasma listo para abrir.
     func startDirectMessage(with user: CoreUserLite) async -> CoreChannel? {
         guard configuration.isUsable, user.id != configuration.userId else { return nil }
         lastError = nil
         do {
-            let payload = try await coreAPIRequest(
-                path: "/api/core/dms",
-                method: "POST",
-                body: ["peerUserId": user.id]
-            )
-            guard payload["ok"] as? Bool == true,
-                  let dmPayload = payload["dm"] as? [String: Any],
-                  let conversationId = dmPayload["id"] as? String else {
-                lastError = (payload["error"] as? String) ?? "No se pudo iniciar el DM."
-                return nil
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
+            var dm = try await client.startDirectMessage(peerUserId: user.id)
+            if dm.peer.id == user.id, dm.peer.fullName == nil {
+                dm.peer = user
             }
-            let empresaId = (dmPayload["empresa_id"] as? Int) ?? configuration.empresaId ?? 0
-            var peer = user
-            if let peerPayload = dmPayload["peer"] as? [String: Any] {
-                peer = CoreUserLite(
-                    id: (peerPayload["id"] as? String) ?? user.id,
-                    fullName: (peerPayload["full_name"] as? String) ?? user.fullName,
-                    avatarURLString: (peerPayload["avatar_url"] as? String) ?? user.avatarURLString,
-                    roleId: peerPayload["rol_id"] as? Int
-                )
-            }
-            let dm = CoreDirectMessage(
-                id: conversationId,
-                empresaId: empresaId,
-                dmKey: dmPayload["dm_key"] as? String,
-                peer: peer
-            )
             if !directMessages.contains(where: { $0.id == dm.id }) {
                 directMessages.insert(dm, at: 0)
                 saveChatListCache()
@@ -301,13 +280,12 @@ final class CoreChannelsStore: ObservableObject {
         UserDefaults.standard.set(Array(mutedChannelIds), forKey: Self.mutedChannelsDefaultsKey)
     }
 
-    /// Marca todo el canal como leído sin abrirlo (upsert en core_message_reads,
-    /// igual que la web).
+    /// Marca todo el canal como leído sin abrirlo en Convex.
     func markChannelAsRead(_ channel: CoreChannel) async {
         guard configuration.isUsable, let conversationId = channel.conversationId else { return }
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             let lastMessageId = channelPreviews[conversationId]?.id ?? messages[conversationId]?.last?.id
             try await client.markRead(conversationId: conversationId, lastReadMessageId: lastMessageId)
             clearUnread(for: channel.id)
@@ -368,7 +346,7 @@ final class CoreChannelsStore: ObservableObject {
 
             do {
                 let activeConfiguration = try await ensureFreshSession()
-                let client = try SupabaseCoreClient(configuration: activeConfiguration)
+                let client = try ConvexCoreClient(configuration: activeConfiguration)
                 let fastChannels: [CoreChannel]
                 do {
                     fastChannels = try await client.listChannelsFast()
@@ -403,10 +381,8 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     private func applyChannels(_ loadedChannels: [CoreChannel]) {
-        // The fast list RPC (core_list_zia_channels) does not return channel
-        // metadata, so the icon (metadata.iconImage) would be lost on the quick
-        // render until the enriched fetch arrives. Carry the previously known
-        // icon forward so it does not flash or disappear.
+        // Carry the previously known icon forward so it does not flash or
+        // disappear during a refresh.
         let previousChannels = Dictionary(
             uniqueKeysWithValues: channels.map { ($0.id, $0) }
         )
@@ -438,7 +414,7 @@ final class CoreChannelsStore: ObservableObject {
         CoreChannelCache.save(mergedChannels, userId: configuration.userId)
     }
 
-    private func loadChannelPreviews(using client: SupabaseCoreClient) async {
+    private func loadChannelPreviews(using client: ConvexCoreClient) async {
         let conversationIds = channels.compactMap(\.conversationId)
         guard !conversationIds.isEmpty else {
             channelPreviews = [:]
@@ -477,18 +453,8 @@ final class CoreChannelsStore: ObservableObject {
         saveChatListCache()
     }
 
-    private func fetchDirectMessages(using client: SupabaseCoreClient) async throws -> [CoreDirectMessage] {
-        do {
-            return try await client.listDirectMessages()
-        } catch {
-            let response = try await coreAPIRequest(path: "/api/core/dms", method: "GET")
-            guard let rawDirectMessages = response["dms"] as? [[String: Any]] else {
-                throw SupabaseCoreError.emptyResponse
-            }
-            return rawDirectMessages.compactMap(decodeDirectMessageAPI).sorted {
-                ($0.lastMessageAt ?? .distantPast) > ($1.lastMessageAt ?? .distantPast)
-            }
-        }
+    private func fetchDirectMessages(using client: ConvexCoreClient) async throws -> [CoreDirectMessage] {
+        try await client.listDirectMessages()
     }
 
     private func decodeDirectMessageAPI(_ raw: [String: Any]) -> CoreDirectMessage? {
@@ -542,7 +508,7 @@ final class CoreChannelsStore: ObservableObject {
         }
 
         let activeConfiguration = try await ensureFreshSession()
-        let client = try SupabaseCoreClient(configuration: activeConfiguration)
+        let client = try ConvexCoreClient(configuration: activeConfiguration)
         let loadedChannels: [CoreChannel]
         do {
             loadedChannels = try await client.listChannelsFast()
@@ -578,7 +544,7 @@ final class CoreChannelsStore: ObservableObject {
         startRealtime(for: channel)
         if !force, messages[conversationId]?.isEmpty == false {
             Task {
-                if let client = try? SupabaseCoreClient(configuration: configuration) {
+                if let client = try? ConvexCoreClient(configuration: configuration) {
                     try? await client.markRead(conversationId: conversationId, lastReadMessageId: messages[conversationId]?.last?.id)
                 }
             }
@@ -589,7 +555,7 @@ final class CoreChannelsStore: ObservableObject {
         isLoadingMessages[conversationId] = true
         lastError = nil
         do {
-            let client = try SupabaseCoreClient(configuration: configuration)
+            let client = try ConvexCoreClient(configuration: configuration)
             let pageLimit = force ? max(21, messages[conversationId]?.count ?? 0) : 21
             let loaded = try await client.listMessagePage(
                 conversationId: conversationId,
@@ -619,7 +585,7 @@ final class CoreChannelsStore: ObservableObject {
         guard let conversationId = channel.conversationId, configuration.isUsable else { return }
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             let reads = try await client.listConversationReads(conversationId: conversationId)
             conversationReads[conversationId] = Dictionary(
                 reads.map { ($0.userId, $0.lastReadAt) },
@@ -669,7 +635,7 @@ final class CoreChannelsStore: ObservableObject {
         if !force, channelMembers[channel.id] != nil { return }
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             channelMembers[channel.id] = try await client.listChannelMembers(channelId: channel.id)
         } catch {
             channelMembers[channel.id] = []
@@ -691,7 +657,7 @@ final class CoreChannelsStore: ObservableObject {
 
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             let page = try await client.listMessagePage(
                 conversationId: conversationId,
                 before: oldestMessage.createdAt
@@ -712,7 +678,7 @@ final class CoreChannelsStore: ObservableObject {
         guard configuration.isUsable, let conversationId = channel.conversationId else { return }
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             messagePins[conversationId] = try await client.listMessagePins(conversationId: conversationId)
         } catch {
             lastError = error.localizedDescription
@@ -728,7 +694,7 @@ final class CoreChannelsStore: ObservableObject {
         lastError = nil
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             if isPinned(message) {
                 try await client.unpinMessage(message)
                 messagePins[message.conversationId]?.removeAll { $0.messageId == message.id }
@@ -809,22 +775,17 @@ final class CoreChannelsStore: ObservableObject {
         lastError = nil
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
-            var message: CoreMessage
-            if content.hasPrefix("/"), parentMessageId == nil, attachments.isEmpty {
-                message = try await sendSlashCommand(content, conversationId: conversationId)
-            } else {
-                message = try await client.sendMessage(
-                    empresaId: channel.empresaId,
-                    conversationId: conversationId,
-                    // Los DMs no tienen canal: el mensaje va solo a la conversación.
-                    channelId: channel.isDirectMessage ? nil : channel.id,
-                    parentMessageId: parentMessageId,
-                    content: content,
-                    attachments: attachments,
-                    replyTo: replyQuote
-                )
-            }
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
+            var message = try await client.sendMessage(
+                empresaId: channel.empresaId,
+                conversationId: conversationId,
+                // Los DMs no tienen canal: el mensaje va solo a la conversación.
+                channelId: channel.isDirectMessage ? nil : channel.id,
+                parentMessageId: parentMessageId,
+                content: content,
+                attachments: attachments,
+                replyTo: replyQuote
+            )
             message.author = optimisticMessage.author
             if insertedOptimisticMessage {
                 removeMessage(id: optimisticMessage.id, conversationId: conversationId)
@@ -837,8 +798,6 @@ final class CoreChannelsStore: ObservableObject {
                 upsertMessage(message)
                 updateChannelPreview(with: message)
             }
-            await realtimeService?.broadcast(message: message)
-            await companyRealtimeService?.broadcast(message: message)
             Task {
                 try? await client.markRead(conversationId: conversationId, lastReadMessageId: message.id)
             }
@@ -859,7 +818,7 @@ final class CoreChannelsStore: ObservableObject {
         defer { isLoadingThread[message.id] = false }
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             threadReplies[message.id] = try await client.listThreadReplies(
                 conversationId: message.conversationId,
                 parentMessageId: message.id
@@ -867,75 +826,6 @@ final class CoreChannelsStore: ObservableObject {
         } catch {
             lastError = error.localizedDescription
         }
-    }
-
-    private func sendSlashCommand(_ content: String, conversationId: String) async throws -> CoreMessage {
-        let normalizedContent = normalizePendingCommand(content)
-        let response = try await coreAPIRequest(
-            path: "/api/core/messages/send",
-            method: "POST",
-            body: [
-                "conversationId": conversationId,
-                "content": normalizedContent,
-                "metadata": [:],
-                "attachments": []
-            ]
-        )
-        guard let rawMessage = response["message"] as? [String: Any] else {
-            throw SupabaseCoreError.emptyResponse
-        }
-        let data = try JSONSerialization.data(withJSONObject: rawMessage)
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .custom { decoder in
-            let container = try decoder.singleValueContainer()
-            let value = try container.decode(String.self)
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            if let date = formatter.date(from: value) {
-                return date
-            }
-            formatter.formatOptions = [.withInternetDateTime]
-            if let date = formatter.date(from: value) {
-                return date
-            }
-            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Fecha inválida")
-        }
-        return try decoder.decode(CoreMessage.self, from: data)
-    }
-
-    private func normalizePendingCommand(_ content: String) -> String {
-        let prefix = "/pendiente "
-        guard content.lowercased().hasPrefix(prefix),
-              let mentionStart = content.index(
-                content.startIndex,
-                offsetBy: prefix.count,
-                limitedBy: content.endIndex
-              ),
-              mentionStart < content.endIndex,
-              content[mentionStart] == "@" else {
-            return content
-        }
-
-        let arguments = String(content[mentionStart...])
-        let candidates = mentionableUsers.sorted {
-            $0.displayName.count > $1.displayName.count
-        }
-        for user in candidates {
-            let mention = "@\(user.displayName)"
-            guard arguments.count > mention.count,
-                  arguments.prefix(mention.count).caseInsensitiveCompare(mention) == .orderedSame else {
-                continue
-            }
-
-            let taskStart = arguments.index(arguments.startIndex, offsetBy: mention.count)
-            guard arguments[taskStart].isWhitespace else { continue }
-            let task = arguments[taskStart...]
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !task.isEmpty else { return content }
-            return "/pendiente \(user.displayName) tiene pendiente \(task)"
-        }
-
-        return content
     }
 
     /// Loads the list of threads (root messages with replies) for a channel.
@@ -948,7 +838,7 @@ final class CoreChannelsStore: ObservableObject {
         defer { isLoadingChannelThreads[conversationId] = false }
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             channelThreads[conversationId] = try await client.listChannelThreads(conversationId: conversationId)
         } catch {
             lastError = error.localizedDescription
@@ -994,7 +884,7 @@ final class CoreChannelsStore: ObservableObject {
         defer { isSending = false }
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             var reply = try await client.sendMessage(
                 empresaId: channel.empresaId,
                 conversationId: conversationId,
@@ -1010,8 +900,6 @@ final class CoreChannelsStore: ObservableObject {
             if upsertThreadReply(reply, parentMessageId: root.id) {
                 incrementReplyCount(for: root.id, conversationId: conversationId)
             }
-            await realtimeService?.broadcast(message: reply)
-            await companyRealtimeService?.broadcast(message: reply)
         } catch {
             lastError = error.localizedDescription
         }
@@ -1024,7 +912,7 @@ final class CoreChannelsStore: ObservableObject {
         defer { isSending = false }
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             var forwarded = try await client.forwardMessage(message, to: channel)
             forwarded.author = CoreUserLite(
                 id: configuration.userId,
@@ -1053,7 +941,7 @@ final class CoreChannelsStore: ObservableObject {
         lastError = nil
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             let trimmedIcon = iconImage?.trimmingCharacters(in: .whitespacesAndNewlines)
             let metadata = CoreChannelMetadata(
                 channelType: channelType,
@@ -1113,7 +1001,7 @@ final class CoreChannelsStore: ObservableObject {
         defer { isCreatingChannel = false }
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
 
             // Partimos de la metadata fresca del servidor (la lista rápida no la
             // trae) para no pisar claves como el token de invitación.
@@ -1149,7 +1037,7 @@ final class CoreChannelsStore: ObservableObject {
             if let index = channels.firstIndex(where: { $0.id == channel.id }) {
                 var updated = channels[index]
                 updated.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
-                updated.slug = SupabaseCoreClient.slugifyCoreName(name)
+                updated.slug = ConvexCoreClient.slugifyCoreName(name)
                 updated.description = description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     ? nil
                     : description.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1173,7 +1061,7 @@ final class CoreChannelsStore: ObservableObject {
         lastError = nil
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             try await client.archiveChannel(channel)
             channels.removeAll { $0.id == channel.id }
             favoriteChannelIds.remove(channel.id)
@@ -1191,7 +1079,7 @@ final class CoreChannelsStore: ObservableObject {
         guard configuration.isUsable else { return nil }
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             return try await client.fetchChannelMetadata(channelId: channel.id)
         } catch {
             return nil
@@ -1204,7 +1092,7 @@ final class CoreChannelsStore: ObservableObject {
         guard configuration.isUsable, !trimmed.isEmpty else { return [] }
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             return try await client.searchChannelMessages(keyword: trimmed, channelIds: [channel.id])
         } catch {
             return []
@@ -1215,79 +1103,42 @@ final class CoreChannelsStore: ObservableObject {
         guard configuration.isUsable else { return [] }
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             return try await client.listChannelMemberRoles(channelId: channelId)
         } catch {
             return []
         }
     }
 
-    /// Llama un endpoint del backend Next.js (mismo que usa la web) con el
-    /// token de la sesión. Devuelve el JSON de respuesta.
-    @discardableResult
-    func coreAPIRequest(path: String, method: String, body: [String: Any]? = nil) async throws -> [String: Any] {
-        let activeConfiguration = try await ensureFreshSession()
-        let environment = CoreEnvironment.load()
-        guard let baseURL = URL(string: environment.appURL),
-              let url = URL(string: path, relativeTo: baseURL) else {
-            throw SupabaseCoreError.invalidURL
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = method
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(activeConfiguration.accessToken)", forHTTPHeaderField: "Authorization")
-        if let body {
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        }
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let payload = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            let message = (payload["error"] as? String)
-                ?? "Error del servidor (\((response as? HTTPURLResponse)?.statusCode ?? 0))"
-            throw SupabaseCoreError.attachmentUpload(message)
-        }
-        return payload
-    }
-
-    /// Crea y devuelve el link de invitación del canal usando el mismo endpoint
-    /// de la web (/api/core/channels/invite).
+    /// Crea y devuelve el link de invitación del canal usando Convex.
     func createChannelInviteLink(_ channel: CoreChannel) async -> String? {
         guard configuration.isUsable else { return nil }
         do {
-            let payload = try await coreAPIRequest(
-                path: "/api/core/channels/invite",
-                method: "POST",
-                body: ["action": "create", "channelId": channel.id]
-            )
-            guard payload["ok"] as? Bool == true, let inviteUrl = payload["inviteUrl"] as? String else {
-                lastError = "No se pudo crear el link de invitación."
-                return nil
-            }
-            return inviteUrl
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
+            let token = try await client.createChannelInviteToken(channelId: channel.id)
+            let baseURL = CoreEnvironment.load().appURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            return "\(baseURL)/dashboard/core?invite=\(token)"
         } catch {
             lastError = error.localizedDescription
             return nil
         }
     }
 
-    /// Edita un mensaje propio (PATCH /api/core/messages/:id, igual que la web).
+    /// Edita un mensaje propio en Convex.
     @discardableResult
     func editMessage(_ message: CoreMessage, newContent: String) async -> Bool {
         let content = newContent.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !content.isEmpty, configuration.isUsable else { return false }
         lastError = nil
         do {
-            try await coreAPIRequest(
-                path: "/api/core/messages/\(message.id)",
-                method: "PATCH",
-                body: ["content": content]
-            )
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
+            _ = try await client.updateMessage(messageId: message.id, content: content)
             applyLocalMessageEdit(messageId: message.id, conversationId: message.conversationId, content: content)
             var updatedMessage = message
             updatedMessage.content = content
             updatedMessage.editedAt = Date()
-            await realtimeService?.broadcast(message: updatedMessage)
-            await companyRealtimeService?.broadcast(message: updatedMessage)
             return true
         } catch {
             lastError = error.localizedDescription
@@ -1295,13 +1146,15 @@ final class CoreChannelsStore: ObservableObject {
         }
     }
 
-    /// Elimina (soft delete) un mensaje propio (DELETE /api/core/messages/:id).
+    /// Elimina (soft delete) un mensaje propio en Convex.
     @discardableResult
     func deleteMessage(_ message: CoreMessage) async -> Bool {
         guard configuration.isUsable else { return false }
         lastError = nil
         do {
-            try await coreAPIRequest(path: "/api/core/messages/\(message.id)", method: "DELETE")
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
+            _ = try await client.hideMessage(message.id)
             removeMessage(id: message.id, conversationId: message.conversationId)
             messagePins[message.conversationId]?.removeAll { $0.messageId == message.id }
             for (rootId, replies) in threadReplies where replies.contains(where: { $0.id == message.id }) {
@@ -1309,8 +1162,6 @@ final class CoreChannelsStore: ObservableObject {
             }
             var deletedMessage = message
             deletedMessage.deletedAt = Date()
-            await realtimeService?.broadcast(message: deletedMessage)
-            await companyRealtimeService?.broadcast(message: deletedMessage)
             return true
         } catch {
             lastError = error.localizedDescription
@@ -1342,7 +1193,7 @@ final class CoreChannelsStore: ObservableObject {
         guard configuration.isUsable, mentionableUsers.isEmpty else { return }
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             mentionableUsers = try await client.listMentionableUsers()
         } catch {
             // Non-fatal: the member picker simply stays empty.
@@ -1353,7 +1204,7 @@ final class CoreChannelsStore: ObservableObject {
         guard configuration.isUsable else { return }
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             internalCompanies = try await client.listInternalCompanies()
         } catch {
             internalCompanies = []
@@ -1365,7 +1216,7 @@ final class CoreChannelsStore: ObservableObject {
         lastError = nil
         do {
             let activeConfiguration = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: activeConfiguration)
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
             try await client.react(
                 empresaId: message.empresaId,
                 conversationId: message.conversationId,
@@ -1404,7 +1255,7 @@ final class CoreChannelsStore: ObservableObject {
             let channelIds = searchableChannels.map(\.id)
             let activeConfiguration = try? await ensureFreshSession()
             if let activeConfiguration,
-               let client = try? SupabaseCoreClient(configuration: activeConfiguration),
+               let client = try? ConvexCoreClient(configuration: activeConfiguration),
                let matches = try? await client.searchChannelMessages(keyword: keyword, channelIds: channelIds) {
                 messageMatches = matches
             }
@@ -1510,56 +1361,14 @@ final class CoreChannelsStore: ObservableObject {
 
     private func startRealtime(for channel: CoreChannel, force: Bool = false) {
         guard let conversationId = channel.conversationId else { return }
-        guard force || realtimeConversationId != conversationId || realtimeService == nil else { return }
+        guard force || realtimeConversationId != conversationId || realtimePollingTask == nil else { return }
 
         stopRealtime()
         realtimeConversationId = conversationId
-
-        Task {
-            do {
-                let service = try CoreRealtimeService(configuration: configuration)
-                realtimeService = service
-                try await service.subscribe(
-                    conversationId: conversationId,
-                    onInsert: { [weak self] message in
-                        await self?.handleRealtimeInsert(message)
-                    },
-                    onUpdate: { [weak self] message in
-                        await self?.handleRealtimeUpdate(message)
-                    },
-                    onDelete: { [weak self] message in
-                        await self?.handleRealtimeDelete(message)
-                    },
-                    onReactionChange: { [weak self] reaction, deletedReactionId in
-                        await self?.handleRealtimeReaction(reaction, deletedReactionId: deletedReactionId)
-                    },
-                    onAttachmentChange: { [weak self] attachment, deletedAttachmentId in
-                        await self?.handleRealtimeAttachment(
-                            attachment,
-                            deletedAttachmentId: deletedAttachmentId
-                        )
-                    },
-                    onPinChange: { [weak self] pin, deletedPinId in
-                        await self?.handleRealtimePin(pin, deletedPinId: deletedPinId)
-                    },
-                    onMessageSignal: { [weak self] in
-                        await self?.scheduleRealtimeMessageRefresh(conversationId: conversationId)
-                    },
-                    onError: { [weak self] message in
-                        await self?.setRealtimeError(message)
-                    },
-                    onDisconnect: { [weak self] in
-                        await self?.scheduleRealtimeReconnect(for: channel)
-                    }
-                )
-            } catch {
-                await MainActor.run {
-                    if self.realtimeConversationId == conversationId {
-                        self.lastError = error.localizedDescription
-                        self.realtimeService = nil
-                    }
-                }
-                self.scheduleRealtimeReconnect(for: channel)
+        realtimePollingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.resyncRealtimeMessages(conversationId: conversationId)
+                try? await Task.sleep(for: .seconds(2))
             }
         }
     }
@@ -1570,53 +1379,34 @@ final class CoreChannelsStore: ObservableObject {
         realtimeMessageRefreshTask?.cancel()
         realtimeMessageRefreshTask = nil
         realtimeConversationId = nil
-
-        guard let realtimeService else { return }
-        self.realtimeService = nil
-        Task {
-            await realtimeService.stop()
-        }
+        realtimePollingTask?.cancel()
+        realtimePollingTask = nil
     }
 
-    func reconnectRealtimeIfNeeded() {
+    func reconnectRealtimeIfNeeded() async {
         startCompanyRealtime(force: true)
         guard let conversationId = realtimeConversationId,
               let channel = channels.first(where: { $0.conversationId == conversationId })
                 ?? directMessages.first(where: { $0.id == conversationId })?.chatTarget else {
+            await refreshChatListActivity()
             return
         }
         startRealtime(for: channel, force: true)
+        async let chatListRefresh: Void = refreshChatListActivity()
+        async let messageRefresh: Void = resyncRealtimeMessages(conversationId: conversationId)
+        _ = await (chatListRefresh, messageRefresh)
     }
 
     private func startCompanyRealtime(force: Bool = false) {
         guard configuration.isUsable, let empresaId = configuration.empresaId else { return }
-        guard force || companyRealtimeService == nil else { return }
+        guard force || companyPollingTask == nil else { return }
 
         stopCompanyRealtime()
-        Task {
-            do {
-                let service = try CoreRealtimeService(configuration: configuration)
-                companyRealtimeService = service
-                try await service.subscribeToCompany(
-                    empresaId: empresaId,
-                    onMessage: { [weak self] message in
-                        await self?.handleCompanyRealtimeMessage(message)
-                    },
-                    onMessageSignal: { [weak self] in
-                        await self?.scheduleChatListRefresh()
-                    },
-                    onError: { [weak self] message in
-                        await self?.setRealtimeError(message)
-                    },
-                    onDisconnect: { [weak self] in
-                        await self?.scheduleCompanyRealtimeReconnect()
-                    }
-                )
-            } catch {
-                if self.configuration.empresaId == empresaId {
-                    self.companyRealtimeService = nil
-                }
-                self.scheduleCompanyRealtimeReconnect()
+        companyPollingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard self?.configuration.empresaId == empresaId else { return }
+                await self?.refreshChatListActivity()
+                try? await Task.sleep(for: .seconds(3))
             }
         }
     }
@@ -1626,11 +1416,8 @@ final class CoreChannelsStore: ObservableObject {
         companyRealtimeReconnectTask = nil
         chatListRefreshTask?.cancel()
         chatListRefreshTask = nil
-        guard let companyRealtimeService else { return }
-        self.companyRealtimeService = nil
-        Task {
-            await companyRealtimeService.stop()
-        }
+        companyPollingTask?.cancel()
+        companyPollingTask = nil
     }
 
     private func scheduleCompanyRealtimeReconnect() {
@@ -1677,7 +1464,7 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     private func refreshChatListActivity() async {
-        guard let client = try? SupabaseCoreClient(configuration: configuration) else { return }
+        guard let client = try? ConvexCoreClient(configuration: configuration) else { return }
         async let loadedDirectMessages = try? fetchDirectMessages(using: client)
         async let loadedPreviews = try? client.listChannelPreviews(
             conversationIds: channels.compactMap(\.conversationId)
@@ -1717,7 +1504,7 @@ final class CoreChannelsStore: ObservableObject {
 
     private func resyncRealtimeMessages(conversationId: String) async {
         guard realtimeConversationId == conversationId,
-              let client = try? SupabaseCoreClient(configuration: configuration) else {
+              let client = try? ConvexCoreClient(configuration: configuration) else {
             return
         }
 
@@ -1750,7 +1537,7 @@ final class CoreChannelsStore: ObservableObject {
 
         if let parentMessageId = message.parentMessageId {
             if threadReplies[parentMessageId] != nil,
-               let client = try? SupabaseCoreClient(configuration: configuration) {
+               let client = try? ConvexCoreClient(configuration: configuration) {
                 let enriched = await client.enrichRealtimeMessage(message)
                 if upsertThreadReply(enriched, parentMessageId: parentMessageId) {
                     incrementReplyCount(for: parentMessageId, conversationId: message.conversationId)
@@ -1775,7 +1562,7 @@ final class CoreChannelsStore: ObservableObject {
         }
         clearUnreadForActiveConversation(message.conversationId)
 
-        if let client = try? SupabaseCoreClient(configuration: configuration) {
+        if let client = try? ConvexCoreClient(configuration: configuration) {
             try? await client.markRead(conversationId: message.conversationId, lastReadMessageId: message.id)
             let enriched = await client.enrichRealtimeMessage(message)
             if !isAttachmentOnly || enriched.attachments?.isEmpty == false {
@@ -1803,7 +1590,7 @@ final class CoreChannelsStore: ObservableObject {
 
         upsertMessage(message)
         updateChannelPreview(with: message)
-        if let client = try? SupabaseCoreClient(configuration: configuration) {
+        if let client = try? ConvexCoreClient(configuration: configuration) {
             let enriched = await client.enrichRealtimeMessage(message)
             upsertMessage(enriched)
             updateChannelPreview(with: enriched)
@@ -1874,7 +1661,7 @@ final class CoreChannelsStore: ObservableObject {
         // Storage rows may need a short-lived signed URL. Hydrate only this
         // message after the realtime event, never the full conversation.
         if attachment.resolvedURL == nil,
-           let client = try? SupabaseCoreClient(configuration: configuration),
+           let client = try? ConvexCoreClient(configuration: configuration),
            let message = messages[conversationId]?[messageIndex] {
             let enriched = await client.enrichRealtimeMessage(message)
             upsertMessage(enriched)
@@ -2068,29 +1855,33 @@ extension CoreChannelsStore {
         lastError = nil
         do {
             let config = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: config)
+            let client = try ConvexCoreClient(configuration: config)
+            let cardId = UUID().uuidString
+            let metadata = CoreMessageMetadata(
+                kind: "command_card",
+                cardId: cardId,
+                command: "poll",
+                status: "active",
+                payload: [
+                    "question": .string(trimmedQuestion),
+                    "options": .array(cleanOptions.map { .string($0) }),
+                    "votes": .object([:]),
+                    "totalVotes": .number(0),
+                ],
+                initiatedBy: configuration.userId
+            )
             var message = try await client.sendMessage(
                 empresaId: channel.empresaId,
                 conversationId: conversationId,
                 channelId: channel.id,
                 parentMessageId: nil,
-                content: announcementText
+                content: announcementText,
+                metadata: metadata
             )
             message.author = optimistic.author
-            _ = try await client.createPoll(
-                channelId: channel.id,
-                messageId: message.id,
-                question: trimmedQuestion,
-                options: cleanOptions
-            )
 
-            if let staged = polls[optimistic.id] {
-                polls[message.id] = CorePoll(
-                    id: staged.id,
-                    messageId: message.id,
-                    question: staged.question,
-                    options: staged.options
-                )
+            if let poll = corePoll(from: message) {
+                polls[message.id] = poll
             }
             polls[optimistic.id] = nil
             removeMessage(id: optimistic.id, conversationId: conversationId)
@@ -2110,18 +1901,10 @@ extension CoreChannelsStore {
 
     /// Loads the channel's polls and indexes them by their linked message id.
     func loadPolls(for channel: CoreChannel) async {
-        guard configuration.isUsable else { return }
-        do {
-            let config = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: config)
-            let loaded = try await client.listPolls(channelId: channel.id)
-            for poll in loaded {
-                if let messageId = poll.messageId {
-                    polls[messageId] = poll
-                }
-            }
-        } catch {
-            // Non-fatal: polls simply won't render.
+        guard let conversationId = channel.conversationId else { return }
+        for message in messages[conversationId] ?? [] {
+            guard let poll = corePoll(from: message), let messageId = poll.messageId else { continue }
+            polls[messageId] = poll
         }
     }
 
@@ -2144,14 +1927,92 @@ extension CoreChannelsStore {
             polls[messageId] = current
         }
 
-        guard configuration.isUsable, !poll.id.hasPrefix("local-") else { return }
+        guard configuration.isUsable,
+              !poll.id.hasPrefix("local-"),
+              let messageId = poll.messageId,
+              var message = message(withId: messageId),
+              var metadata = message.metadata,
+              metadata.kind == "command_card",
+              metadata.command == "poll",
+              var payload = metadata.payload else { return }
         do {
             let config = try await ensureFreshSession()
-            let client = try SupabaseCoreClient(configuration: config)
-            try await client.votePoll(pollId: poll.id, optionId: optionId)
+            let client = try ConvexCoreClient(configuration: config)
+            let selectedIndex = poll.options.first(where: { $0.id == optionId })?.sortOrder ?? -1
+            guard selectedIndex >= 0 else { return }
+            var votes = payload["votes"]?.objectValue ?? [:]
+            for key in votes.keys {
+                let current = votes[key]?.arrayValue ?? []
+                votes[key] = .array(current.filter { $0.stringValue != configuration.userId })
+            }
+            var selectedVotes = votes[String(selectedIndex)]?.arrayValue ?? []
+            if !selectedVotes.contains(where: { $0.stringValue == configuration.userId }) {
+                selectedVotes.append(.string(configuration.userId))
+            }
+            votes[String(selectedIndex)] = .array(selectedVotes)
+            payload["votes"] = .object(votes)
+            payload["totalVotes"] = .number(Double(votes.values.reduce(0) { count, value in
+                count + (value.arrayValue?.count ?? 0)
+            }))
+            metadata.payload = payload
+            message.metadata = metadata
+            let patched = try await client.patchMessageMetadata(
+                messageId: message.id,
+                metadata: metadata,
+                content: message.content,
+                action: "poll_vote"
+            )
+            upsertMessage(patched)
+            if let updatedPoll = corePoll(from: patched) {
+                polls[message.id] = updatedPoll
+            }
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    private func message(withId messageId: String) -> CoreMessage? {
+        for conversationMessages in messages.values {
+            if let message = conversationMessages.first(where: { $0.id == messageId }) {
+                return message
+            }
+        }
+        for replies in threadReplies.values {
+            if let message = replies.first(where: { $0.id == messageId }) {
+                return message
+            }
+        }
+        return nil
+    }
+
+    private func corePoll(from message: CoreMessage) -> CorePoll? {
+        guard let metadata = message.metadata,
+              metadata.kind == "command_card",
+              metadata.command == "poll",
+              metadata.status != "error",
+              let payload = metadata.payload else {
+            return nil
+        }
+        let question = payload["question"]?.stringValue ?? "Encuesta"
+        let optionLabels = payload["options"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        guard !optionLabels.isEmpty else { return nil }
+        let votes = payload["votes"]?.objectValue ?? [:]
+        let pollId = metadata.cardId ?? message.id
+        return CorePoll(
+            id: pollId,
+            messageId: message.id,
+            question: question,
+            options: optionLabels.enumerated().map { index, label in
+                let votedBy = votes[String(index)]?.arrayValue?.compactMap(\.stringValue) ?? []
+                return CorePollOption(
+                    id: "\(message.id):\(index)",
+                    label: label,
+                    sortOrder: index,
+                    votesCount: votedBy.count,
+                    votedByMe: votedBy.contains(configuration.userId)
+                )
+            }
+        )
     }
 }
 
@@ -2255,7 +2116,7 @@ enum CorePreviewData {
                 channelId: "preview-general",
                 parentMessageId: nil,
                 userId: "preview-user",
-                content: "Once Supabase settings are saved, these preview messages are replaced by real Core data.",
+                content: "Once backend settings are saved, these preview messages are replaced by real Core data.",
                 createdAt: Date().addingTimeInterval(-1200),
                 author: CoreUserLite(id: "preview-user", fullName: "You")
             )

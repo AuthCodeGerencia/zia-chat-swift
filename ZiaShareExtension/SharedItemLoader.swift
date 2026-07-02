@@ -10,7 +10,7 @@ struct SharedPayload {
 }
 
 /// Convierte los NSItemProvider del extension context en texto + adjuntos
-/// listos para enviarse con SupabaseCoreClient.
+/// listos para enviarse con ConvexCoreClient.
 enum SharedItemLoader {
     /// Límite por archivo para no exceder la memoria de la extensión (~120 MB).
     static let maxAttachmentBytes = 45 * 1024 * 1024
