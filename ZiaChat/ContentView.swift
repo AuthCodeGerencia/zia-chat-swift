@@ -102,10 +102,6 @@ struct ContentView: View {
                 schedulePendingPushNavigation()
             }
         }
-        .task(id: store.configuration.userId) {
-            guard store.configuration.isUsable else { return }
-            await store.maintainSession()
-        }
         .task {
             guard store.configuration.isUsable else {
                 await pushService.updateBadgeCount(0)
@@ -1439,6 +1435,10 @@ private struct ChatDetailView: View {
                 voicePanel
             }
 
+            if unreadThreadCount > 0 {
+                unreadThreadsBanner
+            }
+
             if channel.conversationId == nil {
                 missingConversationView
             } else {
@@ -1633,6 +1633,43 @@ private struct ChatDetailView: View {
             description: Text("This channel does not have a Core conversation attached.")
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var unreadThreadsBanner: some View {
+        Button {
+            showThreadsOverview = true
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "bubble.left.and.bubble.right.fill")
+                    .foregroundStyle(.white)
+                    .frame(width: 30, height: 30)
+                    .background(ZenitBrand.accent)
+                    .clipShape(Circle())
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(unreadThreadCount == 1 ? "Hay respuestas nuevas en un thread" : "Hay respuestas nuevas en \(unreadThreadCount) threads")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    Text("Si no ves mensajes nuevos aquí, están dentro de hilos.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+                Text("Ver")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(ZenitBrand.accent)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(Color.white)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .overlay(alignment: .bottom) { Divider() }
     }
 
     private var messagesArea: some View {

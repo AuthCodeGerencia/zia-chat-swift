@@ -1,8 +1,11 @@
 import Foundation
 import Combine
+import OSLog
 
 @MainActor
 final class CoreChannelsStore: ObservableObject {
+    private static let realtimeLogger = Logger(subsystem: "authcode.ZiaChat", category: "ConvexRealtime")
+
     @Published var configuration: CoreAppConfiguration
     @Published var channels: [CoreChannel] = CorePreviewData.channels
     @Published var directMessages: [CoreDirectMessage] = []
@@ -37,14 +40,16 @@ final class CoreChannelsStore: ObservableObject {
     @Published var isSearchingChannels = false
     @Published var lastError: String?
 
-    private var realtimePollingTask: Task<Void, Never>?
-    private var companyPollingTask: Task<Void, Never>?
+    private var realtimeResyncTask: Task<Void, Never>?
+    private var companyResyncTask: Task<Void, Never>?
+    private var convexRealtimeClient: ConvexRealtimeClient?
+    private var convexRealtimeKey: String?
+    private var realtimeMessagesSubscription: AnyCancellable?
+    private var companyChannelsSubscription: AnyCancellable?
+    private var companyDirectMessagesSubscription: AnyCancellable?
+    private var convexWebSocketSubscription: AnyCancellable?
     private var channelSearchTask: Task<Void, Never>?
     private var realtimeConversationId: String?
-    private var realtimeReconnectTask: Task<Void, Never>?
-    private var realtimeMessageRefreshTask: Task<Void, Never>?
-    private var companyRealtimeReconnectTask: Task<Void, Never>?
-    private var chatListRefreshTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
     private var sessionRefreshTask: Task<CoreAppConfiguration, Error>?
     private let optimisticMessagePrefix = "local-pending-"
@@ -175,6 +180,9 @@ final class CoreChannelsStore: ObservableObject {
             let service = try CoreAuthService(configuration: loginConfiguration)
             let result = try await service.login(email: email, password: password)
             save(configuration: result.configuration)
+            if let client = try? ConvexCoreClient(configuration: result.configuration) {
+                try? await client.storeCurrentUser(profile: result.profile)
+            }
             await refresh()
         } catch {
             lastError = error.localizedDescription
@@ -189,6 +197,10 @@ final class CoreChannelsStore: ObservableObject {
         sessionRefreshTask = nil
         stopRealtime()
         stopCompanyRealtime()
+        convexWebSocketSubscription?.cancel()
+        convexWebSocketSubscription = nil
+        convexRealtimeClient = nil
+        convexRealtimeKey = nil
         var next = configuration
         next.clearSession()
         save(configuration: next)
@@ -204,7 +216,7 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     @discardableResult
-    func ensureFreshSession(force: Bool = false) async throws -> CoreAppConfiguration {
+    func ensureFreshSession(force: Bool = false, restartRealtime: Bool = true) async throws -> CoreAppConfiguration {
         guard configuration.isUsable else {
             throw CoreAuthError.missingRefreshToken
         }
@@ -231,27 +243,18 @@ final class CoreChannelsStore: ObservableObject {
 
             let activeChannel = realtimeConversationId == nil ? nil : selectedChannel
             save(configuration: refreshedConfiguration)
-            if let activeChannel {
-                stopRealtime()
-                startRealtime(for: activeChannel)
+            if restartRealtime {
+                if let activeChannel {
+                    stopRealtime()
+                    startRealtime(for: activeChannel)
+                }
+                stopCompanyRealtime()
+                startCompanyRealtime()
             }
-            stopCompanyRealtime()
-            startCompanyRealtime()
             return refreshedConfiguration
         } catch {
             sessionRefreshTask = nil
             throw error
-        }
-    }
-
-    func maintainSession() async {
-        while !Task.isCancelled, configuration.isUsable {
-            do {
-                _ = try await ensureFreshSession()
-            } catch {
-                lastError = error.localizedDescription
-            }
-            try? await Task.sleep(for: .seconds(120))
         }
     }
 
@@ -357,7 +360,6 @@ final class CoreChannelsStore: ObservableObject {
                 if let loadedDirectMessages = try? await fetchDirectMessages(using: client) {
                     applyDirectMessages(loadedDirectMessages)
                 }
-                await loadChannelPreviews(using: client)
                 if let users = try? await client.listMentionableUsers() {
                     mentionableUsers = users
                 }
@@ -410,23 +412,39 @@ final class CoreChannelsStore: ObservableObject {
         }
 
         channels = mergedChannels
+        mergeChannelPreviews(from: mergedChannels)
         selectedChannelId = selectedChannelId.flatMap(channel(with:))?.id ?? channels.first?.id
         CoreChannelCache.save(mergedChannels, userId: configuration.userId)
     }
 
-    private func loadChannelPreviews(using client: ConvexCoreClient) async {
-        let conversationIds = channels.compactMap(\.conversationId)
-        guard !conversationIds.isEmpty else {
-            channelPreviews = [:]
-            return
-        }
-
-        if let previews = try? await client.listChannelPreviews(conversationIds: conversationIds) {
-            channelPreviews.merge(previews) { current, incoming in
-                incoming.createdAt >= current.createdAt ? incoming : current
+    private func mergeChannelPreviews(from loadedChannels: [CoreChannel]) {
+        var next = channelPreviews
+        for channel in loadedChannels {
+            guard
+                let conversationId = channel.conversationId,
+                let lastMessageId = channel.lastMessageId,
+                let lastMessageAt = channel.lastMessageAt
+            else {
+                continue
             }
-            saveChatListCache()
+            let incoming = CoreMessage(
+                id: lastMessageId,
+                empresaId: channel.empresaId,
+                conversationId: conversationId,
+                channelId: channel.id,
+                parentMessageId: nil,
+                userId: channel.lastMessageUserId ?? "",
+                content: channel.lastMessageContent ?? "",
+                createdAt: lastMessageAt,
+                author: channel.lastMessageAuthor
+            )
+            if let current = next[conversationId], current.createdAt > incoming.createdAt {
+                continue
+            }
+            next[conversationId] = incoming
         }
+        channelPreviews = next
+        saveChatListCache()
     }
 
     private func applyDirectMessages(_ loaded: [CoreDirectMessage]) {
@@ -507,7 +525,7 @@ final class CoreChannelsStore: ObservableObject {
             return channel
         }
 
-        let activeConfiguration = try await ensureFreshSession()
+        let activeConfiguration = try await ensureFreshSession(restartRealtime: false)
         let client = try ConvexCoreClient(configuration: activeConfiguration)
         let loadedChannels: [CoreChannel]
         do {
@@ -1361,26 +1379,61 @@ final class CoreChannelsStore: ObservableObject {
 
     private func startRealtime(for channel: CoreChannel, force: Bool = false) {
         guard let conversationId = channel.conversationId else { return }
-        guard force || realtimeConversationId != conversationId || realtimePollingTask == nil else { return }
+        guard force || realtimeConversationId != conversationId else { return }
 
         stopRealtime()
         realtimeConversationId = conversationId
-        realtimePollingTask = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.resyncRealtimeMessages(conversationId: conversationId)
-                try? await Task.sleep(for: .seconds(2))
+        realtimeResyncTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                Self.realtimeLogger.info("Starting message subscription conversation=\(conversationId, privacy: .public)")
+                let service = try await self.ensureConvexRealtimeClient()
+                let limit = max(21, self.messages[conversationId, default: []].count + 5)
+                self.realtimeMessagesSubscription = service
+                    .subscribeMessages(conversationId: conversationId, limit: limit)
+                    .sink(
+                        receiveCompletion: { [weak self] completion in
+                            guard case .failure = completion,
+                                  let self,
+                                  self.realtimeConversationId == conversationId else { return }
+                            Self.realtimeLogger.error("Message subscription failed conversation=\(conversationId, privacy: .public)")
+                            self.lastError = "Convex message subscription failed"
+                        },
+                        receiveValue: { [weak self] page in
+                            Task { @MainActor in
+                                guard let self, self.realtimeConversationId == conversationId else { return }
+                                Self.realtimeLogger.info("Message subscription value conversation=\(conversationId, privacy: .public) count=\(page.messages.count, privacy: .public)")
+                                let loaded = page.messages.map(\.coreMessage)
+                                self.hasOlderMessages[conversationId] = page.hasMore
+                                self.mergeMessagePage(loaded, conversationId: conversationId)
+                                if let latest = loaded.last {
+                                    self.updateChannelPreview(with: latest)
+                                    self.clearUnreadForActiveConversation(conversationId)
+                                    Task { [configuration = self.configuration] in
+                                        if let client = try? ConvexCoreClient(configuration: configuration) {
+                                            try? await client.markRead(
+                                                conversationId: conversationId,
+                                                lastReadMessageId: latest.id
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    )
+            } catch {
+                Self.realtimeLogger.error("Message subscription setup failed: \(error.localizedDescription, privacy: .public)")
+                self.lastError = error.localizedDescription
             }
         }
     }
 
     private func stopRealtime() {
-        realtimeReconnectTask?.cancel()
-        realtimeReconnectTask = nil
-        realtimeMessageRefreshTask?.cancel()
-        realtimeMessageRefreshTask = nil
+        realtimeMessagesSubscription?.cancel()
+        realtimeMessagesSubscription = nil
         realtimeConversationId = nil
-        realtimePollingTask?.cancel()
-        realtimePollingTask = nil
+        realtimeResyncTask?.cancel()
+        realtimeResyncTask = nil
     }
 
     func reconnectRealtimeIfNeeded() async {
@@ -1388,46 +1441,91 @@ final class CoreChannelsStore: ObservableObject {
         guard let conversationId = realtimeConversationId,
               let channel = channels.first(where: { $0.conversationId == conversationId })
                 ?? directMessages.first(where: { $0.id == conversationId })?.chatTarget else {
-            await refreshChatListActivity()
             return
         }
         startRealtime(for: channel, force: true)
-        async let chatListRefresh: Void = refreshChatListActivity()
-        async let messageRefresh: Void = resyncRealtimeMessages(conversationId: conversationId)
-        _ = await (chatListRefresh, messageRefresh)
     }
 
     private func startCompanyRealtime(force: Bool = false) {
         guard configuration.isUsable, let empresaId = configuration.empresaId else { return }
-        guard force || companyPollingTask == nil else { return }
+        guard force || companyResyncTask == nil else { return }
 
         stopCompanyRealtime()
-        companyPollingTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard self?.configuration.empresaId == empresaId else { return }
-                await self?.refreshChatListActivity()
-                try? await Task.sleep(for: .seconds(3))
+        companyResyncTask = Task { [weak self] in
+            guard let self, self.configuration.empresaId == empresaId else { return }
+            do {
+                Self.realtimeLogger.info("Starting company subscriptions empresa=\(empresaId, privacy: .public)")
+                let service = try await self.ensureConvexRealtimeClient()
+                let displayName = self.configuration.displayName
+                self.companyChannelsSubscription = service
+                    .subscribeChannels(empresaId: empresaId, displayName: displayName)
+                    .sink(
+                        receiveCompletion: { [weak self] completion in
+                            guard case .failure = completion else { return }
+                            Self.realtimeLogger.error("Channels subscription failed empresa=\(empresaId, privacy: .public)")
+                            self?.lastError = "Convex channels subscription failed"
+                        },
+                        receiveValue: { [weak self] rows in
+                            Task { @MainActor in
+                                Self.realtimeLogger.info("Channels subscription value empresa=\(empresaId, privacy: .public) count=\(rows.count, privacy: .public)")
+                                self?.applyChannels(rows.map(\.coreChannel))
+                            }
+                        }
+                    )
+                self.companyDirectMessagesSubscription = service
+                    .subscribeDirectMessages(empresaId: empresaId, displayName: displayName)
+                    .sink(
+                        receiveCompletion: { [weak self] completion in
+                            guard case .failure = completion else { return }
+                            Self.realtimeLogger.error("DM subscription failed empresa=\(empresaId, privacy: .public)")
+                            self?.lastError = "Convex direct messages subscription failed"
+                        },
+                        receiveValue: { [weak self] rows in
+                            Task { @MainActor in
+                                Self.realtimeLogger.info("DM subscription value empresa=\(empresaId, privacy: .public) count=\(rows.count, privacy: .public)")
+                                self?.applyDirectMessages(rows.map(\.coreDirectMessage))
+                            }
+                        }
+                    )
+            } catch {
+                Self.realtimeLogger.error("Company subscription setup failed: \(error.localizedDescription, privacy: .public)")
+                self.lastError = error.localizedDescription
             }
         }
     }
 
     private func stopCompanyRealtime() {
-        companyRealtimeReconnectTask?.cancel()
-        companyRealtimeReconnectTask = nil
-        chatListRefreshTask?.cancel()
-        chatListRefreshTask = nil
-        companyPollingTask?.cancel()
-        companyPollingTask = nil
+        companyChannelsSubscription?.cancel()
+        companyChannelsSubscription = nil
+        companyDirectMessagesSubscription?.cancel()
+        companyDirectMessagesSubscription = nil
+        companyResyncTask?.cancel()
+        companyResyncTask = nil
     }
 
-    private func scheduleCompanyRealtimeReconnect() {
-        guard configuration.isUsable else { return }
-        companyRealtimeReconnectTask?.cancel()
-        companyRealtimeReconnectTask = Task {
-            try? await Task.sleep(for: .seconds(1))
-            guard !Task.isCancelled, self.configuration.isUsable else { return }
-            self.startCompanyRealtime(force: true)
+    private func ensureConvexRealtimeClient() async throws -> ConvexRealtimeClient {
+        let activeConfiguration = try await ensureFreshSession(restartRealtime: false)
+        let realtimeKey = "\(activeConfiguration.convexURL)|\(activeConfiguration.accessToken)"
+        if let convexRealtimeClient, convexRealtimeKey == realtimeKey {
+            Self.realtimeLogger.info("Reusing Convex realtime client")
+            return convexRealtimeClient
         }
+        Self.realtimeLogger.info("Creating Convex realtime client")
+        let client = try await Task.detached(priority: .utility) {
+            let service = try ConvexRealtimeClient(configuration: activeConfiguration)
+            await service.authenticate()
+            return service
+        }.value
+        Self.realtimeLogger.info("Convex realtime client ready")
+        convexWebSocketSubscription?.cancel()
+        convexWebSocketSubscription = client
+            .watchWebSocketState()
+            .sink { state in
+                Self.realtimeLogger.info("Convex websocket state=\(String(describing: state), privacy: .public)")
+            }
+        convexRealtimeClient = client
+        convexRealtimeKey = realtimeKey
+        return client
     }
 
     private func handleCompanyRealtimeMessage(_ message: CoreMessage) {
@@ -1454,51 +1552,16 @@ final class CoreChannelsStore: ObservableObject {
         }
     }
 
-    private func scheduleChatListRefresh() {
-        chatListRefreshTask?.cancel()
-        chatListRefreshTask = Task {
-            try? await Task.sleep(for: .milliseconds(220))
-            guard !Task.isCancelled, self.configuration.isUsable else { return }
-            await self.refreshChatListActivity()
-        }
-    }
-
     private func refreshChatListActivity() async {
         guard let client = try? ConvexCoreClient(configuration: configuration) else { return }
+        async let loadedChannels = try? client.listChannelsFast()
         async let loadedDirectMessages = try? fetchDirectMessages(using: client)
-        async let loadedPreviews = try? client.listChannelPreviews(
-            conversationIds: channels.compactMap(\.conversationId)
-        )
 
+        if let channels = await loadedChannels {
+            applyChannels(channels)
+        }
         if let directMessages = await loadedDirectMessages {
             applyDirectMessages(directMessages)
-        }
-        if let previews = await loadedPreviews {
-            channelPreviews.merge(previews) { current, incoming in
-                incoming.createdAt >= current.createdAt ? incoming : current
-            }
-            saveChatListCache()
-        }
-    }
-
-    private func scheduleRealtimeReconnect(for channel: CoreChannel) {
-        guard realtimeConversationId == channel.conversationId else { return }
-        realtimeReconnectTask?.cancel()
-        realtimeReconnectTask = Task {
-            try? await Task.sleep(for: .seconds(1))
-            guard !Task.isCancelled,
-                  self.realtimeConversationId == channel.conversationId else { return }
-            self.startRealtime(for: channel, force: true)
-        }
-    }
-
-    private func scheduleRealtimeMessageRefresh(conversationId: String) {
-        guard realtimeConversationId == conversationId else { return }
-        realtimeMessageRefreshTask?.cancel()
-        realtimeMessageRefreshTask = Task {
-            try? await Task.sleep(for: .milliseconds(180))
-            guard !Task.isCancelled, self.realtimeConversationId == conversationId else { return }
-            await self.resyncRealtimeMessages(conversationId: conversationId)
         }
     }
 

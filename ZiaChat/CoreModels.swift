@@ -192,6 +192,11 @@ struct CoreChannel: Identifiable, Codable, Hashable {
     var conversationId: String?
     var unreadCount: Int
     var mentionCount: Int
+    var lastMessageId: String? = nil
+    var lastMessageContent: String? = nil
+    var lastMessageAt: Date? = nil
+    var lastMessageUserId: String? = nil
+    var lastMessageAuthor: CoreUserLite? = nil
     var currentUserIsMember: Bool
     var visibleAsSuperAdmin: Bool
 
@@ -211,6 +216,11 @@ struct CoreChannel: Identifiable, Codable, Hashable {
         case conversationId = "conversation_id"
         case unreadCount = "unread_count"
         case mentionCount = "mention_count"
+        case lastMessageId = "last_message_id"
+        case lastMessageContent = "last_message_content"
+        case lastMessageAt = "last_message_at"
+        case lastMessageUserId = "last_message_user_id"
+        case lastMessageAuthor = "last_message_author"
         case currentUserIsMember = "current_user_is_member"
         case visibleAsSuperAdmin = "visible_as_super_admin"
     }
@@ -231,6 +241,11 @@ struct CoreChannel: Identifiable, Codable, Hashable {
         conversationId: String? = nil,
         unreadCount: Int = 0,
         mentionCount: Int = 0,
+        lastMessageId: String? = nil,
+        lastMessageContent: String? = nil,
+        lastMessageAt: Date? = nil,
+        lastMessageUserId: String? = nil,
+        lastMessageAuthor: CoreUserLite? = nil,
         currentUserIsMember: Bool = true,
         visibleAsSuperAdmin: Bool = false
     ) {
@@ -249,6 +264,11 @@ struct CoreChannel: Identifiable, Codable, Hashable {
         self.conversationId = conversationId
         self.unreadCount = unreadCount
         self.mentionCount = mentionCount
+        self.lastMessageId = lastMessageId
+        self.lastMessageContent = lastMessageContent
+        self.lastMessageAt = lastMessageAt
+        self.lastMessageUserId = lastMessageUserId
+        self.lastMessageAuthor = lastMessageAuthor
         self.currentUserIsMember = currentUserIsMember
         self.visibleAsSuperAdmin = visibleAsSuperAdmin
     }
@@ -305,8 +325,44 @@ struct CoreUserLite: Identifiable, Codable, Hashable {
     }
 
     var avatarURL: URL? {
-        guard let avatarURLString, !avatarURLString.isEmpty else { return nil }
-        return URL(string: avatarURLString)
+        guard let avatarURLString else { return nil }
+        return CoreAvatarURLResolver.url(from: avatarURLString)
+    }
+}
+
+enum CoreAvatarURLResolver {
+    private static let storagePrefix = "/storage/v1/object/public/avatars/"
+
+    static func url(from value: String) -> URL? {
+        let rawValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawValue.isEmpty else { return nil }
+
+        if let absoluteURL = URL(string: rawValue), absoluteURL.scheme != nil {
+            return absoluteURL
+        }
+
+        let supabaseURL = CoreEnvironment.load().supabaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !supabaseURL.isEmpty else { return nil }
+
+        let storagePath: String
+        if rawValue.hasPrefix(storagePrefix) {
+            storagePath = String(rawValue.dropFirst(storagePrefix.count))
+        } else if rawValue.hasPrefix("avatars/") {
+            storagePath = String(rawValue.dropFirst("avatars/".count))
+        } else if rawValue.hasPrefix("users/") {
+            storagePath = rawValue
+        } else {
+            storagePath = "users/\(rawValue)"
+        }
+
+        let encodedPath = storagePath
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map { segment in
+                String(segment).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String(segment)
+            }
+            .joined(separator: "/")
+
+        return URL(string: "\(supabaseURL)/storage/v1/object/public/avatars/\(encodedPath)")
     }
 }
 

@@ -51,32 +51,33 @@ final class ConvexCoreClient {
         try await listChannels()
     }
 
-    func listChannelPreviews(conversationIds: [String]) async throws -> [String: CoreMessage] {
-        var previews: [String: CoreMessage] = [:]
-        for conversationId in conversationIds {
-            let page: ConvexMessagePageDTO = try await query(
-                "messages:list",
-                ["conversationId": conversationId, "parentMessageId": NSNull(), "limit": 1]
-            )
-            if let message = page.messages.last?.coreMessage {
-                previews[conversationId] = message
-            }
-        }
-        return previews
-    }
-
     func listDirectMessages() async throws -> [CoreDirectMessage] {
         guard let empresaId = configuration.empresaId else { return [] }
         let rows: [ConvexDirectMessageDTO] = try await query(
             "dms:list",
             ["empresaId": empresaId, "displayName": configuration.displayName.convexNilIfBlank as Any]
         )
-        return rows.map(\.coreDirectMessage)
+        let directMessages = rows.map(\.coreDirectMessage)
+        return await hydrateDirectMessagePeersIfNeeded(directMessages)
     }
 
     func listMentionableUsers() async throws -> [CoreUserLite] {
         guard let empresaId = configuration.empresaId else { return [] }
         return try await query("users:listByEmpresa", ["empresaId": empresaId])
+    }
+
+    func storeCurrentUser(profile: CoreAuthenticatedProfile) async throws {
+        guard let empresaId = configuration.empresaId else { return }
+        let _: String = try await mutation(
+            "users:store",
+            [
+                "empresaId": empresaId,
+                "name": (profile.fullName ?? configuration.displayName).convexNilIfBlank as Any,
+                "avatarUrl": (profile.avatarURLString?.convexNilIfBlank as Any?) ?? NSNull(),
+                "rolId": profile.roleId ?? NSNull(),
+                "clientId": profile.clientId ?? NSNull(),
+            ]
+        )
     }
 
     func listInternalCompanies() async throws -> [CoreInternalCompany] {
@@ -450,6 +451,62 @@ final class ConvexCoreClient {
         return uploaded
     }
 
+    private func hydrateDirectMessagePeersIfNeeded(_ directMessages: [CoreDirectMessage]) async -> [CoreDirectMessage] {
+        let missingPeerIds = Array(Set(directMessages.compactMap { dm in
+            dm.peer.avatarURLString?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false &&
+            dm.peer.fullName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                ? nil
+                : dm.peer.id
+        }))
+        guard !missingPeerIds.isEmpty,
+              let profiles = try? await fetchSupabaseProfiles(userIds: missingPeerIds),
+              !profiles.isEmpty else {
+            return directMessages
+        }
+
+        let profilesById = Dictionary(uniqueKeysWithValues: profiles.map { ($0.id, $0) })
+        return directMessages.map { dm in
+            guard let profile = profilesById[dm.peer.id] else { return dm }
+            var hydrated = dm
+            hydrated.peer = CoreUserLite(
+                id: dm.peer.id,
+                fullName: profile.fullName ?? dm.peer.fullName,
+                avatarURLString: profile.avatarURLString ?? dm.peer.avatarURLString,
+                roleId: profile.roleId ?? dm.peer.roleId
+            )
+            return hydrated
+        }
+    }
+
+    private func fetchSupabaseProfiles(userIds: [String]) async throws -> [CoreUserLite] {
+        let supabaseURL = configuration.supabaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !supabaseURL.isEmpty,
+              !configuration.anonKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !configuration.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return []
+        }
+
+        let ids = userIds
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: ",")
+        guard !ids.isEmpty,
+              let encodedIds = ids.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "\(supabaseURL)/rest/v1/profiles?select=id,full_name,avatar_url,rol_id&id=in.(\(encodedIds))") else {
+            return []
+        }
+
+        var request = URLRequest(url: url)
+        request.setValue(configuration.anonKey, forHTTPHeaderField: "apikey")
+        request.setValue("Bearer \(configuration.accessToken)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            return []
+        }
+        return try decoder.decode([CoreUserLite].self, from: data)
+    }
+
     private func query<T: Decodable>(_ path: String, _ args: [String: Any]) async throws -> T {
         try await call(endpoint: "query", path: path, args: args)
     }
@@ -681,6 +738,7 @@ private struct ConvexChannelDTO: Decodable {
     var unreadCount: Int?
     var mentionCount: Int?
     var currentUserIsMember: Bool?
+    var lastMessage: ConvexLastMessageDTO?
 
     enum CodingKeys: String, CodingKey {
         case id = "_id"
@@ -700,6 +758,7 @@ private struct ConvexChannelDTO: Decodable {
         case unreadCount
         case mentionCount
         case currentUserIsMember
+        case lastMessage
     }
 
     var coreChannel: CoreChannel {
@@ -721,6 +780,11 @@ private struct ConvexChannelDTO: Decodable {
             conversationId: conversationId,
             unreadCount: unreadCount ?? 0,
             mentionCount: mentionCount ?? 0,
+            lastMessageId: lastMessage?.id,
+            lastMessageContent: lastMessage?.content,
+            lastMessageAt: lastMessage?.createdAt,
+            lastMessageUserId: lastMessage?.userId,
+            lastMessageAuthor: lastMessage?.author,
             currentUserIsMember: currentUserIsMember ?? false,
             visibleAsSuperAdmin: false
         )
@@ -758,6 +822,7 @@ private struct ConvexLastMessageDTO: Decodable {
     var content: String
     var parentMessageId: String?
     var createdAt: Date
+    var author: CoreUserLite?
 }
 
 private struct ConvexChannelMemberDTO: Decodable {

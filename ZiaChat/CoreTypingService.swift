@@ -1,21 +1,19 @@
 import Combine
 import Foundation
 
-/// Indicador de "escribiendo…" respaldado por Convex (`typing:list` /
-/// `typing:set`). La app Swift usa polling liviano porque no mantiene un
-/// cliente Convex reactivo por WebSocket.
+/// Indicador de escritura respaldado por Convex (`typing:set`).
+/// No se consulta `typing:list` en loop; sin canal reactivo, la app solo publica
+/// el estado local para no abrir polling.
 @MainActor
 final class CoreTypingService: ObservableObject {
     @Published private(set) var typingNames: [String] = []
 
-    private var pollTask: Task<Void, Never>?
     private var connectedConversationId: String?
     private var lastTypingSentAt: Date = .distantPast
     private var isTypingSent = false
     private var idleTask: Task<Void, Never>?
     private let typingPulseInterval: TimeInterval = 5
     private let typingIdleStopDelay: Duration = .milliseconds(3500)
-    private let typingPollInterval: Duration = .seconds(4)
 
     var typingLabel: String? {
         guard !typingNames.isEmpty else { return nil }
@@ -26,22 +24,14 @@ final class CoreTypingService: ObservableObject {
     }
 
     func connect(conversationId: String, configuration: CoreAppConfiguration) async {
-        if connectedConversationId == conversationId, pollTask != nil { return }
+        if connectedConversationId == conversationId { return }
         await disconnect()
         guard configuration.isUsable else { return }
         connectedConversationId = conversationId
-        pollTask = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.refreshTyping(conversationId: conversationId, configuration: configuration)
-                try? await Task.sleep(for: self?.typingPollInterval ?? .seconds(4))
-            }
-        }
-        await refreshTyping(conversationId: conversationId, configuration: configuration)
+        typingNames = []
     }
 
     func disconnect() async {
-        pollTask?.cancel()
-        pollTask = nil
         idleTask?.cancel()
         idleTask = nil
         typingNames = []
@@ -94,15 +84,4 @@ final class CoreTypingService: ObservableObject {
         )
     }
 
-    private func refreshTyping(conversationId: String, configuration: CoreAppConfiguration) async {
-        guard connectedConversationId == conversationId,
-              let client = try? ConvexCoreClient(configuration: configuration),
-              let statuses = try? await client.listTyping(conversationId: conversationId) else {
-            return
-        }
-        typingNames = statuses
-            .filter { $0.isTyping && $0.userId != configuration.userId }
-            .map(\.userName)
-            .sorted()
-    }
 }
