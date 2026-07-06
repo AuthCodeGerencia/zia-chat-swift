@@ -79,6 +79,11 @@ struct CoreAppConfiguration: Codable, Equatable {
         return expirationDate.timeIntervalSinceNow <= interval
     }
 
+    func accessTokenRefreshDelay(leadTime: TimeInterval = 300) -> TimeInterval {
+        guard let expirationDate = accessTokenExpirationDate else { return 0 }
+        return max(0, expirationDate.timeIntervalSinceNow - leadTime)
+    }
+
     mutating func clearSession() {
         accessToken = ""
         refreshToken = ""
