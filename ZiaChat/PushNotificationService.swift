@@ -7,9 +7,14 @@ struct PushNotificationDestination: Equatable, Sendable {
     var conversationId: String?
     var messageId: String?
 
-    var isValid: Bool {
+    nonisolated var isValid: Bool {
         channelId != nil || conversationId != nil
     }
+}
+
+struct ForegroundPushNotificationEvent: Equatable, Sendable {
+    let id = UUID()
+    var destination: PushNotificationDestination
 }
 
 @MainActor
@@ -18,6 +23,7 @@ final class PushNotificationService: NSObject, ObservableObject, UNUserNotificat
 
     @Published private(set) var deviceToken: String?
     @Published private(set) var pendingDestination: PushNotificationDestination?
+    @Published private(set) var foregroundEvent: ForegroundPushNotificationEvent?
     @Published private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
     @Published var lastError: String?
 
@@ -67,6 +73,11 @@ final class PushNotificationService: NSObject, ObservableObject, UNUserNotificat
         pendingDestination = destination
     }
 
+    func receiveForeground(destination: PushNotificationDestination) {
+        guard destination.isValid else { return }
+        foregroundEvent = ForegroundPushNotificationEvent(destination: destination)
+    }
+
     func consume(_ destination: PushNotificationDestination) {
         guard pendingDestination == destination else { return }
         pendingDestination = nil
@@ -108,6 +119,9 @@ final class PushNotificationService: NSObject, ObservableObject, UNUserNotificat
     ) async -> UNNotificationPresentationOptions {
         // Canales silenciados por el usuario: sin banner ni sonido.
         let destination = Self.destination(from: notification.request.content.userInfo)
+        if destination.isValid {
+            Task { await PushNotificationService.shared.receiveForeground(destination: destination) }
+        }
         let muted = Set(UserDefaults.standard.stringArray(forKey: "zia.mutedChannelIds") ?? [])
         if let channelId = destination.channelId, muted.contains(channelId) {
             return [.list]

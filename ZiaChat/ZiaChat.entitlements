@@ -6,7 +6,7 @@
 	<string>$(APS_ENVIRONMENT)</string>
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.authcode.ZiaChat</string>
+		<string>group.com.authcodetechnologies.authcodeapp</string>
 	</array>
 </dict>
 </plist>

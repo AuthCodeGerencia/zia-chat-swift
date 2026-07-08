@@ -12,6 +12,7 @@ struct ContentView: View {
     @State private var showingNewChannel = false
     @State private var navigationPath: [CoreChannel.ID] = []
     @State private var pushNavigationTask: Task<Void, Never>?
+    @State private var foregroundRefreshTask: Task<Void, Never>?
 
     var body: some View {
         Group {
@@ -79,6 +80,18 @@ struct ContentView: View {
             guard destination != nil else { return }
             schedulePendingPushNavigation()
         }
+        .onChange(of: pushService.foregroundEvent) { _, event in
+            guard event != nil, scenePhase == .active else { return }
+            foregroundRefreshTask?.cancel()
+            foregroundRefreshTask = Task {
+                guard store.configuration.isUsable, scenePhase == .active else { return }
+                _ = try? await store.ensureFreshSession()
+                guard !Task.isCancelled, scenePhase == .active else { return }
+                await store.refresh()
+                guard !Task.isCancelled, scenePhase == .active else { return }
+                await syncAppBadge()
+            }
+        }
         .onChange(of: store.channels) { _, _ in
             schedulePendingPushNavigation()
             Task { await syncAppBadge() }
@@ -90,6 +103,11 @@ struct ContentView: View {
             Task { await pushService.registerCurrentToken(configuration: store.configuration) }
         }
         .onChange(of: scenePhase) { _, phase in
+            store.setSceneActive(phase == .active)
+            if phase != .active {
+                foregroundRefreshTask?.cancel()
+                foregroundRefreshTask = nil
+            }
             guard phase == .active else { return }
             Task {
                 guard store.configuration.isUsable else {
@@ -97,6 +115,7 @@ struct ContentView: View {
                     return
                 }
                 _ = try? await store.ensureFreshSession()
+                await store.refresh()
                 await store.reconnectRealtimeIfNeeded()
                 await syncAppBadge()
                 schedulePendingPushNavigation()

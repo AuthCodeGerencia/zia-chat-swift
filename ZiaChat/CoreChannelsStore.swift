@@ -56,6 +56,7 @@ final class CoreChannelsStore: ObservableObject {
     private var realtimeRetryTask: Task<Void, Never>?
     private var pendingRealtimeConversationId: String?
     private var realtimeRetryDelay: TimeInterval = 2
+    private var sceneIsActive = true
     private let optimisticMessagePrefix = "local-pending-"
 
     init(configuration: CoreAppConfiguration) {
@@ -78,6 +79,56 @@ final class CoreChannelsStore: ObservableObject {
 
     convenience init() {
         self.init(configuration: CoreConfigurationStore.load())
+    }
+
+    func setSceneActive(_ isActive: Bool) {
+        sceneIsActive = isActive
+        if isActive {
+            if isLoading {
+                isLoading = false
+            }
+            if configuration.isUsable {
+                startSessionMaintenance()
+            }
+        } else {
+            refreshTask?.cancel()
+            refreshTask = nil
+            sessionRefreshTask?.cancel()
+            sessionRefreshTask = nil
+            stopSessionMaintenance()
+            channelSearchTask?.cancel()
+            channelSearchTask = nil
+            realtimeRetryTask?.cancel()
+            realtimeRetryTask = nil
+            pendingRealtimeConversationId = realtimeConversationId
+            stopRealtime()
+            stopCompanyRealtime()
+            stopConvexRealtimeClient()
+        }
+    }
+
+    private func canPublishSceneUpdates() -> Bool {
+        sceneIsActive && !Task.isCancelled
+    }
+
+    private func publishSceneUpdate(_ update: () -> Void) {
+        guard canPublishSceneUpdates() else { return }
+        update()
+    }
+
+    private func publishError(_ message: String) {
+        guard canPublishSceneUpdates() else { return }
+        lastError = message
+    }
+
+    private func setLoadingChannelThreads(_ isLoading: Bool, conversationId: String) {
+        guard canPublishSceneUpdates() else { return }
+        isLoadingChannelThreads[conversationId] = isLoading
+    }
+
+    private func setLoadingAllThreads(_ isLoading: Bool) {
+        guard canPublishSceneUpdates() else { return }
+        isLoadingAllThreads = isLoading
     }
 
     var selectedChannel: CoreChannel? {
@@ -214,10 +265,7 @@ final class CoreChannelsStore: ObservableObject {
         realtimeRetryDelay = 2
         stopRealtime()
         stopCompanyRealtime()
-        convexWebSocketSubscription?.cancel()
-        convexWebSocketSubscription = nil
-        convexRealtimeClient = nil
-        convexRealtimeKey = nil
+        stopConvexRealtimeClient()
         var next = configuration
         next.clearSession()
         save(configuration: next)
@@ -256,6 +304,10 @@ final class CoreChannelsStore: ObservableObject {
             sessionRefreshTask = nil
             guard configuration.userId == originalConfiguration.userId else {
                 return configuration
+            }
+            guard sceneIsActive else {
+                CoreConfigurationStore.save(refreshedConfiguration)
+                return refreshedConfiguration
             }
 
             let activeChannel = realtimeConversationId == nil ? nil : selectedChannel
@@ -403,10 +455,15 @@ final class CoreChannelsStore: ObservableObject {
         }
 
         let task = Task { @MainActor in
-            isLoading = true
-            lastError = nil
+            let shouldPublishLoading = sceneIsActive
+            if shouldPublishLoading {
+                isLoading = true
+                lastError = nil
+            }
             defer {
-                isLoading = false
+                if sceneIsActive {
+                    isLoading = false
+                }
                 refreshTask = nil
             }
 
@@ -419,26 +476,32 @@ final class CoreChannelsStore: ObservableObject {
                 } catch {
                     fastChannels = try await client.listChannels()
                 }
+                guard sceneIsActive, !Task.isCancelled else { return }
                 applyChannels(fastChannels)
                 if let loadedDirectMessages = try? await fetchDirectMessages(using: client) {
+                    guard sceneIsActive, !Task.isCancelled else { return }
                     applyDirectMessages(loadedDirectMessages)
                 }
                 if let users = try? await client.listMentionableUsers() {
+                    guard sceneIsActive, !Task.isCancelled else { return }
                     mentionableUsers = users
                 }
                 startCompanyRealtime()
 
                 Task { @MainActor [weak self] in
-                    guard let self, self.configuration.isUsable else { return }
+                    guard let self, self.configuration.isUsable, self.sceneIsActive else { return }
                     do {
                         let enrichedChannels = try await client.listChannels()
+                        guard self.sceneIsActive, !Task.isCancelled else { return }
                         self.applyChannels(enrichedChannels)
                     } catch {
                         // Fast channel data is already visible; stale counters are preferable to blocking the list.
                     }
                 }
             } catch {
-                lastError = error.localizedDescription
+                if sceneIsActive {
+                    lastError = error.localizedDescription
+                }
             }
         }
         refreshTask = task
@@ -463,7 +526,6 @@ final class CoreChannelsStore: ObservableObject {
             var updated = channel
             if let previous = previousChannels[channel.id] {
                 updated.unreadCount = max(updated.unreadCount, previous.unreadCount)
-                updated.mentionCount = max(updated.mentionCount, previous.mentionCount)
             }
             if updated.metadata?.iconImage?.isEmpty != false,
                let previousIcon = previousIcons[channel.id] {
@@ -520,7 +582,6 @@ final class CoreChannelsStore: ObservableObject {
             }
             var merged = incoming
             merged.unreadCount = max(incoming.unreadCount, cached.unreadCount)
-            merged.mentionCount = max(incoming.mentionCount, cached.mentionCount)
             if (cached.lastMessageAt ?? .distantPast) > (incoming.lastMessageAt ?? .distantPast) {
                 merged.lastMessageContent = cached.lastMessageContent
                 merged.lastMessageAt = cached.lastMessageAt
@@ -624,12 +685,16 @@ final class CoreChannelsStore: ObservableObject {
         await loadChannelMembers(for: channel, force: force)
         startRealtime(for: channel)
         if !force, messages[conversationId]?.isEmpty == false {
+            let lastReadMessageId = messages[conversationId]?.last?.id
             Task {
                 if let client = try? ConvexCoreClient(configuration: configuration) {
-                    try? await client.markRead(conversationId: conversationId, lastReadMessageId: messages[conversationId]?.last?.id)
+                    try? await client.markRead(conversationId: conversationId, lastReadMessageId: lastReadMessageId)
                 }
             }
             clearUnread(for: channel.id)
+            Task { [weak self] in
+                await self?.resyncRealtimeMessages(conversationId: conversationId)
+            }
             return
         }
 
@@ -913,16 +978,19 @@ final class CoreChannelsStore: ObservableObject {
     func loadChannelThreads(for channel: CoreChannel, force: Bool = false) async {
         guard let conversationId = channel.conversationId else { return }
         if !force, channelThreads[conversationId] != nil { return }
-        guard configuration.isUsable else { return }
+        guard configuration.isUsable, canPublishSceneUpdates() else { return }
 
-        isLoadingChannelThreads[conversationId] = true
-        defer { isLoadingChannelThreads[conversationId] = false }
+        setLoadingChannelThreads(true, conversationId: conversationId)
+        defer { setLoadingChannelThreads(false, conversationId: conversationId) }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
-            channelThreads[conversationId] = try await client.listChannelThreads(conversationId: conversationId)
+            let loadedThreads = try await client.listChannelThreads(conversationId: conversationId)
+            publishSceneUpdate {
+                channelThreads[conversationId] = loadedThreads
+            }
         } catch {
-            lastError = error.localizedDescription
+            publishError(error.localizedDescription)
         }
     }
 
@@ -930,21 +998,18 @@ final class CoreChannelsStore: ObservableObject {
     /// Con `force == false` solo consulta los canales que aún no tienen threads
     /// en memoria, así el refresco incremental es barato.
     func loadAllChannelThreads(force: Bool = false) async {
-        guard configuration.isUsable else { return }
+        guard configuration.isUsable, canPublishSceneUpdates() else { return }
         let targets = textChannels.filter { channel in
             guard let conversationId = channel.conversationId else { return false }
             return force || channelThreads[conversationId] == nil
         }
         guard !targets.isEmpty else { return }
 
-        isLoadingAllThreads = true
-        defer { isLoadingAllThreads = false }
-        await withTaskGroup(of: Void.self) { group in
-            for channel in targets {
-                group.addTask { [weak self] in
-                    await self?.loadChannelThreads(for: channel, force: force)
-                }
-            }
+        setLoadingAllThreads(true)
+        defer { setLoadingAllThreads(false) }
+        for channel in targets {
+            guard canPublishSceneUpdates() else { return }
+            await loadChannelThreads(for: channel, force: force)
         }
     }
 
@@ -1441,6 +1506,7 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     private func startRealtime(for channel: CoreChannel, force: Bool = false) {
+        guard sceneIsActive else { return }
         guard let conversationId = channel.conversationId else { return }
         guard force || realtimeConversationId != conversationId else { return }
 
@@ -1456,16 +1522,21 @@ final class CoreChannelsStore: ObservableObject {
                     .subscribeMessages(conversationId: conversationId, limit: limit)
                     .sink(
                         receiveCompletion: { [weak self] completion in
-                            guard case .failure = completion,
-                                  let self,
-                                  self.realtimeConversationId == conversationId else { return }
-                            Self.realtimeLogger.error("Message subscription failed conversation=\(conversationId, privacy: .public)")
-                            self.lastError = "Convex message subscription failed"
-                            self.scheduleRealtimeReconnect(conversationId: conversationId)
+                            guard case .failure = completion else { return }
+                            Task { @MainActor in
+                                guard let self,
+                                      self.sceneIsActive,
+                                      self.realtimeConversationId == conversationId else { return }
+                                Self.realtimeLogger.error("Message subscription failed conversation=\(conversationId, privacy: .public)")
+                                self.lastError = "Convex message subscription failed"
+                                self.scheduleRealtimeReconnect(conversationId: conversationId)
+                            }
                         },
                         receiveValue: { [weak self] page in
                             Task { @MainActor in
-                                guard let self, self.realtimeConversationId == conversationId else { return }
+                                guard let self,
+                                      self.sceneIsActive,
+                                      self.realtimeConversationId == conversationId else { return }
                                 self.resetRealtimeRetry()
                                 Self.realtimeLogger.info("Message subscription value conversation=\(conversationId, privacy: .public) count=\(page.messages.count, privacy: .public)")
                                 let loaded = page.messages.map(\.coreMessage)
@@ -1488,8 +1559,10 @@ final class CoreChannelsStore: ObservableObject {
                     )
             } catch {
                 Self.realtimeLogger.error("Message subscription setup failed: \(error.localizedDescription, privacy: .public)")
-                self.lastError = error.localizedDescription
-                self.scheduleRealtimeReconnect(conversationId: conversationId)
+                self.publishError(error.localizedDescription)
+                if self.sceneIsActive {
+                    self.scheduleRealtimeReconnect(conversationId: conversationId)
+                }
             }
         }
     }
@@ -1503,8 +1576,11 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     func reconnectRealtimeIfNeeded() async {
+        guard sceneIsActive else { return }
         startCompanyRealtime(force: true)
-        guard let conversationId = realtimeConversationId,
+        let conversationId = realtimeConversationId ?? pendingRealtimeConversationId
+        pendingRealtimeConversationId = nil
+        guard let conversationId,
               let channel = channels.first(where: { $0.conversationId == conversationId })
                 ?? directMessages.first(where: { $0.id == conversationId })?.chatTarget else {
             return
@@ -1513,7 +1589,7 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     private func startCompanyRealtime(force: Bool = false) {
-        guard configuration.isUsable, let empresaId = configuration.empresaId else { return }
+        guard sceneIsActive, configuration.isUsable, let empresaId = configuration.empresaId else { return }
         guard force || companyResyncTask == nil else { return }
 
         stopCompanyRealtime()
@@ -1528,15 +1604,19 @@ final class CoreChannelsStore: ObservableObject {
                     .sink(
                         receiveCompletion: { [weak self] completion in
                             guard case .failure = completion else { return }
-                            Self.realtimeLogger.error("Channels subscription failed empresa=\(empresaId, privacy: .public)")
-                            self?.lastError = "Convex channels subscription failed"
-                            self?.scheduleRealtimeReconnect()
+                            Task { @MainActor in
+                                guard let self, self.sceneIsActive else { return }
+                                Self.realtimeLogger.error("Channels subscription failed empresa=\(empresaId, privacy: .public)")
+                                self.lastError = "Convex channels subscription failed"
+                                self.scheduleRealtimeReconnect()
+                            }
                         },
                         receiveValue: { [weak self] rows in
                             Task { @MainActor in
-                                self?.resetRealtimeRetry(onlyIfNoPendingConversation: true)
+                                guard let self, self.sceneIsActive else { return }
+                                self.resetRealtimeRetry(onlyIfNoPendingConversation: true)
                                 Self.realtimeLogger.info("Channels subscription value empresa=\(empresaId, privacy: .public) count=\(rows.count, privacy: .public)")
-                                self?.applyChannels(rows.map(\.coreChannel))
+                                self.applyChannels(rows.map(\.coreChannel))
                             }
                         }
                     )
@@ -1545,22 +1625,28 @@ final class CoreChannelsStore: ObservableObject {
                     .sink(
                         receiveCompletion: { [weak self] completion in
                             guard case .failure = completion else { return }
-                            Self.realtimeLogger.error("DM subscription failed empresa=\(empresaId, privacy: .public)")
-                            self?.lastError = "Convex direct messages subscription failed"
-                            self?.scheduleRealtimeReconnect()
+                            Task { @MainActor in
+                                guard let self, self.sceneIsActive else { return }
+                                Self.realtimeLogger.error("DM subscription failed empresa=\(empresaId, privacy: .public)")
+                                self.lastError = "Convex direct messages subscription failed"
+                                self.scheduleRealtimeReconnect()
+                            }
                         },
                         receiveValue: { [weak self] rows in
                             Task { @MainActor in
-                                self?.resetRealtimeRetry(onlyIfNoPendingConversation: true)
+                                guard let self, self.sceneIsActive else { return }
+                                self.resetRealtimeRetry(onlyIfNoPendingConversation: true)
                                 Self.realtimeLogger.info("DM subscription value empresa=\(empresaId, privacy: .public) count=\(rows.count, privacy: .public)")
-                                self?.applyDirectMessages(rows.map(\.coreDirectMessage))
+                                self.applyDirectMessages(rows.map(\.coreDirectMessage))
                             }
                         }
                     )
             } catch {
                 Self.realtimeLogger.error("Company subscription setup failed: \(error.localizedDescription, privacy: .public)")
-                self.lastError = error.localizedDescription
-                self.scheduleRealtimeReconnect()
+                self.publishError(error.localizedDescription)
+                if self.sceneIsActive {
+                    self.scheduleRealtimeReconnect()
+                }
             }
         }
     }
@@ -1574,8 +1660,15 @@ final class CoreChannelsStore: ObservableObject {
         companyResyncTask = nil
     }
 
+    private func stopConvexRealtimeClient() {
+        convexWebSocketSubscription?.cancel()
+        convexWebSocketSubscription = nil
+        convexRealtimeClient = nil
+        convexRealtimeKey = nil
+    }
+
     private func scheduleRealtimeReconnect(conversationId: String? = nil) {
-        guard configuration.isUsable else { return }
+        guard sceneIsActive, configuration.isUsable else { return }
         pendingRealtimeConversationId = conversationId ?? pendingRealtimeConversationId
         guard realtimeRetryTask == nil else { return }
         let delay = realtimeRetryDelay
@@ -1591,11 +1684,11 @@ final class CoreChannelsStore: ObservableObject {
         realtimeRetryTask = nil
         let conversationId = pendingRealtimeConversationId
         pendingRealtimeConversationId = nil
-        guard configuration.isUsable else { return }
+        guard sceneIsActive, configuration.isUsable else { return }
         do {
             _ = try await ensureFreshSession()
         } catch {
-            lastError = error.localizedDescription
+            publishError(error.localizedDescription)
             scheduleRealtimeReconnect(conversationId: conversationId)
             return
         }
@@ -1649,7 +1742,8 @@ final class CoreChannelsStore: ObservableObject {
     private func handleCompanyRealtimeMessage(_ message: CoreMessage) {
         guard message.empresaId == configuration.empresaId,
               message.parentMessageId == nil,
-              message.deletedAt == nil else {
+              message.deletedAt == nil,
+              sceneIsActive else {
             return
         }
 
@@ -1671,14 +1765,17 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     private func refreshChatListActivity() async {
+        guard sceneIsActive else { return }
         guard let client = try? ConvexCoreClient(configuration: configuration) else { return }
         async let loadedChannels = try? client.listChannelsFast()
         async let loadedDirectMessages = try? fetchDirectMessages(using: client)
 
         if let channels = await loadedChannels {
+            guard sceneIsActive, !Task.isCancelled else { return }
             applyChannels(channels)
         }
         if let directMessages = await loadedDirectMessages {
+            guard sceneIsActive, !Task.isCancelled else { return }
             applyDirectMessages(directMessages)
         }
     }
