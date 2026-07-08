@@ -892,19 +892,34 @@ final class CoreChannelsStore: ObservableObject {
             of: #"^/dado(?:\s|$)"#,
             options: [.regularExpression, .caseInsensitive]
         ) != nil && parentMessageId == nil && attachments.isEmpty
+        let diceResult = isDiceCommand ? Int.random(in: 1...6) : nil
+        let diceXp = (diceResult ?? 0) * 10
+        let diceMultiplierUntil = diceResult == 6
+            ? ISO8601DateFormatter().string(from: Date().addingTimeInterval(30 * 60))
+            : nil
+        let diceFlavor = diceResult == 1
+            ? "Mala suerte"
+            : diceResult == 6
+                ? "XP x2 por 30 minutos activo"
+                : "Buen tiro"
         var optimisticMessage = makeOptimisticMessage(
-            content: isDiceCommand ? "" : content,
+            content: diceResult.map { "🎲 Dado Core: \($0) (+\(diceXp) XP)" } ?? content,
             channel: channel,
             conversationId: conversationId,
             parentMessageId: parentMessageId
         )
-        if isDiceCommand {
+        if let diceResult {
             optimisticMessage.metadata = CoreMessageMetadata(
                 kind: "command_card",
                 cardId: optimisticMessage.id,
                 command: "dado",
-                status: "rolling",
-                payload: [:],
+                status: "finished",
+                payload: [
+                    "result": .number(Double(diceResult)),
+                    "xp": .number(Double(diceXp)),
+                    "multiplierUntil": diceMultiplierUntil.map { .string($0) } ?? .string(""),
+                    "flavor": .string(diceFlavor),
+                ],
                 initiatedBy: configuration.userId
             )
         }
@@ -928,9 +943,10 @@ final class CoreChannelsStore: ObservableObject {
                 // Los DMs no tienen canal: el mensaje va solo a la conversación.
                 channelId: channel.isDirectMessage ? nil : channel.id,
                 parentMessageId: parentMessageId,
-                content: content,
+                content: diceResult.map { "🎲 Dado Core: \($0) (+\(diceXp) XP)" } ?? content,
                 attachments: attachments,
-                replyTo: replyQuote
+                replyTo: replyQuote,
+                metadata: optimisticMessage.metadata
             )
             message.author = optimisticMessage.author
             if insertedOptimisticMessage {
