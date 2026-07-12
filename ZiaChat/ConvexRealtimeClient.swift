@@ -57,7 +57,9 @@ final class ConvexRealtimeClient: @unchecked Sendable {
         client.subscribe(
             to: "channels:list",
             with: [
-                "empresaId": empresaId,
+                // Swift Int se codifica como Int64 de Convex; el backend valida
+                // v.number() (float64), así que hay que mandar Double.
+                "empresaId": Double(empresaId),
                 "displayName": displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : displayName,
             ],
             yielding: [CoreRealtimeChannelDTO].self
@@ -68,7 +70,7 @@ final class ConvexRealtimeClient: @unchecked Sendable {
         client.subscribe(
             to: "dms:list",
             with: [
-                "empresaId": empresaId,
+                "empresaId": Double(empresaId),
                 "displayName": displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : displayName,
             ],
             yielding: [CoreRealtimeDirectMessageDTO].self
@@ -81,7 +83,7 @@ final class ConvexRealtimeClient: @unchecked Sendable {
             with: [
                 "conversationId": conversationId,
                 "parentMessageId": nil,
-                "limit": limit,
+                "limit": Double(limit),
             ],
             yielding: CoreRealtimeMessagePageDTO.self
         )

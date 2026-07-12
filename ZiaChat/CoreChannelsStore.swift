@@ -1533,6 +1533,9 @@ final class CoreChannelsStore: ObservableObject {
             do {
                 Self.realtimeLogger.info("Starting message subscription conversation=\(conversationId, privacy: .public)")
                 let service = try await self.ensureConvexRealtimeClient()
+                // Si mientras esperábamos el cliente otra llamada reinició o
+                // detuvo el realtime, no pisar su suscripción.
+                guard !Task.isCancelled, self.realtimeConversationId == conversationId else { return }
                 let limit = max(21, self.messages[conversationId, default: []].count + 5)
                 self.realtimeMessagesSubscription = service
                     .subscribeMessages(conversationId: conversationId, limit: limit)
@@ -1614,6 +1617,7 @@ final class CoreChannelsStore: ObservableObject {
             do {
                 Self.realtimeLogger.info("Starting company subscriptions empresa=\(empresaId, privacy: .public)")
                 let service = try await self.ensureConvexRealtimeClient()
+                guard !Task.isCancelled else { return }
                 let displayName = self.configuration.displayName
                 self.companyChannelsSubscription = service
                     .subscribeChannels(empresaId: empresaId, displayName: displayName)
@@ -1709,6 +1713,10 @@ final class CoreChannelsStore: ObservableObject {
             return
         }
 
+        // Descarta el cliente websocket cacheado: si la suscripción falló por
+        // un socket en mal estado (p. ej. auth rechazada), reutilizarlo dejaría
+        // el realtime muerto de forma permanente.
+        stopConvexRealtimeClient()
         startCompanyRealtime(force: true)
         guard let conversationId,
               realtimeConversationId == conversationId,
