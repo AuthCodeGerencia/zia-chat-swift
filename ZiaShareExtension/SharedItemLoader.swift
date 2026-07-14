@@ -1,5 +1,6 @@
 import Foundation
 import UniformTypeIdentifiers
+import UIKit
 
 /// Contenido recibido desde otra app (WhatsApp, Fotos, Archivos, Safari...).
 struct SharedPayload {
@@ -101,25 +102,120 @@ enum SharedItemLoader {
 
         guard let typeIdentifier else { return nil }
 
-        return await withCheckedContinuation { continuation in
+        if let attachment = await loadFileRepresentation(provider, typeIdentifier: typeIdentifier) {
+            return attachment
+        }
+
+        // Varias apps (especialmente Fotos y WhatsApp) anuncian una imagen o
+        // video, pero no entregan una URL temporal. En esos casos iOS sí puede
+        // entregar los bytes o el objeto directamente.
+        if let data = await loadDataRepresentation(provider, typeIdentifier: typeIdentifier) {
+            return makeAttachment(data: data, provider: provider, typeIdentifier: typeIdentifier)
+        }
+
+        return await loadItemRepresentation(provider, typeIdentifier: typeIdentifier)
+    }
+
+    private static func loadFileRepresentation(
+        _ provider: NSItemProvider,
+        typeIdentifier: String
+    ) async -> CorePendingAttachment? {
+        await withCheckedContinuation { continuation in
             provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { url, _ in
-                // El archivo temporal se borra al salir del handler:
-                // hay que leer los datos aquí mismo.
-                guard let url, let data = try? Data(contentsOf: url) else {
+                guard let url else {
                     continuation.resume(returning: nil)
                     return
                 }
 
-                let fileName = url.lastPathComponent
-                let mimeType =
-                    UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ??
-                    UTType(typeIdentifier)?.preferredMIMEType ??
-                    "application/octet-stream"
+                let accessed = url.startAccessingSecurityScopedResource()
+                defer {
+                    if accessed { url.stopAccessingSecurityScopedResource() }
+                }
 
-                continuation.resume(
-                    returning: CorePendingAttachment(data: data, fileName: fileName, mimeType: mimeType)
-                )
+                guard let data = try? Data(contentsOf: url) else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: makeAttachment(
+                    data: data,
+                    provider: provider,
+                    typeIdentifier: typeIdentifier,
+                    sourceURL: url
+                ))
             }
         }
+    }
+
+    private static func loadDataRepresentation(
+        _ provider: NSItemProvider,
+        typeIdentifier: String
+    ) async -> Data? {
+        await withCheckedContinuation { continuation in
+            provider.loadDataRepresentation(forTypeIdentifier: typeIdentifier) { data, _ in
+                continuation.resume(returning: data)
+            }
+        }
+    }
+
+    private static func loadItemRepresentation(
+        _ provider: NSItemProvider,
+        typeIdentifier: String
+    ) async -> CorePendingAttachment? {
+        await withCheckedContinuation { continuation in
+            provider.loadItem(forTypeIdentifier: typeIdentifier, options: nil) { value, _ in
+                if let data = value as? Data {
+                    continuation.resume(returning: makeAttachment(
+                        data: data,
+                        provider: provider,
+                        typeIdentifier: typeIdentifier
+                    ))
+                } else if let image = value as? UIImage,
+                          let data = image.pngData() {
+                    continuation.resume(returning: CorePendingAttachment(
+                        data: data,
+                        fileName: fileName(provider: provider, type: .png),
+                        mimeType: UTType.png.preferredMIMEType ?? "image/png"
+                    ))
+                } else if let url = value as? URL,
+                          let data = try? Data(contentsOf: url) {
+                    continuation.resume(returning: makeAttachment(
+                        data: data,
+                        provider: provider,
+                        typeIdentifier: typeIdentifier,
+                        sourceURL: url
+                    ))
+                } else {
+                    continuation.resume(returning: nil)
+                }
+            }
+        }
+    }
+
+    private static func makeAttachment(
+        data: Data,
+        provider: NSItemProvider,
+        typeIdentifier: String,
+        sourceURL: URL? = nil
+    ) -> CorePendingAttachment {
+        let type = sourceURL.flatMap { UTType(filenameExtension: $0.pathExtension) }
+            ?? UTType(typeIdentifier)
+            ?? .data
+        return CorePendingAttachment(
+            data: data,
+            fileName: sourceURL?.lastPathComponent ?? fileName(provider: provider, type: type),
+            mimeType: type.preferredMIMEType ?? "application/octet-stream"
+        )
+    }
+
+    private static func fileName(provider: NSItemProvider, type: UTType) -> String {
+        let suggested = provider.suggestedName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let suggested, !suggested.isEmpty {
+            if (suggested as NSString).pathExtension.isEmpty,
+               let fileExtension = type.preferredFilenameExtension {
+                return "\(suggested).\(fileExtension)"
+            }
+            return suggested
+        }
+        return "Compartido.\(type.preferredFilenameExtension ?? "bin")"
     }
 }
