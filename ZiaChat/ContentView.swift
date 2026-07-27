@@ -178,6 +178,10 @@ struct ContentView: View {
                     channelId: destination.channelId,
                     conversationId: destination.conversationId
                 ) {
+                    // A notification can arrive while this conversation still has
+                    // cached messages. Refresh it explicitly because ChatDetailView's
+                    // task may not run again when the user is already on this channel.
+                    await store.open(channel, force: true)
                     store.selectedChannelId = channel.id
                     navigationPath = [channel.id]
                     pushService.consume(destination)
