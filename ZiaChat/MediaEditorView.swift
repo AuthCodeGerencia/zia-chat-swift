@@ -32,18 +32,54 @@ nonisolated struct PickedMovie: Transferable {
 }
 
 /// Resultado Sendable de la exportación; se convierte a CorePendingAttachment
-/// en el MainActor.
+/// en el MainActor. Los videos quedan en disco (`fileURL`) y las imágenes en
+/// memoria (`data`).
 nonisolated struct ExportedMedia: Sendable {
     let data: Data
+    let fileURL: URL?
     let fileName: String
     let mimeType: String
+
+    init(data: Data, fileName: String, mimeType: String) {
+        self.data = data
+        self.fileURL = nil
+        self.fileName = fileName
+        self.mimeType = mimeType
+    }
+
+    init(fileURL: URL, fileName: String, mimeType: String) {
+        self.data = Data()
+        self.fileURL = fileURL
+        self.fileName = fileName
+        self.mimeType = mimeType
+    }
+
+    var sizeBytes: Int {
+        if let fileURL, data.isEmpty {
+            return (try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        }
+        return data.count
+    }
+
+    var pendingAttachment: CorePendingAttachment {
+        if let fileURL, data.isEmpty {
+            return CorePendingAttachment(fileURL: fileURL, fileName: fileName, mimeType: mimeType)
+        }
+        return CorePendingAttachment(data: data, fileName: fileName, mimeType: mimeType)
+    }
 }
 
 /// Elemento seleccionado desde la galería pendiente de edición antes de enviar.
 struct MediaEditorItem: Identifiable {
     let id = UUID()
     /// Imagen de trabajo (con crop/dibujo ya aplicados). `nil` si es video.
-    var image: UIImage?
+    /// Conserva la resolución completa para recortar/dibujar/exportar.
+    private(set) var image: UIImage?
+    /// Versión reducida (≤ 1600 px) para el pager: evita decodificar cada foto
+    /// a resolución completa al abrir el editor.
+    var displayImage: UIImage?
+    /// Versión reducida (≤ 138 px) para la tira de miniaturas.
+    var thumbImage: UIImage?
     /// Estado de edición de video. `nil` si es imagen.
     let video: VideoEditState?
     var quality: MediaSendQuality = .standard
@@ -64,6 +100,36 @@ struct MediaEditorItem: Identifiable {
         self.video = VideoEditState(url: videoURL)
         self.originalFileName = fileName
         self.originalMimeType = mimeType
+    }
+
+    /// Sustituye la imagen de trabajo (crop/dibujo); las versiones reducidas
+    /// se regeneran con `preparingPreviews()`.
+    mutating func replaceImage(_ newImage: UIImage) {
+        image = newImage
+        displayImage = nil
+        thumbImage = nil
+    }
+
+    /// Genera `displayImage`/`thumbImage` fuera del hilo principal.
+    func preparingPreviews() async -> MediaEditorItem {
+        guard let image else { return self }
+        var copy = self
+        // La miniatura se deriva de la versión reducida: un solo decode de la
+        // foto a resolución completa por elemento.
+        let display = await Self.thumbnail(of: image, maxPixel: 1600)
+        copy.displayImage = display
+        copy.thumbImage = await Self.thumbnail(of: display ?? image, maxPixel: 138)
+        return copy
+    }
+
+    private static func thumbnail(of image: UIImage, maxPixel: CGFloat) async -> UIImage? {
+        let pixelWidth = image.size.width * image.scale
+        let pixelHeight = image.size.height * image.scale
+        let largestSide = max(pixelWidth, pixelHeight)
+        guard largestSide > maxPixel, largestSide > 0 else { return image }
+        let factor = maxPixel / largestSide
+        let size = CGSize(width: (pixelWidth * factor).rounded(), height: (pixelHeight * factor).rounded())
+        return await image.byPreparingThumbnail(ofSize: size)
     }
 }
 
@@ -243,8 +309,9 @@ struct MediaEditorView: View {
                         image: image,
                         onCancel: { editingMode = .none },
                         onDone: { cropped in
-                            items[selectedIndex].image = cropped
+                            items[selectedIndex].replaceImage(cropped)
                             editingMode = .none
+                            refreshPreviews(at: selectedIndex)
                         }
                     )
                 }
@@ -254,8 +321,9 @@ struct MediaEditorView: View {
                         image: image,
                         onCancel: { editingMode = .none },
                         onDone: { drawn in
-                            items[selectedIndex].image = drawn
+                            items[selectedIndex].replaceImage(drawn)
                             editingMode = .none
+                            refreshPreviews(at: selectedIndex)
                         }
                     )
                 }
@@ -376,6 +444,18 @@ struct MediaEditorView: View {
         .accessibilityLabel("Guardar como sticker")
     }
 
+    private func refreshPreviews(at index: Int) {
+        guard items.indices.contains(index) else { return }
+        let snapshot = items[index]
+        Task {
+            let prepared = await snapshot.preparingPreviews()
+            guard let current = items.firstIndex(where: { $0.id == snapshot.id }),
+                  items[current].image === prepared.image else { return }
+            items[current].displayImage = prepared.displayImage
+            items[current].thumbImage = prepared.thumbImage
+        }
+    }
+
     private func saveCurrentAsSticker() {
         guard let onSaveSticker,
               let image = currentItem?.image,
@@ -417,7 +497,7 @@ struct MediaEditorView: View {
                 Group {
                     if let video = item.video {
                         VideoEditorPane(state: video)
-                    } else if let image = item.image {
+                    } else if let image = item.displayImage ?? item.image {
                         Image(uiImage: image)
                             .resizable()
                             .scaledToFit()
@@ -563,16 +643,10 @@ struct MediaEditorView: View {
                     } else {
                         throw MediaExportError.invalidItem
                     }
-                    guard exported.data.count <= 15 * 1_024 * 1_024 else {
+                    guard exported.sizeBytes <= 15 * 1_024 * 1_024 else {
                         throw MediaExportError.tooLarge
                     }
-                    attachments.append(
-                        CorePendingAttachment(
-                            data: exported.data,
-                            fileName: exported.fileName,
-                            mimeType: exported.mimeType
-                        )
-                    )
+                    attachments.append(exported.pendingAttachment)
                 } catch let error as MediaExportError {
                     isExporting = false
                     exportError = error.message
@@ -597,7 +671,7 @@ private struct EditorThumbContent: View {
     let item: MediaEditorItem
 
     var body: some View {
-        if let image = item.image {
+        if let image = item.thumbImage ?? item.image {
             Image(uiImage: image)
                 .resizable()
                 .scaledToFill()
@@ -1227,6 +1301,7 @@ nonisolated enum MediaExporter {
 
     // MARK: Imagen
 
+    @concurrent
     static func exportImage(_ image: UIImage, quality: MediaSendQuality) async throws -> ExportedMedia {
         let maxDimension: CGFloat = quality == .hd ? 4096 : 1600
         let jpegQuality: CGFloat = quality == .hd ? 0.92 : 0.7
@@ -1235,10 +1310,15 @@ nonisolated enum MediaExporter {
         let largest = max(working.size.width, working.size.height)
         if largest > maxDimension {
             let factor = maxDimension / largest
-            working = working.zia_resized(to: CGSize(
+            let target = CGSize(
                 width: (working.size.width * factor).rounded(),
                 height: (working.size.height * factor).rounded()
-            ))
+            )
+            if quality == .standard, let thumbnail = working.preparingThumbnail(of: target) {
+                working = thumbnail
+            } else {
+                working = working.zia_resized(to: target)
+            }
         }
         guard let data = working.jpegData(compressionQuality: jpegQuality) else {
             throw MediaExportError.invalidItem
@@ -1253,6 +1333,7 @@ nonisolated enum MediaExporter {
 
     // MARK: Video
 
+    @concurrent
     static func exportVideo(
         url: URL,
         trimStart: Double,
@@ -1269,8 +1350,10 @@ nonisolated enum MediaExporter {
         // Sin recorte, en HD y dentro del límite: enviar el original tal cual
         // (evita recomprimir). Si supera el límite, se recodifica abajo.
         if !isTrimmed, quality == .hd, fileSize > 0, fileSize <= limit {
-            let data = try Data(contentsOf: url)
-            return ExportedMedia(data: data, fileName: originalFileName, mimeType: originalMimeType)
+            // El original lo borra el editor al cerrarse; la copia en la carpeta
+            // de subidas pendientes sobrevive hasta que termina el envío.
+            let copy = try PendingUploadStorage.importFile(at: url, fileName: originalFileName)
+            return ExportedMedia(fileURL: copy, fileName: originalFileName, mimeType: originalMimeType)
         }
 
         let asset = AVURLAsset(url: url)
@@ -1286,25 +1369,21 @@ nonisolated enum MediaExporter {
         }
         session.timeRange = range
 
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("video-export-\(UUID().uuidString).mp4")
+        let outputURL = PendingUploadStorage.makeURL(for: "video-export.mp4")
 
         do {
             try await session.export(to: outputURL, as: .mp4)
         } catch {
             // Algunos códecs no admiten contenedor MP4: reintentar como .mov.
-            let movURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("video-export-\(UUID().uuidString).mov")
+            let movURL = PendingUploadStorage.makeURL(for: "video-export.mov")
             guard let retrySession = AVAssetExportSession(asset: asset, presetName: preset) else {
                 throw MediaExportError.exportFailed
             }
             retrySession.timeRange = range
             do {
                 try await retrySession.export(to: movURL, as: .mov)
-                let data = try Data(contentsOf: movURL)
-                try? FileManager.default.removeItem(at: movURL)
                 return ExportedMedia(
-                    data: data,
+                    fileURL: movURL,
                     fileName: "video-\(Int(Date().timeIntervalSince1970)).mov",
                     mimeType: "video/quicktime"
                 )
@@ -1313,10 +1392,8 @@ nonisolated enum MediaExporter {
             }
         }
 
-        let data = try Data(contentsOf: outputURL)
-        try? FileManager.default.removeItem(at: outputURL)
         return ExportedMedia(
-            data: data,
+            fileURL: outputURL,
             fileName: "video-\(Int(Date().timeIntervalSince1970)).mp4",
             mimeType: "video/mp4"
         )

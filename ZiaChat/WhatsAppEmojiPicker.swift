@@ -1,6 +1,8 @@
 import SwiftUI
 
 struct WhatsAppEmojiPicker: View {
+    /// Altura fija de la rejilla; `nil` para ocupar el alto disponible.
+    var gridHeight: CGFloat? = 210
     let onSelect: (String) -> Void
     let onDelete: () -> Void
 
@@ -57,7 +59,8 @@ struct WhatsAppEmojiPicker: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
             }
-            .frame(height: 210)
+            .frame(height: gridHeight)
+            .frame(maxHeight: gridHeight == nil ? .infinity : nil)
 
             Divider()
 

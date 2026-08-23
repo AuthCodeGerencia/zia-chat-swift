@@ -1,15 +1,16 @@
 import Foundation
 import Combine
 import OSLog
+import UIKit
 
 @MainActor
 final class CoreChannelsStore: ObservableObject {
     private static let realtimeLogger = Logger(subsystem: "authcode.ZiaChat", category: "ConvexRealtime")
 
     @Published var configuration: CoreAppConfiguration
-    @Published var channels: [CoreChannel] = CorePreviewData.channels
+    @Published var channels: [CoreChannel] = []
     @Published var directMessages: [CoreDirectMessage] = []
-    @Published var messages: [String: [CoreMessage]] = CorePreviewData.messages
+    @Published var messages: [String: [CoreMessage]] = [:]
     @Published var messagePins: [String: [CoreMessagePin]] = [:]
     @Published var channelPreviews: [String: CoreMessage] = [:]
     @Published var polls: [String: CorePoll] = [:]
@@ -44,32 +45,74 @@ final class CoreChannelsStore: ObservableObject {
     private var companyResyncTask: Task<Void, Never>?
     private var convexRealtimeClient: ConvexRealtimeClient?
     private var convexRealtimeKey: String?
+    private var convexClientTask: Task<ConvexRealtimeClient, Error>?
+    private var convexClientTaskKey: String?
+    private var isConnectingCompanyRealtime = false
     private var realtimeMessagesSubscription: AnyCancellable?
     private var companyChannelsSubscription: AnyCancellable?
     private var companyDirectMessagesSubscription: AnyCancellable?
+    /// Identifica el arranque vigente de las suscripciones de empresa para
+    /// que un fallo tardío de una suscripción reemplazada no tire la nueva.
+    private var companyRealtimeGeneration = 0
     private var convexWebSocketSubscription: AnyCancellable?
     private var channelSearchTask: Task<Void, Never>?
     private var realtimeConversationId: String?
     private var refreshTask: Task<Void, Never>?
+    private var lastRefreshAt: Date?
+    /// Primer refresh terminado (con o sin éxito): hasta entonces la lista
+    /// vacía muestra el cargador y no el estado "sin chats".
+    @Published private(set) var hasLoadedChatList = false
+    var hasCompletedRefresh: Bool { lastRefreshAt != nil }
+    /// Conversaciones cuya lista de hilos ya se pidió al servidor (o cuya
+    /// página local cubre todo el historial).
+    private var syncedThreadConversationIds: Set<String> = []
     private var sessionRefreshTask: Task<CoreAppConfiguration, Error>?
     private var sessionMaintenanceTask: Task<Void, Never>?
     private var realtimeRetryTask: Task<Void, Never>?
     private var pendingRealtimeConversationId: String?
     private var realtimeRetryDelay: TimeInterval = 2
     private var sceneIsActive = true
-    private let optimisticMessagePrefix = "local-pending-"
+    static let optimisticMessageIdPrefix = "local-pending-"
+    private let optimisticMessagePrefix = CoreChannelsStore.optimisticMessageIdPrefix
+    /// Conversación cuyo ChatDetailView está en pantalla. Solo ella marca leído.
+    private(set) var visibleConversationId: String?
+    private var lastMarkedReadMessageId: [String: String] = [:]
+    private var pendingSends: [String: PendingSend] = [:]
+    private var cacheWriteTask: Task<Void, Never>?
+    private var messagesCacheWriteTasks: [String: Task<Void, Never>] = [:]
+    /// No leídos que tenía cada conversación al abrirla (antes de ponerlos en
+    /// cero); se resuelve a un id cuando llega la primera página del servidor,
+    /// porque la lista en memoria o de caché puede estar desactualizada.
+    private var pendingNewMessagesUnread: [String: Int] = [:]
+    /// Mensaje sobre el que el chat pinta el separador "Nuevos mensajes".
+    @Published private(set) var newMessagesDividerId: [String: String] = [:]
+    /// Borradores por conversación (o por hilo, con el id de la raíz).
+    @Published private(set) var drafts: [String: ComposerDraft] = CoreChannelsStore.loadDrafts()
+    static let draftsDefaultsKey = "zia.composerDrafts"
+    private var draftsWriteTask: Task<Void, Never>?
+    /// Conversaciones puestas en cero localmente; se respeta el cero unos
+    /// segundos mientras el servidor procesa el markRead.
+    private var locallyClearedAt: [String: Date] = [:]
+    private static let locallyClearedGrace: TimeInterval = 10
 
     init(configuration: CoreAppConfiguration) {
         self.configuration = configuration
-        if configuration.isUsable,
-           let cachedChannels = CoreChannelCache.load(userId: configuration.userId),
-           !cachedChannels.isEmpty {
-            self.channels = cachedChannels
+        CoreStoreDiskCache.removeLegacyDefaults()
+        let draftFiles = Set(drafts.values.flatMap { $0.attachments.map(\.storedFileName) })
+        Task.detached(priority: .utility) {
+            PendingUploadStorage.purgeStale(keeping: draftFiles)
+            AttachmentCacheStorage.purgeStale()
         }
-        if configuration.isUsable,
-           let cachedList = CoreChatListCache.load(userId: configuration.userId) {
-            self.directMessages = cachedList.directMessages
-            self.channelPreviews = cachedList.channelPreviews
+        if configuration.isUsable, !Self.isDemo {
+            let userId = configuration.userId
+            if let cachedChannels = CoreStoreDiskCache.loadChannels(userId: userId), !cachedChannels.isEmpty {
+                self.channels = cachedChannels
+                restoreCachedChannelImages(cachedChannels)
+            }
+            if let cachedList = CoreStoreDiskCache.loadChatList(userId: userId) {
+                self.directMessages = cachedList.directMessages
+                self.channelPreviews = cachedList.channelPreviews.mapValues(\.coreMessage)
+            }
         }
         self.selectedChannelId = channels.first?.id
         if configuration.isUsable {
@@ -77,8 +120,174 @@ final class CoreChannelsStore: ObservableObject {
         }
     }
 
+    private func restoreCachedChannelImages(_ cached: [CoreChannel]) {
+        Task { [weak self] in
+            let restored = await Task.detached(priority: .userInitiated) {
+                CoreStoreDiskCache.restoringInlineImages(cached)
+            }.value
+            guard let self else { return }
+            let restoredById = Dictionary(uniqueKeysWithValues: restored.map { ($0.id, $0) })
+            var next = self.channels
+            var changed = false
+            for index in next.indices {
+                guard let source = restoredById[next[index].id]?.metadata else { continue }
+                var metadata = next[index].metadata ?? CoreChannelMetadata()
+                if metadata.iconImage?.isEmpty != false, let icon = source.iconImage, !icon.isEmpty {
+                    metadata.iconImage = icon
+                    changed = true
+                }
+                if metadata.theme?.backgroundImage?.isEmpty != false,
+                   let background = source.theme?.backgroundImage, !background.isEmpty {
+                    var theme = metadata.theme ?? CoreChannelTheme()
+                    theme.backgroundImage = background
+                    metadata.theme = theme
+                    changed = true
+                }
+                next[index].metadata = metadata
+            }
+            if changed {
+                self.channels = next
+            }
+        }
+    }
+
+    /// Persiste la lista de chats con debounce y fuera del hilo principal.
+    private func scheduleCacheWrite() {
+        guard !Self.isDemo else { return }
+        cacheWriteTask?.cancel()
+        cacheWriteTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(750))
+            guard !Task.isCancelled, let self, self.configuration.isUsable else { return }
+            let userId = self.configuration.userId
+            let snapshot = CoreStoreCacheSnapshot(
+                channels: self.channels,
+                directMessages: self.directMessages,
+                channelPreviews: self.channelPreviews.mapValues(CachedMessage.init)
+            )
+            CoreStoreDiskCache.scheduleWrite(snapshot, userId: userId)
+        }
+    }
+
+    /// Persiste los últimos mensajes de la conversación (sin los envíos
+    /// locales pendientes, que no sobreviven al relanzamiento) con debounce.
+    private func scheduleMessagesCacheWrite(conversationId: String) {
+        guard configuration.isUsable, !Self.isDemo else { return }
+        messagesCacheWriteTasks[conversationId]?.cancel()
+        messagesCacheWriteTasks[conversationId] = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(750))
+            guard !Task.isCancelled, let self, self.configuration.isUsable else { return }
+            self.messagesCacheWriteTasks[conversationId] = nil
+            let recent = (self.messages[conversationId] ?? [])
+                .filter { $0.localState == nil }
+                .suffix(CoreMessagesCache.limit)
+                .map(CachedMessage.init)
+            CoreMessagesCache.scheduleWrite(recent, userId: self.configuration.userId, conversationId: conversationId)
+        }
+    }
+
+    @concurrent
+    private static func loadCachedMessages(
+        userId: String,
+        conversationId: String,
+        enabled: Bool
+    ) async -> [CachedMessage]? {
+        guard enabled else { return nil }
+        return CoreMessagesCache.load(userId: userId, conversationId: conversationId)
+    }
+
+    // MARK: - Borradores
+
+    /// Guarda (o elimina, si está vacío) el borrador de una conversación o hilo.
+    func setDraft(_ draft: ComposerDraft?, for key: String, flush: Bool = false) {
+        let next = draft.flatMap { $0.isEmpty ? nil : $0 }
+        guard drafts[key] != next else { return }
+        if let next {
+            drafts[key] = next
+        } else {
+            drafts.removeValue(forKey: key)
+        }
+        scheduleDraftsWrite(flush: flush)
+    }
+
+    private func scheduleDraftsWrite(flush: Bool) {
+        draftsWriteTask?.cancel()
+        let snapshot = drafts
+        guard !flush else {
+            Task.detached(priority: .utility) { Self.persistDrafts(snapshot) }
+            return
+        }
+        draftsWriteTask = Task.detached(priority: .utility) {
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            Self.persistDrafts(snapshot)
+        }
+    }
+
+    private nonisolated static func persistDrafts(_ drafts: [String: ComposerDraft]) {
+        let defaults = UserDefaults.standard
+        guard !drafts.isEmpty, let data = try? JSONEncoder().encode(drafts) else {
+            defaults.removeObject(forKey: draftsDefaultsKey)
+            return
+        }
+        defaults.set(data, forKey: draftsDefaultsKey)
+    }
+
+    private nonisolated static func loadDrafts() -> [String: ComposerDraft] {
+        guard let data = UserDefaults.standard.data(forKey: draftsDefaultsKey) else { return [:] }
+        return (try? JSONDecoder().decode([String: ComposerDraft].self, from: data)) ?? [:]
+    }
+
     convenience init() {
         self.init(configuration: CoreConfigurationStore.load())
+    }
+
+    /// Modo demo (`-zia-demo`, solo DEBUG): datos de muestra y ninguna
+    /// llamada de red. Cada método que toca el servidor lo consulta.
+    nonisolated static var isDemo: Bool { ZiaDemoMode.isEnabled }
+
+#if DEBUG
+    static func preview() -> CoreChannelsStore {
+        let store = CoreChannelsStore(configuration: CoreConfigurationStore.load())
+        store.channels = CorePreviewData.channels
+        store.messages = CorePreviewData.messages
+        store.selectedChannelId = store.channels.first?.id
+        return store
+    }
+
+    static func demo() -> CoreChannelsStore {
+        let store = CoreChannelsStore(configuration: CorePreviewData.configuration)
+        store.channels = CorePreviewData.channels
+        store.directMessages = CorePreviewData.directMessages
+        store.channelPreviews = CorePreviewData.channelPreviews
+        store.messages = CorePreviewData.messages
+        store.messagePins = CorePreviewData.pins
+        store.threadReplies = CorePreviewData.threadReplies
+        store.mentionableUsers = CorePreviewData.users
+        store.selectedChannelId = store.channels.first?.id
+        store.hasLoadedChatList = true
+        store.lastRefreshAt = Date()
+        return store
+    }
+
+    /// Páginas antiguas ya sintetizadas por conversación en modo demo.
+    private var demoOlderPagesLoaded: [String: Int] = [:]
+#endif
+
+    func setVisibleConversation(_ conversationId: String?) {
+        visibleConversationId = conversationId
+    }
+
+    /// Limpia la conversación visible solo si sigue siendo la indicada: al
+    /// reemplazar la ruta, el `onDisappear` del chat anterior puede llegar
+    /// después del `onAppear` del nuevo.
+    func clearVisibleConversation(_ conversationId: String?) {
+        guard visibleConversationId == conversationId else { return }
+        visibleConversationId = nil
+    }
+
+    func closeActiveConversation() {
+        visibleConversationId = nil
+        stopRealtime()
     }
 
     func setSceneActive(_ isActive: Bool) {
@@ -181,10 +390,13 @@ final class CoreChannelsStore: ObservableObject {
             directMessages = []
             return
         }
+        guard !Self.isDemo else { return }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
-            applyDirectMessages(try await fetchDirectMessages(using: client))
+            let loaded = try await fetchDirectMessages(using: client)
+            applyDirectMessages(loaded)
+            hydrateDirectMessagePeers(loaded, using: client)
         } catch {
             lastError = error.localizedDescription
         }
@@ -195,6 +407,9 @@ final class CoreChannelsStore: ObservableObject {
     func startDirectMessage(with user: CoreUserLite) async -> CoreChannel? {
         guard configuration.isUsable, user.id != configuration.userId else { return nil }
         lastError = nil
+        if Self.isDemo {
+            return directMessages.first { $0.peer.id == user.id }.map(dmChannel(for:))
+        }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
@@ -204,7 +419,7 @@ final class CoreChannelsStore: ObservableObject {
             }
             if !directMessages.contains(where: { $0.id == dm.id }) {
                 directMessages.insert(dm, at: 0)
-                saveChatListCache()
+                scheduleCacheWrite()
             }
             return dmChannel(for: dm)
         } catch {
@@ -215,13 +430,25 @@ final class CoreChannelsStore: ObservableObject {
 
     func clearDMUnread(_ dmId: String) {
         guard let index = directMessages.firstIndex(where: { $0.id == dmId }) else { return }
+        locallyClearedAt[dmId] = Date()
+        guard directMessages[index].unreadCount != 0 || directMessages[index].mentionCount != 0 else { return }
         directMessages[index].unreadCount = 0
         directMessages[index].mentionCount = 0
-        saveChatListCache()
+        scheduleCacheWrite()
+    }
+
+    private func isLocallyCleared(_ id: String) -> Bool {
+        guard let clearedAt = locallyClearedAt[id] else { return false }
+        if Date().timeIntervalSince(clearedAt) < Self.locallyClearedGrace {
+            return true
+        }
+        locallyClearedAt[id] = nil
+        return false
     }
 
     func save(configuration: CoreAppConfiguration) {
         self.configuration = configuration
+        guard !Self.isDemo else { return }
         CoreConfigurationStore.save(configuration)
         if configuration.isUsable {
             startSessionMaintenance()
@@ -231,10 +458,11 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     func login(email: String, password: String) async {
+        guard !Self.isDemo else { return }
         isLoggingIn = true
         lastError = nil
         do {
-            let environment = CoreEnvironment.load()
+            let environment = CoreEnvironment.shared
             var loginConfiguration = configuration
             loginConfiguration.supabaseURL = environment.supabaseURL
             loginConfiguration.anonKey = environment.supabaseAnonKey
@@ -266,12 +494,22 @@ final class CoreChannelsStore: ObservableObject {
         stopRealtime()
         stopCompanyRealtime()
         stopConvexRealtimeClient()
+        visibleConversationId = nil
+        lastMarkedReadMessageId = [:]
+        lastRefreshAt = nil
+        hasLoadedChatList = false
+        syncedThreadConversationIds = []
+        pendingNewMessagesUnread = [:]
+        newMessagesDividerId = [:]
+        CoreMessagesCache.removeAll(userId: configuration.userId)
+        drafts = [:]
+        scheduleDraftsWrite(flush: true)
         var next = configuration
         next.clearSession()
         save(configuration: next)
-        channels = CorePreviewData.channels
+        channels = []
         directMessages = []
-        messages = CorePreviewData.messages
+        messages = [:]
         channelPreviews = [:]
         mentionableUsers = []
         channelMembers = [:]
@@ -285,7 +523,7 @@ final class CoreChannelsStore: ObservableObject {
         guard configuration.isUsable else {
             throw CoreAuthError.missingRefreshToken
         }
-        guard force || configuration.accessTokenExpires() else {
+        guard force || configuration.accessTokenExpires(), !Self.isDemo else {
             return configuration
         }
         if let sessionRefreshTask {
@@ -329,7 +567,7 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     func startSessionMaintenance() {
-        guard configuration.isUsable, sessionMaintenanceTask == nil else { return }
+        guard configuration.isUsable, !Self.isDemo, sessionMaintenanceTask == nil else { return }
         sessionMaintenanceTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -401,6 +639,10 @@ final class CoreChannelsStore: ObservableObject {
     /// Marca todo el canal como leído sin abrirlo en Convex.
     func markChannelAsRead(_ channel: CoreChannel) async {
         guard configuration.isUsable, let conversationId = channel.conversationId else { return }
+        if Self.isDemo {
+            clearUnread(for: channel.id)
+            return
+        }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
@@ -440,17 +682,25 @@ final class CoreChannelsStore: ObservableObject {
         isSearchingChannels = false
     }
 
-    func refresh() async {
+    func refresh(force: Bool = false) async {
         guard configuration.isUsable else {
-            channels = CorePreviewData.channels
-            messages = CorePreviewData.messages
-            selectedChannelId = selectedChannelId ?? channels.first?.id
+            channels = []
+            messages = [:]
+            selectedChannelId = nil
             lastError = nil
             return
         }
 
+        if Self.isDemo {
+            hasLoadedChatList = true
+            lastRefreshAt = Date()
+            return
+        }
         if let refreshTask {
             await refreshTask.value
+            return
+        }
+        if !force, let lastRefreshAt, Date().timeIntervalSince(lastRefreshAt) < 5 {
             return
         }
 
@@ -470,37 +720,28 @@ final class CoreChannelsStore: ObservableObject {
             do {
                 let activeConfiguration = try await ensureFreshSession()
                 let client = try ConvexCoreClient(configuration: activeConfiguration)
-                let fastChannels: [CoreChannel]
-                do {
-                    fastChannels = try await client.listChannelsFast()
-                } catch {
-                    fastChannels = try await client.listChannels()
-                }
+                startCompanyRealtime()
+                async let channelsLoad = client.listChannels()
+                async let directMessagesLoad = try? fetchDirectMessages(using: client)
+                async let usersLoad = try? client.listMentionableUsers()
+                let loadedChannels = try await channelsLoad
                 guard sceneIsActive, !Task.isCancelled else { return }
-                applyChannels(fastChannels)
-                if let loadedDirectMessages = try? await fetchDirectMessages(using: client) {
+                applyChannels(loadedChannels)
+                hasLoadedChatList = true
+                if let loadedDirectMessages = await directMessagesLoad {
                     guard sceneIsActive, !Task.isCancelled else { return }
                     applyDirectMessages(loadedDirectMessages)
+                    hydrateDirectMessagePeers(loadedDirectMessages, using: client)
                 }
-                if let users = try? await client.listMentionableUsers() {
+                if let users = await usersLoad {
                     guard sceneIsActive, !Task.isCancelled else { return }
                     mentionableUsers = users
                 }
-                startCompanyRealtime()
-
-                Task { @MainActor [weak self] in
-                    guard let self, self.configuration.isUsable, self.sceneIsActive else { return }
-                    do {
-                        let enrichedChannels = try await client.listChannels()
-                        guard self.sceneIsActive, !Task.isCancelled else { return }
-                        self.applyChannels(enrichedChannels)
-                    } catch {
-                        // Fast channel data is already visible; stale counters are preferable to blocking the list.
-                    }
-                }
+                lastRefreshAt = Date()
             } catch {
                 if sceneIsActive {
                     lastError = error.localizedDescription
+                    hasLoadedChatList = true
                 }
             }
         }
@@ -511,9 +752,6 @@ final class CoreChannelsStore: ObservableObject {
     private func applyChannels(_ loadedChannels: [CoreChannel]) {
         // Carry the previously known icon forward so it does not flash or
         // disappear during a refresh.
-        let previousChannels = Dictionary(
-            uniqueKeysWithValues: channels.map { ($0.id, $0) }
-        )
         let previousIcons = Dictionary(
             channels.compactMap { channel -> (String, String)? in
                 guard let icon = channel.metadata?.iconImage, !icon.isEmpty else { return nil }
@@ -524,8 +762,9 @@ final class CoreChannelsStore: ObservableObject {
 
         let mergedChannels = loadedChannels.map { channel -> CoreChannel in
             var updated = channel
-            if let previous = previousChannels[channel.id] {
-                updated.unreadCount = max(updated.unreadCount, previous.unreadCount)
+            if isLocallyCleared(channel.id) {
+                updated.unreadCount = 0
+                updated.mentionCount = 0
             }
             if updated.metadata?.iconImage?.isEmpty != false,
                let previousIcon = previousIcons[channel.id] {
@@ -536,10 +775,15 @@ final class CoreChannelsStore: ObservableObject {
             return updated
         }
 
-        channels = mergedChannels
+        if channels != mergedChannels {
+            channels = mergedChannels
+            scheduleCacheWrite()
+        }
         mergeChannelPreviews(from: mergedChannels)
-        selectedChannelId = selectedChannelId.flatMap(channel(with:))?.id ?? channels.first?.id
-        CoreChannelCache.save(mergedChannels, userId: configuration.userId)
+        let nextSelectedChannelId = selectedChannelId.flatMap(channel(with:))?.id ?? channels.first?.id
+        if selectedChannelId != nextSelectedChannelId {
+            selectedChannelId = nextSelectedChannelId
+        }
     }
 
     private func mergeChannelPreviews(from loadedChannels: [CoreChannel]) {
@@ -568,20 +812,30 @@ final class CoreChannelsStore: ObservableObject {
             }
             next[conversationId] = incoming
         }
-        channelPreviews = next
-        saveChatListCache()
+        if next != channelPreviews {
+            channelPreviews = next
+            scheduleCacheWrite()
+        }
     }
 
     private func applyDirectMessages(_ loaded: [CoreDirectMessage]) {
         let cachedByID = Dictionary(
             uniqueKeysWithValues: directMessages.map { ($0.id, $0) }
         )
-        directMessages = loaded.map { incoming in
-            guard let cached = cachedByID[incoming.id] else {
-                return incoming
+        let merged = loaded.map { incoming in
+            var merged = ConvexCoreClient.applyingCachedPeerProfile(incoming)
+            if isLocallyCleared(incoming.id) {
+                merged.unreadCount = 0
+                merged.mentionCount = 0
             }
-            var merged = incoming
-            merged.unreadCount = max(incoming.unreadCount, cached.unreadCount)
+            guard let cached = cachedByID[incoming.id] else {
+                return merged
+            }
+            // Un par ya hidratado no debe volver a "Usuario Core" por una
+            // emisión de la suscripción sin perfil.
+            if ConvexCoreClient.peerNeedsHydration(merged.peer), !ConvexCoreClient.peerNeedsHydration(cached.peer) {
+                merged.peer = cached.peer
+            }
             if (cached.lastMessageAt ?? .distantPast) > (incoming.lastMessageAt ?? .distantPast) {
                 merged.lastMessageContent = cached.lastMessageContent
                 merged.lastMessageAt = cached.lastMessageAt
@@ -592,7 +846,33 @@ final class CoreChannelsStore: ObservableObject {
         .sorted {
             ($0.lastMessageAt ?? .distantPast) > ($1.lastMessageAt ?? .distantPast)
         }
-        saveChatListCache()
+        if merged != directMessages {
+            directMessages = merged
+            scheduleCacheWrite()
+        }
+    }
+
+    /// Resuelve nombre/avatar de pares incompletos en segundo plano y parchea
+    /// la lista sin bloquear el refresh.
+    private func hydrateDirectMessagePeers(_ loaded: [CoreDirectMessage], using client: ConvexCoreClient) {
+        guard loaded.contains(where: { ConvexCoreClient.peerNeedsHydration($0.peer) }) else { return }
+        Task { [weak self] in
+            let profiles = await client.fetchMissingPeerProfiles(for: loaded)
+            guard let self, !profiles.isEmpty, self.configuration.isUsable else { return }
+            var next = self.directMessages
+            var changed = false
+            for index in next.indices where ConvexCoreClient.peerNeedsHydration(next[index].peer) {
+                let hydrated = ConvexCoreClient.applyingCachedPeerProfile(next[index])
+                if hydrated.peer != next[index].peer {
+                    next[index] = hydrated
+                    changed = true
+                }
+            }
+            if changed {
+                self.directMessages = next
+                self.scheduleCacheWrite()
+            }
+        }
     }
 
     private func fetchDirectMessages(using client: ConvexCoreClient) async throws -> [CoreDirectMessage] {
@@ -636,28 +916,15 @@ final class CoreChannelsStore: ObservableObject {
         return formatter.date(from: value)
     }
 
-    private func saveChatListCache() {
-        CoreChatListCache.save(
-            directMessages: directMessages,
-            channelPreviews: channelPreviews,
-            userId: configuration.userId
-        )
-    }
-
     func channelForNotification(channelId: String?, conversationId: String?) async throws -> CoreChannel? {
         if let channel = resolveChannel(channelId: channelId, conversationId: conversationId) {
             return channel
         }
+        guard !Self.isDemo else { return nil }
 
         let activeConfiguration = try await ensureFreshSession(restartRealtime: false)
         let client = try ConvexCoreClient(configuration: activeConfiguration)
-        let loadedChannels: [CoreChannel]
-        do {
-            loadedChannels = try await client.listChannelsFast()
-        } catch {
-            loadedChannels = try await client.listChannels()
-        }
-        applyChannels(loadedChannels)
+        applyChannels(try await client.listChannels())
         return resolveChannel(channelId: channelId, conversationId: conversationId)
     }
 
@@ -675,25 +942,56 @@ final class CoreChannelsStore: ObservableObject {
     func open(_ channel: CoreChannel, force: Bool = false) async {
         guard let conversationId = channel.conversationId else { return }
         selectedChannelId = channel.id
+        if !force {
+            pendingNewMessagesUnread[conversationId] = channels.first { $0.id == channel.id }?.unreadCount
+                ?? directMessages.first { $0.id == channel.id }?.unreadCount
+                ?? channel.unreadCount
+            newMessagesDividerId[conversationId] = nil
+        }
         guard configuration.isUsable else { return }
+        if Self.isDemo {
+            resolveNewMessagesDivider(conversationId: conversationId)
+            mergeThreadSummaries(from: messages[conversationId] ?? [], conversationId: conversationId)
+            await loadChannelMembers(for: channel, force: false)
+            clearUnread(for: channel.id)
+            return
+        }
+        // La caché de disco se lee mientras se valida la sesión; si no hay
+        // nada en memoria, siembra la lista y la suscripción la concilia.
+        let userId = configuration.userId
+        let shouldSeedFromCache = !force && messages[conversationId]?.isEmpty != false
+        async let cachedPage = Self.loadCachedMessages(
+            userId: userId,
+            conversationId: conversationId,
+            enabled: shouldSeedFromCache
+        )
         do {
             _ = try await ensureFreshSession()
         } catch {
             lastError = error.localizedDescription
             return
         }
-        await loadChannelMembers(for: channel, force: force)
+        // Si el usuario ya salió del chat mientras esperábamos, no revivir la
+        // suscripción ni marcar leído.
+        guard !Task.isCancelled else { return }
+        if let cached = await cachedPage, !cached.isEmpty, messages[conversationId]?.isEmpty != false {
+            messages[conversationId] = cached.map(\.coreMessage)
+            if hasOlderMessages[conversationId] == nil {
+                hasOlderMessages[conversationId] = true
+            }
+        }
+        let membersLoad = Task { await loadChannelMembers(for: channel, force: force) }
+        // Una suscripción recién creada entrega la página más reciente por sí
+        // sola; solo hace falta resincronizar si ya estaba viva.
+        let subscriptionWasLive = realtimeConversationId == conversationId
         startRealtime(for: channel)
         if !force, messages[conversationId]?.isEmpty == false {
-            let lastReadMessageId = messages[conversationId]?.last?.id
-            Task {
-                if let client = try? ConvexCoreClient(configuration: configuration) {
-                    try? await client.markRead(conversationId: conversationId, lastReadMessageId: lastReadMessageId)
-                }
-            }
+            markReadIfNeeded(conversationId: conversationId, messageId: messages[conversationId]?.last?.id)
             clearUnread(for: channel.id)
-            Task { [weak self] in
-                await self?.resyncRealtimeMessages(conversationId: conversationId)
+            if subscriptionWasLive {
+                Task { [weak self] in
+                    await self?.resyncRealtimeMessages(conversationId: conversationId)
+                }
             }
             return
         }
@@ -707,17 +1005,17 @@ final class CoreChannelsStore: ObservableObject {
                 conversationId: conversationId,
                 limit: pageLimit
             )
-            messages[conversationId] = loaded
+            messages[conversationId] = keepingLocalSends(messages[conversationId] ?? [], in: loaded)
+            resolveNewMessagesDivider(conversationId: conversationId)
             hasOlderMessages[conversationId] = loaded.count == pageLimit
+            scheduleMessagesCacheWrite(conversationId: conversationId)
+            mergeThreadSummaries(from: loaded, conversationId: conversationId)
             clearUnread(for: channel.id)
             isLoadingMessages[conversationId] = false
 
-            Task {
-                try? await client.markRead(conversationId: conversationId, lastReadMessageId: loaded.last?.id)
-            }
-            if let enriched = try? await client.enrichMessages(loaded), !enriched.isEmpty {
-                messages[conversationId] = enriched
-            }
+            guard !Task.isCancelled else { return }
+            markReadIfNeeded(conversationId: conversationId, messageId: loaded.last?.id)
+            await membersLoad.value
         } catch {
             lastError = error.localizedDescription
             isLoadingMessages[conversationId] = false
@@ -728,15 +1026,18 @@ final class CoreChannelsStore: ObservableObject {
 
     /// Carga las marcas de lectura de todos los miembros de la conversación.
     func loadConversationReads(for channel: CoreChannel) async {
-        guard let conversationId = channel.conversationId, configuration.isUsable else { return }
+        guard let conversationId = channel.conversationId, configuration.isUsable, !Self.isDemo else { return }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
             let reads = try await client.listConversationReads(conversationId: conversationId)
-            conversationReads[conversationId] = Dictionary(
+            let next = Dictionary(
                 reads.map { ($0.userId, $0.lastReadAt) },
                 uniquingKeysWith: max
             )
+            if conversationReads[conversationId] != next {
+                conversationReads[conversationId] = next
+            }
         } catch {
             // Los recibos de lectura no son críticos; no se reporta el error.
         }
@@ -756,19 +1057,20 @@ final class CoreChannelsStore: ObservableObject {
     /// Palomitas de un mensaje propio: ✓ enviado, ✓✓ gris leído por algunos,
     /// ✓✓ azul leído por todos los demás miembros.
     func receipt(for message: CoreMessage, in channel: CoreChannel) -> MessageReceipt {
-        let recipients = members(for: channel).filter { $0.id != message.userId }
-        guard !recipients.isEmpty else { return .sent }
-        let readCount = readers(of: message, in: channel).count
-        if readCount == 0 { return .sent }
-        return readCount < recipients.count ? .readBySome : .readByAll
+        MessageReceipt.compute(
+            message: message,
+            members: members(for: channel),
+            reads: conversationReads[message.conversationId] ?? [:]
+        )
     }
 
+    /// Para DMs, `loadChannelMembers` ya guarda al peer en `channelMembers`.
     func members(for channel: CoreChannel) -> [CoreUserLite] {
-        if channel.isDirect,
-           let directMessage = directMessages.first(where: { $0.id == channel.id }) {
+        if let cached = channelMembers[channel.id] { return cached }
+        if channel.isDirect, let directMessage = directMessages.first(where: { $0.id == channel.id }) {
             return [directMessage.peer]
         }
-        return channelMembers[channel.id] ?? []
+        return []
     }
 
     private func loadChannelMembers(for channel: CoreChannel, force: Bool) async {
@@ -779,6 +1081,10 @@ final class CoreChannelsStore: ObservableObject {
             return
         }
         if !force, channelMembers[channel.id] != nil { return }
+        if Self.isDemo {
+            channelMembers[channel.id] = mentionableUsers
+            return
+        }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
@@ -801,6 +1107,16 @@ final class CoreChannelsStore: ObservableObject {
         isLoadingOlderMessages[conversationId] = true
         defer { isLoadingOlderMessages[conversationId] = false }
 
+#if DEBUG
+        if Self.isDemo {
+            try? await Task.sleep(for: .milliseconds(400))
+            let loadedPages = demoOlderPagesLoaded[conversationId, default: 0]
+            demoOlderPagesLoaded[conversationId] = loadedPages + 1
+            hasOlderMessages[conversationId] = loadedPages + 1 < 2
+            mergeMessagePage(CorePreviewData.olderPage(before: oldestMessage), conversationId: conversationId, isLatestPage: false)
+            return
+        }
+#endif
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
@@ -810,22 +1126,21 @@ final class CoreChannelsStore: ObservableObject {
             )
 
             hasOlderMessages[conversationId] = page.count == 21
-            mergeMessagePage(page, conversationId: conversationId)
-
-            if let enriched = try? await client.enrichMessages(page) {
-                mergeMessagePage(enriched, conversationId: conversationId)
-            }
+            mergeMessagePage(page, conversationId: conversationId, isLatestPage: false)
         } catch {
             lastError = error.localizedDescription
         }
     }
 
     func loadMessagePins(for channel: CoreChannel) async {
-        guard configuration.isUsable, let conversationId = channel.conversationId else { return }
+        guard configuration.isUsable, !Self.isDemo, let conversationId = channel.conversationId else { return }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
-            messagePins[conversationId] = try await client.listMessagePins(conversationId: conversationId)
+            let pins = try await client.listMessagePins(conversationId: conversationId)
+            if messagePins[conversationId] != pins {
+                messagePins[conversationId] = pins
+            }
         } catch {
             lastError = error.localizedDescription
         }
@@ -838,6 +1153,22 @@ final class CoreChannelsStore: ObservableObject {
     func togglePin(_ message: CoreMessage) async {
         guard configuration.isUsable else { return }
         lastError = nil
+        if Self.isDemo {
+            if isPinned(message) {
+                messagePins[message.conversationId]?.removeAll { $0.messageId == message.id }
+            } else {
+                let pin = CoreMessagePin(
+                    id: "local-pin-\(message.id)",
+                    empresaId: message.empresaId,
+                    conversationId: message.conversationId,
+                    messageId: message.id,
+                    pinnedBy: configuration.userId,
+                    createdAt: Date()
+                )
+                messagePins[message.conversationId, default: []].insert(pin, at: 0)
+            }
+            return
+        }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
@@ -902,11 +1233,21 @@ final class CoreChannelsStore: ObservableObject {
             : diceResult == 6
                 ? "XP x2 por 30 minutos activo"
                 : "Buen tiro"
+        // Los adjuntos pasan a disco fuera del MainActor: la burbuja optimista
+        // los muestra desde el archivo y la subida usa `fromFile:`.
+        let persisted: [CorePendingAttachment]
+        do {
+            persisted = try await Self.persistAttachments(attachments)
+        } catch {
+            lastError = error.localizedDescription
+            return
+        }
         var optimisticMessage = makeOptimisticMessage(
             content: diceResult.map { "🎲 Dado Core: \($0) (+\(diceXp) XP)" } ?? content,
             channel: channel,
             conversationId: conversationId,
-            parentMessageId: parentMessageId
+            parentMessageId: parentMessageId,
+            attachments: persisted
         )
         if let diceResult {
             optimisticMessage.metadata = CoreMessageMetadata(
@@ -926,65 +1267,168 @@ final class CoreChannelsStore: ObservableObject {
         if let replyQuote, !isDiceCommand {
             optimisticMessage.metadata = CoreMessageMetadata(replyTo: replyQuote)
         }
-        // Thread replies must not be inserted into the main channel timeline.
-        let insertedOptimisticMessage = (!content.isEmpty || isDiceCommand) && parentMessageId == nil
-        if insertedOptimisticMessage {
+        var metadata = optimisticMessage.metadata ?? CoreMessageMetadata()
+        metadata.payload = (metadata.payload ?? [:]).merging(
+            [Self.clientMessageIdKey: .string(optimisticMessage.id)]
+        ) { _, new in new }
+        optimisticMessage.metadata = metadata
+        optimisticMessage.localState = .sending
+        if let parentMessageId {
+            if upsertThreadReply(optimisticMessage, parentMessageId: parentMessageId) {
+                incrementReplyCount(for: parentMessageId, conversationId: conversationId)
+            }
+        } else {
             upsertMessage(optimisticMessage)
         }
 
-        isSending = true
+        await performSend(
+            PendingSend(channel: channel, message: optimisticMessage, attachments: persisted)
+        )
+    }
+
+    /// Envío pendiente de confirmar por el servidor; se conserva tras un fallo
+    /// para poder reintentarlo con el mismo contenido y adjuntos.
+    private struct PendingSend {
+        var channel: CoreChannel
+        var message: CoreMessage
+        var attachments: [CorePendingAttachment]
+    }
+
+    private func performSend(_ pending: PendingSend) async {
+        let optimistic = pending.message
+        let conversationId = optimistic.conversationId
         lastError = nil
+        if Self.isDemo {
+            var message = optimistic
+            message.id = "demo-\(UUID().uuidString)"
+            message.localState = nil
+            if let parentMessageId = optimistic.parentMessageId {
+                replaceThreadReply(id: optimistic.id, with: message, parentMessageId: parentMessageId)
+            } else {
+                removeMessage(id: optimistic.id, conversationId: conversationId)
+                upsertMessage(message)
+                updateChannelPreview(with: message)
+            }
+            return
+        }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
             var message = try await client.sendMessage(
-                empresaId: channel.empresaId,
+                empresaId: pending.channel.empresaId,
                 conversationId: conversationId,
                 // Los DMs no tienen canal: el mensaje va solo a la conversación.
-                channelId: channel.isDirectMessage ? nil : channel.id,
-                parentMessageId: parentMessageId,
-                content: diceResult.map { "🎲 Dado Core: \($0) (+\(diceXp) XP)" } ?? content,
-                attachments: attachments,
-                replyTo: replyQuote,
-                metadata: optimisticMessage.metadata
+                channelId: pending.channel.isDirectMessage ? nil : pending.channel.id,
+                parentMessageId: optimistic.parentMessageId,
+                content: optimistic.content,
+                attachments: pending.attachments,
+                metadata: optimistic.metadata
             )
-            message.author = optimisticMessage.author
-            if insertedOptimisticMessage {
-                removeMessage(id: optimisticMessage.id, conversationId: conversationId)
-            }
-            if let parentMessageId {
-                if upsertThreadReply(message, parentMessageId: parentMessageId) {
-                    incrementReplyCount(for: parentMessageId, conversationId: conversationId)
-                }
+            message.author = optimistic.author
+            pendingSends[optimistic.id] = nil
+            PendingUploadStorage.remove(pending.attachments)
+            if let parentMessageId = optimistic.parentMessageId {
+                replaceThreadReply(id: optimistic.id, with: message, parentMessageId: parentMessageId)
             } else {
+                removeMessage(id: optimistic.id, conversationId: conversationId)
                 upsertMessage(message)
                 updateChannelPreview(with: message)
             }
-            Task {
-                try? await client.markRead(conversationId: conversationId, lastReadMessageId: message.id)
-            }
+            markReadIfNeeded(conversationId: conversationId, messageId: message.id)
         } catch {
-            if insertedOptimisticMessage {
-                removeMessage(id: optimisticMessage.id, conversationId: conversationId)
+            // Si la página en tiempo real ya confirmó el mensaje, la burbuja
+            // optimista desapareció y no hay nada que reintentar.
+            guard isLocalMessagePresent(optimistic) else {
+                PendingUploadStorage.remove(pending.attachments)
+                return
             }
+            pendingSends[optimistic.id] = pending
+            setLocalState(
+                .failed,
+                messageId: optimistic.id,
+                conversationId: conversationId,
+                parentMessageId: optimistic.parentMessageId
+            )
             lastError = error.localizedDescription
+            Haptics.error()
         }
-        isSending = false
+    }
+
+    private func isLocalMessagePresent(_ message: CoreMessage) -> Bool {
+        if let parentMessageId = message.parentMessageId {
+            return threadReplies[parentMessageId]?.contains { $0.id == message.id } ?? false
+        }
+        return messages[message.conversationId]?.contains { $0.id == message.id } ?? false
+    }
+
+    /// Reintenta un mensaje marcado como `.failed`.
+    func retrySend(messageId: String) async {
+        guard let pending = pendingSends.removeValue(forKey: messageId) else { return }
+        setLocalState(
+            .sending,
+            messageId: messageId,
+            conversationId: pending.message.conversationId,
+            parentMessageId: pending.message.parentMessageId
+        )
+        await performSend(pending)
+    }
+
+    /// Descarta un mensaje fallido y sus archivos temporales.
+    func discardFailed(messageId: String) {
+        guard let pending = pendingSends.removeValue(forKey: messageId) else { return }
+        PendingUploadStorage.remove(pending.attachments)
+        let conversationId = pending.message.conversationId
+        if let parentMessageId = pending.message.parentMessageId {
+            threadReplies[parentMessageId]?.removeAll { $0.id == messageId }
+            incrementReplyCount(for: parentMessageId, conversationId: conversationId, by: -1)
+            decrementThreadSummary(parentMessageId: parentMessageId, conversationId: conversationId)
+        } else {
+            removeMessage(id: messageId, conversationId: conversationId)
+        }
+    }
+
+    func isFailedSend(_ message: CoreMessage) -> Bool {
+        message.localState == .failed && pendingSends[message.id] != nil
+    }
+
+    private func setLocalState(
+        _ state: LocalSendState?,
+        messageId: String,
+        conversationId: String,
+        parentMessageId: String?
+    ) {
+        if let parentMessageId {
+            guard var replies = threadReplies[parentMessageId],
+                  let index = replies.firstIndex(where: { $0.id == messageId }) else { return }
+            replies[index].localState = state
+            threadReplies[parentMessageId] = replies
+        } else {
+            guard var list = messages[conversationId],
+                  let index = list.firstIndex(where: { $0.id == messageId }) else { return }
+            list[index].localState = state
+            messages[conversationId] = list
+        }
+    }
+
+    @concurrent
+    private static func persistAttachments(_ attachments: [CorePendingAttachment]) async throws -> [CorePendingAttachment] {
+        try attachments.map { try PendingUploadStorage.persist($0) }
     }
 
     func loadThread(for message: CoreMessage, force: Bool = false) async {
         if !force, threadReplies[message.id] != nil { return }
-        guard configuration.isUsable else { return }
+        guard configuration.isUsable, !Self.isDemo else { return }
 
         isLoadingThread[message.id] = true
         defer { isLoadingThread[message.id] = false }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
-            threadReplies[message.id] = try await client.listThreadReplies(
+            let loaded = try await client.listThreadReplies(
                 conversationId: message.conversationId,
                 parentMessageId: message.id
             )
+            threadReplies[message.id] = keepingLocalSends(threadReplies[message.id] ?? [], in: loaded)
         } catch {
             lastError = error.localizedDescription
         }
@@ -993,8 +1437,12 @@ final class CoreChannelsStore: ObservableObject {
     /// Loads the list of threads (root messages with replies) for a channel.
     func loadChannelThreads(for channel: CoreChannel, force: Bool = false) async {
         guard let conversationId = channel.conversationId else { return }
-        if !force, channelThreads[conversationId] != nil { return }
+        if !force, syncedThreadConversationIds.contains(conversationId) { return }
         guard configuration.isUsable, canPublishSceneUpdates() else { return }
+        if Self.isDemo {
+            mergeThreadSummaries(from: messages[conversationId] ?? [], conversationId: conversationId)
+            return
+        }
 
         setLoadingChannelThreads(true, conversationId: conversationId)
         defer { setLoadingChannelThreads(false, conversationId: conversationId) }
@@ -1004,6 +1452,7 @@ final class CoreChannelsStore: ObservableObject {
             let loadedThreads = try await client.listChannelThreads(conversationId: conversationId)
             publishSceneUpdate {
                 channelThreads[conversationId] = loadedThreads
+                syncedThreadConversationIds.insert(conversationId)
             }
         } catch {
             publishError(error.localizedDescription)
@@ -1014,18 +1463,49 @@ final class CoreChannelsStore: ObservableObject {
     /// Con `force == false` solo consulta los canales que aún no tienen threads
     /// en memoria, así el refresco incremental es barato.
     func loadAllChannelThreads(force: Bool = false) async {
-        guard configuration.isUsable, canPublishSceneUpdates() else { return }
-        let targets = textChannels.filter { channel in
-            guard let conversationId = channel.conversationId else { return false }
-            return force || channelThreads[conversationId] == nil
+        guard configuration.isUsable, !Self.isDemo, canPublishSceneUpdates() else { return }
+        let targets = textChannels.compactMap { channel -> String? in
+            guard let conversationId = channel.conversationId else { return nil }
+            return force || !syncedThreadConversationIds.contains(conversationId) ? conversationId : nil
         }
         guard !targets.isEmpty else { return }
 
         setLoadingAllThreads(true)
         defer { setLoadingAllThreads(false) }
-        for channel in targets {
-            guard canPublishSceneUpdates() else { return }
-            await loadChannelThreads(for: channel, force: force)
+        do {
+            let activeConfiguration = try await ensureFreshSession()
+            let client = try ConvexCoreClient(configuration: activeConfiguration)
+            let loaded = await withTaskGroup(of: (String, [CoreThreadSummary])?.self) { group in
+                var results: [String: [CoreThreadSummary]] = [:]
+                var pending = targets[...]
+                let maxInFlight = 4
+                func enqueue() {
+                    guard let conversationId = pending.popFirst() else { return }
+                    group.addTask { @MainActor in
+                        guard let threads = try? await client.listChannelThreads(conversationId: conversationId) else {
+                            return nil
+                        }
+                        return (conversationId, threads)
+                    }
+                }
+                for _ in 0..<maxInFlight { enqueue() }
+                while let result = await group.next() {
+                    if let (conversationId, threads) = result {
+                        results[conversationId] = threads
+                    }
+                    enqueue()
+                }
+                return results
+            }
+            guard canPublishSceneUpdates(), !loaded.isEmpty else { return }
+            var next = channelThreads
+            for (conversationId, threads) in loaded {
+                next[conversationId] = threads
+            }
+            syncedThreadConversationIds.formUnion(loaded.keys)
+            channelThreads = next
+        } catch {
+            publishError(error.localizedDescription)
         }
     }
 
@@ -1035,40 +1515,15 @@ final class CoreChannelsStore: ObservableObject {
         to root: CoreMessage,
         in channel: CoreChannel
     ) async {
-        let content = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !content.isEmpty || !attachments.isEmpty,
-              let conversationId = channel.conversationId else {
-            return
-        }
-
-        isSending = true
-        lastError = nil
-        defer { isSending = false }
-        do {
-            let activeConfiguration = try await ensureFreshSession()
-            let client = try ConvexCoreClient(configuration: activeConfiguration)
-            var reply = try await client.sendMessage(
-                empresaId: channel.empresaId,
-                conversationId: conversationId,
-                channelId: channel.isDirect ? nil : channel.id,
-                parentMessageId: root.id,
-                content: content,
-                attachments: attachments
-            )
-            reply.author = CoreUserLite(
-                id: configuration.userId,
-                fullName: configuration.displayName.isEmpty ? "You" : configuration.displayName
-            )
-            if upsertThreadReply(reply, parentMessageId: root.id) {
-                incrementReplyCount(for: root.id, conversationId: conversationId)
-            }
-        } catch {
-            lastError = error.localizedDescription
-        }
+        await send(text, attachments: attachments, in: channel, parentMessageId: root.id)
     }
 
     func forward(_ message: CoreMessage, to channel: CoreChannel) async {
         guard configuration.isUsable else { return }
+        if Self.isDemo {
+            await send(message.content, in: channel)
+            return
+        }
         isSending = true
         lastError = nil
         defer { isSending = false }
@@ -1098,7 +1553,7 @@ final class CoreChannelsStore: ObservableObject {
         memberIds: [String] = [],
         adminIds: [String] = []
     ) async {
-        guard configuration.isUsable else { return }
+        guard configuration.isUsable, !Self.isDemo else { return }
         isCreatingChannel = true
         lastError = nil
         do {
@@ -1157,7 +1612,7 @@ final class CoreChannelsStore: ObservableObject {
         memberIds: [String],
         adminIds: [String]
     ) async -> Bool {
-        guard configuration.isUsable else { return false }
+        guard configuration.isUsable, !Self.isDemo else { return false }
         isCreatingChannel = true
         lastError = nil
         defer { isCreatingChannel = false }
@@ -1219,7 +1674,7 @@ final class CoreChannelsStore: ObservableObject {
     /// Elimina (archiva) un canal igual que la web y limpia el estado local.
     @discardableResult
     func deleteChannel(_ channel: CoreChannel) async -> Bool {
-        guard configuration.isUsable else { return false }
+        guard configuration.isUsable, !Self.isDemo else { return false }
         lastError = nil
         do {
             let activeConfiguration = try await ensureFreshSession()
@@ -1238,7 +1693,7 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     func fetchChannelMetadata(_ channel: CoreChannel) async -> CoreChannelMetadata? {
-        guard configuration.isUsable else { return nil }
+        guard configuration.isUsable, !Self.isDemo else { return nil }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
@@ -1252,6 +1707,10 @@ final class CoreChannelsStore: ObservableObject {
     func searchMessages(in channel: CoreChannel, keyword: String) async -> [CoreMessage] {
         let trimmed = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
         guard configuration.isUsable, !trimmed.isEmpty else { return [] }
+        if Self.isDemo {
+            return (messages[channel.conversationId ?? ""] ?? [])
+                .filter { $0.content.localizedCaseInsensitiveContains(trimmed) }
+        }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
@@ -1262,7 +1721,7 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     func loadChannelMemberRoles(channelId: String) async -> [CoreChannelMemberRole] {
-        guard configuration.isUsable else { return [] }
+        guard configuration.isUsable, !Self.isDemo else { return [] }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
@@ -1274,12 +1733,12 @@ final class CoreChannelsStore: ObservableObject {
 
     /// Crea y devuelve el link de invitación del canal usando Convex.
     func createChannelInviteLink(_ channel: CoreChannel) async -> String? {
-        guard configuration.isUsable else { return nil }
+        guard configuration.isUsable, !Self.isDemo else { return nil }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
             let token = try await client.createChannelInviteToken(channelId: channel.id)
-            let baseURL = CoreEnvironment.load().appURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let baseURL = CoreEnvironment.shared.appURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             return "\(baseURL)/dashboard/core?invite=\(token)"
         } catch {
             lastError = error.localizedDescription
@@ -1293,16 +1752,21 @@ final class CoreChannelsStore: ObservableObject {
         let content = newContent.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !content.isEmpty, configuration.isUsable else { return false }
         lastError = nil
+        let previous = messages[message.conversationId]?.first { $0.id == message.id } ?? message
+        applyLocalMessageEdit(messageId: message.id, conversationId: message.conversationId, content: content)
+        if Self.isDemo { return true }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
             _ = try await client.updateMessage(messageId: message.id, content: content)
-            applyLocalMessageEdit(messageId: message.id, conversationId: message.conversationId, content: content)
-            var updatedMessage = message
-            updatedMessage.content = content
-            updatedMessage.editedAt = Date()
             return true
         } catch {
+            applyLocalMessageEdit(
+                messageId: message.id,
+                conversationId: message.conversationId,
+                content: previous.content,
+                editedAt: previous.editedAt
+            )
             lastError = error.localizedDescription
             return false
         }
@@ -1313,6 +1777,11 @@ final class CoreChannelsStore: ObservableObject {
     func deleteMessage(_ message: CoreMessage) async -> Bool {
         guard configuration.isUsable else { return false }
         lastError = nil
+        if Self.isDemo {
+            removeMessage(id: message.id, conversationId: message.conversationId)
+            messagePins[message.conversationId]?.removeAll { $0.messageId == message.id }
+            return true
+        }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
@@ -1331,18 +1800,24 @@ final class CoreChannelsStore: ObservableObject {
         }
     }
 
-    private func applyLocalMessageEdit(messageId: String, conversationId: String, content: String) {
+    private func applyLocalMessageEdit(
+        messageId: String,
+        conversationId: String,
+        content: String,
+        editedAt: Date? = Date()
+    ) {
         if var list = messages[conversationId],
            let index = list.firstIndex(where: { $0.id == messageId }) {
             list[index].content = content
-            list[index].editedAt = Date()
+            list[index].editedAt = editedAt
             messages[conversationId] = list
+            scheduleMessagesCacheWrite(conversationId: conversationId)
         }
         for (rootId, replies) in threadReplies {
             guard let index = replies.firstIndex(where: { $0.id == messageId }) else { continue }
             var copy = replies
             copy[index].content = content
-            copy[index].editedAt = Date()
+            copy[index].editedAt = editedAt
             threadReplies[rootId] = copy
         }
         if var preview = channelPreviews[conversationId], preview.id == messageId {
@@ -1352,7 +1827,7 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     func loadMentionableUsersIfNeeded() async {
-        guard configuration.isUsable, mentionableUsers.isEmpty else { return }
+        guard configuration.isUsable, !Self.isDemo, mentionableUsers.isEmpty else { return }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
@@ -1363,7 +1838,7 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     func loadInternalCompanies() async {
-        guard configuration.isUsable else { return }
+        guard configuration.isUsable, !Self.isDemo else { return }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
@@ -1373,24 +1848,63 @@ final class CoreChannelsStore: ObservableObject {
         }
     }
 
+    /// Alterna la reacción de forma optimista y concilia con la respuesta del
+    /// servidor sin recargar la conversación.
     func react(to message: CoreMessage, emoji: String) async {
-        guard configuration.isUsable else { return }
+        guard configuration.isUsable, message.localState == nil else { return }
+        let conversationId = message.conversationId
+        let previousReactions = messages[conversationId]?.first { $0.id == message.id }?.reactions
+        var reactions = previousReactions ?? []
+        if let existing = reactions.firstIndex(where: { $0.userId == configuration.userId && $0.emoji == emoji }) {
+            reactions.remove(at: existing)
+        } else {
+            reactions.append(
+                CoreReaction(
+                    id: "local-\(UUID().uuidString)",
+                    empresaId: message.empresaId,
+                    messageId: message.id,
+                    userId: configuration.userId,
+                    emoji: emoji,
+                    createdAt: Date()
+                )
+            )
+        }
+        setReactions(reactions, messageId: message.id, conversationId: conversationId)
         lastError = nil
+        guard !Self.isDemo else { return }
         do {
             let activeConfiguration = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: activeConfiguration)
-            try await client.react(
-                empresaId: message.empresaId,
-                conversationId: message.conversationId,
-                messageId: message.id,
-                emoji: emoji
-            )
-            if let channel = channels.first(where: { $0.conversationId == message.conversationId }) {
-                await open(channel, force: true)
+            let toggle = try await client.react(messageId: message.id, emoji: emoji)
+            var reconciled = reactions
+            if !toggle.removed, let confirmed = toggle.reaction {
+                if let placeholder = reconciled.firstIndex(where: {
+                    $0.id.hasPrefix("local-") && $0.userId == configuration.userId && $0.emoji == emoji
+                }) {
+                    reconciled[placeholder] = confirmed
+                } else if !reconciled.contains(where: { $0.id == confirmed.id }) {
+                    reconciled.append(confirmed)
+                }
             }
+            var updated = toggle.message
+            // El servidor puede devolver el documento sin hidratar (sin
+            // reacciones): en ese caso se conserva la conciliación local.
+            if updated.reactions?.isEmpty != false {
+                updated.reactions = reconciled
+            }
+            upsertMessage(updated)
         } catch {
+            setReactions(previousReactions, messageId: message.id, conversationId: conversationId)
             lastError = error.localizedDescription
         }
+    }
+
+    private func setReactions(_ reactions: [CoreReaction]?, messageId: String, conversationId: String) {
+        guard var list = messages[conversationId],
+              let index = list.firstIndex(where: { $0.id == messageId }) else { return }
+        list[index].reactions = reactions
+        messages[conversationId] = list
+        scheduleMessagesCacheWrite(conversationId: conversationId)
     }
 
     private func performChannelSearch(_ keyword: String) async {
@@ -1413,7 +1927,7 @@ final class CoreChannelsStore: ObservableObject {
         }
 
         var messageMatches: [CoreMessage] = []
-        if configuration.isUsable {
+        if configuration.isUsable, !Self.isDemo {
             let channelIds = searchableChannels.map(\.id)
             let activeConfiguration = try? await ensureFreshSession()
             if let activeConfiguration,
@@ -1477,10 +1991,34 @@ final class CoreChannelsStore: ObservableObject {
 
     private func clearUnread(for channelId: CoreChannel.ID) {
         if let index = channels.firstIndex(where: { $0.id == channelId }) {
-            channels[index].unreadCount = 0
-            channels[index].mentionCount = 0
+            locallyClearedAt[channelId] = Date()
+            if channels[index].unreadCount != 0 || channels[index].mentionCount != 0 {
+                channels[index].unreadCount = 0
+                channels[index].mentionCount = 0
+                scheduleCacheWrite()
+            }
         }
         clearDMUnread(channelId)
+    }
+
+    private static let clientMessageIdKey = "clientMessageId"
+
+    /// Coalesce de markRead: una sola llamada por (conversación, último mensaje),
+    /// en vez de una por cada tick de la suscripción.
+    private func markReadIfNeeded(conversationId: String, messageId: String?) {
+        guard let messageId, lastMarkedReadMessageId[conversationId] != messageId else { return }
+        lastMarkedReadMessageId[conversationId] = messageId
+        guard !Self.isDemo else { return }
+        Task { [configuration] in
+            guard let client = try? ConvexCoreClient(configuration: configuration) else { return }
+            do {
+                try await client.markRead(conversationId: conversationId, lastReadMessageId: messageId)
+            } catch {
+                if lastMarkedReadMessageId[conversationId] == messageId {
+                    lastMarkedReadMessageId[conversationId] = nil
+                }
+            }
+        }
     }
 
     private func appendPreviewMessage(_ content: String, channel: CoreChannel, parentMessageId: String?) {
@@ -1503,10 +2041,25 @@ final class CoreChannelsStore: ObservableObject {
         content: String,
         channel: CoreChannel,
         conversationId: String,
-        parentMessageId: String?
+        parentMessageId: String?,
+        attachments: [CorePendingAttachment] = []
     ) -> CoreMessage {
-        CoreMessage(
-            id: "\(optimisticMessagePrefix)\(UUID().uuidString)",
+        let id = "\(optimisticMessagePrefix)\(UUID().uuidString)"
+        let localAttachments = attachments.map { pending in
+            CoreAttachment(
+                id: "local-\(pending.id.uuidString)",
+                empresaId: channel.empresaId,
+                messageId: id,
+                uploaderId: configuration.userId,
+                url: pending.localURL?.absoluteString,
+                fileName: pending.fileName,
+                mimeType: pending.mimeType,
+                sizeBytes: pending.sizeBytes,
+                createdAt: Date()
+            )
+        }
+        return CoreMessage(
+            id: id,
             empresaId: channel.empresaId,
             conversationId: conversationId,
             channelId: channel.id,
@@ -1517,12 +2070,13 @@ final class CoreChannelsStore: ObservableObject {
             author: CoreUserLite(
                 id: configuration.userId,
                 fullName: configuration.displayName.isEmpty ? "You" : configuration.displayName
-            )
+            ),
+            attachments: localAttachments.isEmpty ? nil : localAttachments
         )
     }
 
     private func startRealtime(for channel: CoreChannel, force: Bool = false) {
-        guard sceneIsActive else { return }
+        guard sceneIsActive, !Self.isDemo else { return }
         guard let conversationId = channel.conversationId else { return }
         guard force || realtimeConversationId != conversationId else { return }
 
@@ -1559,18 +2113,15 @@ final class CoreChannelsStore: ObservableObject {
                                 self.resetRealtimeRetry()
                                 Self.realtimeLogger.info("Message subscription value conversation=\(conversationId, privacy: .public) count=\(page.messages.count, privacy: .public)")
                                 let loaded = page.messages.map(\.coreMessage)
-                                self.hasOlderMessages[conversationId] = page.hasMore
+                                if self.hasOlderMessages[conversationId] != page.hasMore {
+                                    self.hasOlderMessages[conversationId] = page.hasMore
+                                }
                                 self.mergeMessagePage(loaded, conversationId: conversationId)
                                 if let latest = loaded.last {
                                     self.updateChannelPreview(with: latest)
-                                    self.clearUnreadForActiveConversation(conversationId)
-                                    Task { [configuration = self.configuration] in
-                                        if let client = try? ConvexCoreClient(configuration: configuration) {
-                                            try? await client.markRead(
-                                                conversationId: conversationId,
-                                                lastReadMessageId: latest.id
-                                            )
-                                        }
+                                    if self.visibleConversationId == conversationId {
+                                        self.clearUnreadForActiveConversation(conversationId)
+                                        self.markReadIfNeeded(conversationId: conversationId, messageId: latest.id)
                                     }
                                 }
                             }
@@ -1581,6 +2132,10 @@ final class CoreChannelsStore: ObservableObject {
                 self.publishError(error.localizedDescription)
                 if self.sceneIsActive {
                     self.scheduleRealtimeReconnect(conversationId: conversationId)
+                    // Mientras llega el reintento, la página se actualiza por HTTP.
+                    Task { [weak self] in
+                        await self?.resyncRealtimeMessages(conversationId: conversationId)
+                    }
                 }
             }
         }
@@ -1595,8 +2150,11 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     func reconnectRealtimeIfNeeded() async {
-        guard sceneIsActive else { return }
-        startCompanyRealtime(force: true)
+        guard sceneIsActive, !Self.isDemo else { return }
+        if !isConnectingCompanyRealtime {
+            let companyIsLive = companyChannelsSubscription != nil && companyDirectMessagesSubscription != nil
+            startCompanyRealtime(force: !companyIsLive)
+        }
         let conversationId = realtimeConversationId ?? pendingRealtimeConversationId
         pendingRealtimeConversationId = nil
         guard let conversationId,
@@ -1604,15 +2162,24 @@ final class CoreChannelsStore: ObservableObject {
                 ?? directMessages.first(where: { $0.id == conversationId })?.chatTarget else {
             return
         }
-        startRealtime(for: channel, force: true)
+        startRealtime(for: channel, force: realtimeConversationId != conversationId)
     }
 
     private func startCompanyRealtime(force: Bool = false) {
-        guard sceneIsActive, configuration.isUsable, let empresaId = configuration.empresaId else { return }
+        guard sceneIsActive, configuration.isUsable, !Self.isDemo, let empresaId = configuration.empresaId else { return }
         guard force || companyResyncTask == nil else { return }
 
         stopCompanyRealtime()
+        isConnectingCompanyRealtime = true
+        companyRealtimeGeneration += 1
+        let generation = companyRealtimeGeneration
         companyResyncTask = Task { [weak self] in
+            // Una tarea reemplazada llega aquí cancelada; el flag pertenece a la vigente.
+            defer {
+                if !Task.isCancelled {
+                    self?.isConnectingCompanyRealtime = false
+                }
+            }
             guard let self, self.configuration.empresaId == empresaId else { return }
             do {
                 Self.realtimeLogger.info("Starting company subscriptions empresa=\(empresaId, privacy: .public)")
@@ -1625,9 +2192,10 @@ final class CoreChannelsStore: ObservableObject {
                         receiveCompletion: { [weak self] completion in
                             guard case .failure = completion else { return }
                             Task { @MainActor in
-                                guard let self, self.sceneIsActive else { return }
+                                guard let self, self.sceneIsActive,
+                                      self.companyRealtimeGeneration == generation else { return }
                                 Self.realtimeLogger.error("Channels subscription failed empresa=\(empresaId, privacy: .public)")
-                                self.lastError = "Convex channels subscription failed"
+                                self.companyChannelsSubscription = nil
                                 self.scheduleRealtimeReconnect()
                             }
                         },
@@ -1646,9 +2214,10 @@ final class CoreChannelsStore: ObservableObject {
                         receiveCompletion: { [weak self] completion in
                             guard case .failure = completion else { return }
                             Task { @MainActor in
-                                guard let self, self.sceneIsActive else { return }
+                                guard let self, self.sceneIsActive,
+                                      self.companyRealtimeGeneration == generation else { return }
                                 Self.realtimeLogger.error("DM subscription failed empresa=\(empresaId, privacy: .public)")
-                                self.lastError = "Convex direct messages subscription failed"
+                                self.companyDirectMessagesSubscription = nil
                                 self.scheduleRealtimeReconnect()
                             }
                         },
@@ -1672,6 +2241,7 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     private func stopCompanyRealtime() {
+        isConnectingCompanyRealtime = false
         companyChannelsSubscription?.cancel()
         companyChannelsSubscription = nil
         companyDirectMessagesSubscription?.cancel()
@@ -1685,13 +2255,16 @@ final class CoreChannelsStore: ObservableObject {
         convexWebSocketSubscription = nil
         convexRealtimeClient = nil
         convexRealtimeKey = nil
+        convexClientTask?.cancel()
+        convexClientTask = nil
+        convexClientTaskKey = nil
     }
 
     private func scheduleRealtimeReconnect(conversationId: String? = nil) {
         guard sceneIsActive, configuration.isUsable else { return }
         pendingRealtimeConversationId = conversationId ?? pendingRealtimeConversationId
         guard realtimeRetryTask == nil else { return }
-        let delay = realtimeRetryDelay
+        let delay = realtimeRetryDelay * Double.random(in: 0.8...1.25)
         realtimeRetryDelay = min(realtimeRetryDelay * 2, 30)
         realtimeRetryTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
@@ -1739,18 +2312,46 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     private func ensureConvexRealtimeClient() async throws -> ConvexRealtimeClient {
+        guard !Self.isDemo else { throw CoreAuthError.missingRefreshToken }
         let activeConfiguration = try await ensureFreshSession(restartRealtime: false)
         let realtimeKey = "\(activeConfiguration.convexURL)|\(activeConfiguration.accessToken)"
         if let convexRealtimeClient, convexRealtimeKey == realtimeKey {
             Self.realtimeLogger.info("Reusing Convex realtime client")
             return convexRealtimeClient
         }
-        Self.realtimeLogger.info("Creating Convex realtime client")
-        let client = try await Task.detached(priority: .utility) {
-            let service = try ConvexRealtimeClient(configuration: activeConfiguration)
-            await service.authenticate()
-            return service
-        }.value
+        let task: Task<ConvexRealtimeClient, Error>
+        if let convexClientTask, convexClientTaskKey == realtimeKey {
+            task = convexClientTask
+        } else {
+            Self.realtimeLogger.info("Creating Convex realtime client")
+            task = Task.detached(priority: .utility) {
+                let service = try ConvexRealtimeClient(configuration: activeConfiguration)
+                await service.authenticate()
+                return service
+            }
+            convexClientTask = task
+            convexClientTaskKey = realtimeKey
+        }
+        let client: ConvexRealtimeClient
+        do {
+            client = try await task.value
+        } catch {
+            if convexClientTask == task {
+                convexClientTask = nil
+                convexClientTaskKey = nil
+            }
+            throw error
+        }
+        guard convexClientTask == task else {
+            // Otro awaiter ya instaló este cliente, o fue descartado mientras conectaba.
+            if let convexRealtimeClient, convexRealtimeKey == realtimeKey {
+                return convexRealtimeClient
+            }
+            try Task.checkCancellation()
+            return try await ensureConvexRealtimeClient()
+        }
+        convexClientTask = nil
+        convexClientTaskKey = nil
         Self.realtimeLogger.info("Convex realtime client ready")
         convexWebSocketSubscription?.cancel()
         convexWebSocketSubscription = client
@@ -1788,24 +2389,8 @@ final class CoreChannelsStore: ObservableObject {
         }
     }
 
-    private func refreshChatListActivity() async {
-        guard sceneIsActive else { return }
-        guard let client = try? ConvexCoreClient(configuration: configuration) else { return }
-        async let loadedChannels = try? client.listChannelsFast()
-        async let loadedDirectMessages = try? fetchDirectMessages(using: client)
-
-        if let channels = await loadedChannels {
-            guard sceneIsActive, !Task.isCancelled else { return }
-            applyChannels(channels)
-        }
-        if let directMessages = await loadedDirectMessages {
-            guard sceneIsActive, !Task.isCancelled else { return }
-            applyDirectMessages(directMessages)
-        }
-    }
-
     private func resyncRealtimeMessages(conversationId: String) async {
-        guard realtimeConversationId == conversationId,
+        guard !Self.isDemo, realtimeConversationId == conversationId,
               let client = try? ConvexCoreClient(configuration: configuration) else {
             return
         }
@@ -1818,172 +2403,14 @@ final class CoreChannelsStore: ObservableObject {
             return
         }
 
-        if let enriched = try? await client.enrichMessages(loaded) {
-            mergeMessagePage(enriched, conversationId: conversationId)
-        } else {
-            mergeMessagePage(loaded, conversationId: conversationId)
-        }
+        mergeMessagePage(loaded, conversationId: conversationId)
         if let latest = loaded.last {
             updateChannelPreview(with: latest)
-            clearUnreadForActiveConversation(conversationId)
-            try? await client.markRead(
-                conversationId: conversationId,
-                lastReadMessageId: latest.id
-            )
-        }
-    }
-
-    private func handleRealtimeInsert(_ message: CoreMessage) async {
-        guard message.conversationId == realtimeConversationId else { return }
-        guard message.deletedAt == nil else { return }
-
-        if let parentMessageId = message.parentMessageId {
-            if threadReplies[parentMessageId] != nil,
-               let client = try? ConvexCoreClient(configuration: configuration) {
-                let enriched = await client.enrichRealtimeMessage(message)
-                if upsertThreadReply(enriched, parentMessageId: parentMessageId) {
-                    incrementReplyCount(for: parentMessageId, conversationId: message.conversationId)
-                }
-            } else {
-                // Thread not loaded locally: still refresh counts and the
-                // threads overview so unread indicators stay accurate.
-                incrementReplyCount(for: parentMessageId, conversationId: message.conversationId)
-                bumpThreadSummary(with: message, parentMessageId: parentMessageId)
-            }
-            return
-        }
-
-        if !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            updateChannelPreview(with: message)
-        }
-        removeMatchingOptimisticMessage(for: message)
-        let isAttachmentOnly = message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && message.metadata?.isCommandCard != true
-        if !isAttachmentOnly {
-            upsertMessage(message)
-        }
-        clearUnreadForActiveConversation(message.conversationId)
-
-        if let client = try? ConvexCoreClient(configuration: configuration) {
-            try? await client.markRead(conversationId: message.conversationId, lastReadMessageId: message.id)
-            let enriched = await client.enrichRealtimeMessage(message)
-            if !isAttachmentOnly || enriched.attachments?.isEmpty == false {
-                upsertMessage(enriched)
-                updateChannelPreview(with: enriched)
+            if visibleConversationId == conversationId {
+                clearUnreadForActiveConversation(conversationId)
+                markReadIfNeeded(conversationId: conversationId, messageId: latest.id)
             }
         }
-
-        // Poll announcements ("📊 …") need their poll loaded so the voting UI
-        // renders instead of plain text.
-        if message.content.hasPrefix("📊"),
-           polls[message.id] == nil,
-           let channel = channels.first(where: { $0.conversationId == message.conversationId }) {
-            await loadPolls(for: channel)
-        }
-    }
-
-    private func handleRealtimeUpdate(_ message: CoreMessage) async {
-        guard message.conversationId == realtimeConversationId else { return }
-
-        if message.deletedAt != nil || message.parentMessageId != nil {
-            removeMessage(id: message.id, conversationId: message.conversationId)
-            return
-        }
-
-        upsertMessage(message)
-        updateChannelPreview(with: message)
-        if let client = try? ConvexCoreClient(configuration: configuration) {
-            let enriched = await client.enrichRealtimeMessage(message)
-            upsertMessage(enriched)
-            updateChannelPreview(with: enriched)
-        }
-    }
-
-    private func handleRealtimeDelete(_ message: CoreMessage) {
-        guard message.conversationId == realtimeConversationId else { return }
-        removeMessage(id: message.id, conversationId: message.conversationId)
-        messagePins[message.conversationId]?.removeAll { $0.messageId == message.id }
-    }
-
-    private func setRealtimeError(_ message: String) {
-        lastError = message
-    }
-
-    private func handleRealtimeReaction(_ reaction: CoreReaction?, deletedReactionId: String?) async {
-        guard let reaction else { return }
-
-        for (conversationId, conversationMessages) in messages where conversationId == realtimeConversationId {
-            guard let messageIndex = conversationMessages.firstIndex(where: { $0.id == reaction.messageId }) else { continue }
-            var nextMessages = conversationMessages
-            var reactions = nextMessages[messageIndex].reactions ?? []
-
-            if let deletedReactionId {
-                reactions.removeAll { $0.id == deletedReactionId }
-            } else if let reactionIndex = reactions.firstIndex(where: { $0.id == reaction.id }) {
-                reactions[reactionIndex] = reaction
-            } else {
-                reactions.append(reaction)
-            }
-
-            nextMessages[messageIndex].reactions = reactions
-            messages[conversationId] = nextMessages
-            return
-        }
-
-        // The reactions stream is company-wide because the table has no
-        // conversation_id column. Ignore events for messages outside this chat.
-    }
-
-    private func handleRealtimeAttachment(
-        _ attachment: CoreAttachment?,
-        deletedAttachmentId: String?
-    ) async {
-        guard let attachment,
-              let messageId = attachment.messageId,
-              let conversationId = realtimeConversationId,
-              let messageIndex = messages[conversationId]?.firstIndex(where: { $0.id == messageId }) else {
-            return
-        }
-
-        if let deletedAttachmentId {
-            messages[conversationId]?[messageIndex].attachments?.removeAll {
-                $0.id == deletedAttachmentId
-            }
-            return
-        }
-
-        var attachments = messages[conversationId]?[messageIndex].attachments ?? []
-        if let attachmentIndex = attachments.firstIndex(where: { $0.id == attachment.id }) {
-            attachments[attachmentIndex] = attachment
-        } else {
-            attachments.append(attachment)
-        }
-        messages[conversationId]?[messageIndex].attachments = attachments
-
-        // Storage rows may need a short-lived signed URL. Hydrate only this
-        // message after the realtime event, never the full conversation.
-        if attachment.resolvedURL == nil,
-           let client = try? ConvexCoreClient(configuration: configuration),
-           let message = messages[conversationId]?[messageIndex] {
-            let enriched = await client.enrichRealtimeMessage(message)
-            upsertMessage(enriched)
-        }
-    }
-
-    private func handleRealtimePin(_ pin: CoreMessagePin?, deletedPinId: String?) {
-        guard let pin, pin.conversationId == realtimeConversationId else { return }
-        var pins = messagePins[pin.conversationId] ?? []
-
-        if let deletedPinId {
-            pins.removeAll { $0.id == deletedPinId || $0.messageId == pin.messageId }
-        } else if let index = pins.firstIndex(where: { $0.id == pin.id || $0.messageId == pin.messageId }) {
-            pins[index] = pin
-        } else {
-            pins.append(pin)
-        }
-
-        pins.sort { $0.createdAt > $1.createdAt }
-        messagePins[pin.conversationId] = pins
     }
 
     private func upsertMessage(_ message: CoreMessage) {
@@ -1997,21 +2424,61 @@ final class CoreChannelsStore: ObservableObject {
                 copy.attachments = current[index].attachments
             }
             copy.parent = message.parent ?? current[index].parent
+            copy.replyCount = message.replyCount ?? current[index].replyCount
             current[index] = copy
+        } else if let last = current.last, message.createdAt < last.createdAt {
+            let insertIndex = current.lastIndex { $0.createdAt <= message.createdAt }
+                .map { $0 + 1 } ?? 0
+            current.insert(message, at: insertIndex)
         } else {
             current.append(message)
         }
-
-        current.sort { $0.createdAt < $1.createdAt }
         messages[message.conversationId] = current
+        scheduleMessagesCacheWrite(conversationId: message.conversationId)
+        prefetchImages(in: message)
     }
 
-    private func mergeMessagePage(_ page: [CoreMessage], conversationId: String) {
-        guard !page.isEmpty else { return }
-        var byID = Dictionary(
-            uniqueKeysWithValues: messages[conversationId, default: []].map { ($0.id, $0) }
-        )
+    /// Precalienta las fotos del mensaje al tamaño de burbuja para que
+    /// aparezcan ya decodificadas al hacer scroll.
+    private func prefetchImages(in message: CoreMessage) {
+        guard let attachments = message.attachments, !attachments.isEmpty else { return }
+        let scale = UITraitCollection.current.displayScale
+        guard scale > 0 else { return }
+        for attachment in attachments where attachment.isImage && !attachment.isGIF {
+            guard let url = attachment.resolvedURL else { continue }
+            Task(priority: .utility) {
+                await RemoteImageLoader.shared.prefetch(url, targetSize: CGSize(width: 220, height: 180), scale: scale)
+            }
+        }
+    }
 
+    /// `isLatestPage`: la página es la más reciente del servidor, así que los
+    /// mensajes en memoria dentro de su ventana de tiempo que no aparezcan en
+    /// ella fueron borrados mientras la app no escuchaba.
+    private func mergeMessagePage(_ page: [CoreMessage], conversationId: String, isLatestPage: Bool = true) {
+        guard !page.isEmpty else { return }
+        let current = messages[conversationId, default: []]
+        var byID = Dictionary(uniqueKeysWithValues: current.map { ($0.id, $0) })
+
+        if isLatestPage, let oldest = page.first?.createdAt {
+            let pageIds = Set(page.map(\.id))
+            for message in current where message.createdAt >= oldest
+                && !pageIds.contains(message.id)
+                && !message.id.hasPrefix(optimisticMessagePrefix)
+                && message.localState == nil {
+                byID[message.id] = nil
+            }
+        }
+
+        if current.contains(where: { $0.id.hasPrefix(optimisticMessagePrefix) }) {
+            for message in page where !message.id.hasPrefix(optimisticMessagePrefix) {
+                for candidate in current where isOptimisticMessage(candidate, confirmedBy: message) {
+                    byID[candidate.id] = nil
+                }
+            }
+        }
+
+        var newMessages: [CoreMessage] = []
         for message in page {
             if let existing = byID[message.id] {
                 var copy = message
@@ -2022,32 +2489,123 @@ final class CoreChannelsStore: ObservableObject {
                     copy.attachments = existing.attachments
                 }
                 copy.parent = message.parent ?? existing.parent
+                copy.replyCount = message.replyCount ?? existing.replyCount
                 byID[message.id] = copy
             } else {
                 byID[message.id] = message
+                if isLatestPage {
+                    newMessages.append(message)
+                }
             }
         }
+        // Solo las últimas (las visibles al abrir) para acotar el trabajo en la primera carga.
+        for message in newMessages.suffix(10) {
+            prefetchImages(in: message)
+        }
 
-        messages[conversationId] = byID.values.sorted { $0.createdAt < $1.createdAt }
+        let merged = byID.values.sorted { $0.createdAt < $1.createdAt }
+        if merged != current {
+            messages[conversationId] = merged
+            scheduleMessagesCacheWrite(conversationId: conversationId)
+        }
+        if isLatestPage {
+            resolveNewMessagesDivider(conversationId: conversationId)
+        }
+        mergeThreadSummaries(from: page, conversationId: conversationId)
+    }
+
+    /// Primer no leído al abrir (índice cronológico `count - unread`) sobre la
+    /// primera página fresca del servidor; sin separador si es propio.
+    private func resolveNewMessagesDivider(conversationId: String) {
+        guard let unread = pendingNewMessagesUnread.removeValue(forKey: conversationId) else { return }
+        guard unread > 0, let list = messages[conversationId], !list.isEmpty else { return }
+        let candidate = list[max(0, list.count - unread)]
+        guard candidate.userId != configuration.userId else { return }
+        newMessagesDividerId[conversationId] = candidate.id
+    }
+
+    private nonisolated static func threadSummaries(from page: [CoreMessage]) -> [CoreThreadSummary] {
+        page
+            .filter { $0.parentMessageId == nil && $0.deletedAt == nil && ($0.replyCount ?? 0) > 0 }
+            .map {
+                CoreThreadSummary(
+                    root: $0,
+                    replyCount: $0.replyCount ?? 0,
+                    lastReplyAt: $0.createdAt,
+                    lastReplyUserId: nil
+                )
+            }
+    }
+
+    /// Mantiene la lista de hilos del canal a partir de la página de mensajes
+    /// ya descargada, sin una consulta extra al servidor.
+    private func mergeThreadSummaries(from page: [CoreMessage], conversationId: String) {
+        let current = channelThreads[conversationId] ?? []
+        var byID = Dictionary(current.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for summary in Self.threadSummaries(from: page) {
+            if var existing = byID[summary.id] {
+                existing.root = summary.root
+                existing.replyCount = max(existing.replyCount, summary.replyCount)
+                byID[summary.id] = existing
+            } else {
+                byID[summary.id] = summary
+            }
+        }
+        for message in page where message.parentMessageId == nil
+            && (message.deletedAt != nil || (message.replyCount ?? 0) == 0) {
+            byID[message.id] = nil
+        }
+        let next = byID.values.sorted { $0.lastReplyAt > $1.lastReplyAt }
+        if next != current || channelThreads[conversationId] == nil {
+            channelThreads[conversationId] = next
+        }
+        if hasOlderMessages[conversationId] == false {
+            syncedThreadConversationIds.insert(conversationId)
+        }
     }
 
     private func removeMessage(id: String, conversationId: String) {
         messages[conversationId, default: []].removeAll { $0.id == id }
+        scheduleMessagesCacheWrite(conversationId: conversationId)
     }
 
-    private func removeMatchingOptimisticMessage(for message: CoreMessage) {
-        let pendingWindow: TimeInterval = 30
-        messages[message.conversationId, default: []].removeAll { candidate in
-            candidate.id.hasPrefix(optimisticMessagePrefix) &&
-            candidate.userId == message.userId &&
-            candidate.content == message.content &&
-            abs(candidate.createdAt.timeIntervalSince(message.createdAt)) < pendingWindow
+    /// Al recargar desde el servidor se conservan los mensajes locales que
+    /// siguen enviándose o fallaron, para no perder su texto ni el reintento.
+    private func keepingLocalSends(_ current: [CoreMessage], in loaded: [CoreMessage]) -> [CoreMessage] {
+        let local = current.filter { $0.localState != nil }
+        guard !local.isEmpty else { return loaded }
+        var kept: [CoreMessage] = []
+        for candidate in local {
+            // Si la página ya trae el mensaje confirmado, el local sobra (y no
+            // debe reintentarse: crearía un duplicado en el servidor).
+            if loaded.contains(where: { isOptimisticMessage(candidate, confirmedBy: $0) }) {
+                if let pending = pendingSends.removeValue(forKey: candidate.id) {
+                    PendingUploadStorage.remove(pending.attachments)
+                }
+            } else {
+                kept.append(candidate)
+            }
         }
+        guard !kept.isEmpty else { return loaded }
+        return (loaded + kept).sorted { $0.createdAt < $1.createdAt }
+    }
+
+    /// El servidor devuelve `metadata.payload.clientMessageId`; si lo omite,
+    /// se usa autor + contenido en una ventana corta.
+    private func isOptimisticMessage(_ candidate: CoreMessage, confirmedBy message: CoreMessage) -> Bool {
+        guard candidate.id.hasPrefix(optimisticMessagePrefix) else { return false }
+        if case .string(let clientMessageId)? = message.metadata?.payload?[Self.clientMessageIdKey] {
+            return clientMessageId == candidate.id
+        }
+        let pendingWindow: TimeInterval = 30
+        return candidate.userId == message.userId
+            && candidate.content == message.content
+            && abs(candidate.createdAt.timeIntervalSince(message.createdAt)) < pendingWindow
     }
 
     private func clearUnreadForActiveConversation(_ conversationId: String) {
-        guard let channel = channels.first(where: { $0.conversationId == conversationId }) else { return }
-        clearUnread(for: channel.id)
+        // El id de un DM es su conversationId; clearUnread cae en clearDMUnread.
+        clearUnread(for: channels.first(where: { $0.conversationId == conversationId })?.id ?? conversationId)
     }
 
     private func updateChannelPreview(with message: CoreMessage) {
@@ -2057,26 +2615,64 @@ final class CoreChannelsStore: ObservableObject {
                currentDate > message.createdAt {
                 return
             }
+            if directMessages[index].lastMessageAt == message.createdAt,
+               directMessages[index].lastMessageContent == message.content,
+               directMessages[index].lastMessageUserId == message.userId {
+                return
+            }
             directMessages[index].lastMessageUserId = message.userId
             directMessages[index].lastMessageContent = message.content
             directMessages[index].lastMessageAt = message.createdAt
             directMessages.sort { first, second in
                 (first.lastMessageAt ?? .distantPast) > (second.lastMessageAt ?? .distantPast)
             }
-            saveChatListCache()
+            scheduleCacheWrite()
             return
         }
         if let current = channelPreviews[message.conversationId],
-           current.createdAt > message.createdAt {
+           current.createdAt > message.createdAt || current == message {
             return
         }
         channelPreviews[message.conversationId] = message
-        saveChatListCache()
+        scheduleCacheWrite()
     }
 
-    private func incrementReplyCount(for messageId: String, conversationId: String) {
+    private func incrementReplyCount(for messageId: String, conversationId: String, by delta: Int = 1) {
         guard let index = messages[conversationId]?.firstIndex(where: { $0.id == messageId }) else { return }
-        messages[conversationId]?[index].replyCount = (messages[conversationId]?[index].replyCount ?? 0) + 1
+        messages[conversationId]?[index].replyCount = max(0, (messages[conversationId]?[index].replyCount ?? 0) + delta)
+    }
+
+    /// Sustituye la respuesta optimista por la confirmada por el servidor.
+    private func replaceThreadReply(id optimisticId: String, with reply: CoreMessage, parentMessageId: String) {
+        var replies = threadReplies[parentMessageId, default: []]
+        guard let index = replies.firstIndex(where: { $0.id == optimisticId }) else {
+            if upsertThreadReply(reply, parentMessageId: parentMessageId) {
+                incrementReplyCount(for: parentMessageId, conversationId: reply.conversationId)
+            }
+            return
+        }
+        // loadThread pudo traer ya la respuesta confirmada: se quita la
+        // optimista en lugar de duplicarla.
+        if let confirmedIndex = replies.firstIndex(where: { $0.id == reply.id }) {
+            replies[confirmedIndex] = reply
+            replies.remove(at: index)
+        } else {
+            replies[index] = reply
+        }
+        replies.sort { $0.createdAt < $1.createdAt }
+        threadReplies[parentMessageId] = replies
+    }
+
+    /// Contraparte de `bumpThreadSummary` al descartar una respuesta local.
+    private func decrementThreadSummary(parentMessageId: String, conversationId: String) {
+        guard var summaries = channelThreads[conversationId],
+              let index = summaries.firstIndex(where: { $0.id == parentMessageId }) else { return }
+        summaries[index].replyCount = max(0, summaries[index].replyCount - 1)
+        let rootReplies = messages[conversationId]?.first { $0.id == parentMessageId }?.replyCount ?? 0
+        if summaries[index].replyCount == 0, rootReplies == 0 {
+            summaries.remove(at: index)
+        }
+        channelThreads[conversationId] = summaries
     }
 
     @discardableResult
@@ -2134,15 +2730,16 @@ extension CoreChannelsStore {
             .filter { !$0.isEmpty }
         guard !trimmedQuestion.isEmpty, cleanOptions.count >= 2,
               let conversationId = channel.conversationId else { return }
-        guard configuration.isUsable else { return }
+        guard configuration.isUsable, !Self.isDemo else { return }
 
         let announcementText = "📊 \(trimmedQuestion)"
-        let optimistic = makeOptimisticMessage(
+        var optimistic = makeOptimisticMessage(
             content: announcementText,
             channel: channel,
             conversationId: conversationId,
             parentMessageId: nil
         )
+        optimistic.localState = .sending
         upsertMessage(optimistic)
         polls[optimistic.id] = CorePoll(
             id: "local-\(optimistic.id)",
@@ -2153,7 +2750,6 @@ extension CoreChannelsStore {
             }
         )
 
-        isSending = true
         lastError = nil
         do {
             let config = try await ensureFreshSession()
@@ -2189,16 +2785,13 @@ extension CoreChannelsStore {
             removeMessage(id: optimistic.id, conversationId: conversationId)
             upsertMessage(message)
             updateChannelPreview(with: message)
-            Task {
-                try? await client.markRead(conversationId: conversationId, lastReadMessageId: message.id)
-            }
+            markReadIfNeeded(conversationId: conversationId, messageId: message.id)
             await loadPolls(for: channel)
         } catch {
             polls[optimistic.id] = nil
             removeMessage(id: optimistic.id, conversationId: conversationId)
             lastError = error.localizedDescription
         }
-        isSending = false
     }
 
     /// Loads the channel's polls and indexes them by their linked message id.
@@ -2230,6 +2823,7 @@ extension CoreChannelsStore {
         }
 
         guard configuration.isUsable,
+              !Self.isDemo,
               !poll.id.hasPrefix("local-"),
               let messageId = poll.messageId,
               var message = message(withId: messageId),
@@ -2316,125 +2910,4 @@ extension CoreChannelsStore {
             }
         )
     }
-}
-
-private enum CoreChannelCache {
-    private static let keyPrefix = "zia-chat.channels."
-
-    static func load(userId: String) -> [CoreChannel]? {
-        guard !userId.isEmpty,
-              let data = UserDefaults.standard.data(forKey: keyPrefix + userId) else {
-            return nil
-        }
-        return try? JSONDecoder().decode([CoreChannel].self, from: data)
-    }
-
-    static func save(_ channels: [CoreChannel], userId: String) {
-        guard !userId.isEmpty, let data = try? JSONEncoder().encode(channels) else { return }
-        UserDefaults.standard.set(data, forKey: keyPrefix + userId)
-    }
-}
-
-private struct CoreChatListCachePayload: Codable {
-    var directMessages: [CoreDirectMessage]
-    var channelPreviews: [String: CoreMessage]
-}
-
-private enum CoreChatListCache {
-    private static let keyPrefix = "zia-chat.chat-list."
-
-    static func load(userId: String) -> CoreChatListCachePayload? {
-        guard !userId.isEmpty,
-              let data = UserDefaults.standard.data(forKey: keyPrefix + userId) else {
-            return nil
-        }
-        return try? JSONDecoder().decode(CoreChatListCachePayload.self, from: data)
-    }
-
-    static func save(
-        directMessages: [CoreDirectMessage],
-        channelPreviews: [String: CoreMessage],
-        userId: String
-    ) {
-        guard !userId.isEmpty else { return }
-        let payload = CoreChatListCachePayload(
-            directMessages: directMessages,
-            channelPreviews: channelPreviews
-        )
-        guard let data = try? JSONEncoder().encode(payload) else { return }
-        UserDefaults.standard.set(data, forKey: keyPrefix + userId)
-    }
-}
-
-enum CorePreviewData {
-    static let channels: [CoreChannel] = [
-        CoreChannel(
-            id: "preview-general",
-            empresaId: 1,
-            name: "general",
-            slug: "general",
-            description: "Company-wide updates from Azank React Core",
-            conversationId: "preview-conversation-general",
-            unreadCount: 3
-        ),
-        CoreChannel(
-            id: "preview-private",
-            empresaId: 1,
-            name: "leadership",
-            slug: "leadership",
-            description: "Private decisions and follow-ups",
-            visibility: .private,
-            conversationId: "preview-conversation-leadership",
-            mentionCount: 1
-        ),
-        CoreChannel(
-            id: "preview-voice",
-            empresaId: 1,
-            name: "daily-standup",
-            slug: "daily-standup",
-            description: "Voice room",
-            metadata: CoreChannelMetadata(channelType: "voice", iconImage: nil),
-            conversationId: "preview-conversation-voice"
-        )
-    ]
-
-    static let messages: [String: [CoreMessage]] = [
-        "preview-conversation-general": [
-            CoreMessage(
-                id: "m1",
-                empresaId: 1,
-                conversationId: "preview-conversation-general",
-                channelId: "preview-general",
-                parentMessageId: nil,
-                userId: "ana",
-                content: "This mirrors the Core channel list, unread badges, and chat flow from azank-react.",
-                createdAt: Date().addingTimeInterval(-3600),
-                author: CoreUserLite(id: "ana", fullName: "Ana Martinez")
-            ),
-            CoreMessage(
-                id: "m2",
-                empresaId: 1,
-                conversationId: "preview-conversation-general",
-                channelId: "preview-general",
-                parentMessageId: nil,
-                userId: "preview-user",
-                content: "Once backend settings are saved, these preview messages are replaced by real Core data.",
-                createdAt: Date().addingTimeInterval(-1200),
-                author: CoreUserLite(id: "preview-user", fullName: "You")
-            )
-        ],
-        "preview-conversation-leadership": [
-            CoreMessage(
-                id: "m3",
-                empresaId: 1,
-                conversationId: "preview-conversation-leadership",
-                channelId: "preview-private",
-                parentMessageId: nil,
-                userId: "zia",
-                content: "@you review the private-channel membership rules from the React RPC before launch.",
-                createdAt: Date().addingTimeInterval(-600),
-                author: CoreUserLite(id: "zia", fullName: "Zia Core")
-            )
-        ]
-    ]
 }

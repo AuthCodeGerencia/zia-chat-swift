@@ -1,5 +1,7 @@
 import Foundation
+import ImageIO
 import SwiftUI
+import UIKit
 
 enum CoreChannelVisibility: String, Codable, CaseIterable, Hashable {
     case `public`
@@ -89,7 +91,7 @@ struct CoreChannelMetadata: Codable, Hashable {
         case inviteTokenCreatedBy
     }
 
-    init(
+    nonisolated init(
         channelType: String? = nil,
         iconImage: String? = nil,
         theme: CoreChannelTheme? = nil,
@@ -225,7 +227,7 @@ struct CoreChannel: Identifiable, Codable, Hashable {
         case visibleAsSuperAdmin = "visible_as_super_admin"
     }
 
-    init(
+    nonisolated init(
         id: String,
         empresaId: Int,
         teamId: String? = nil,
@@ -310,8 +312,13 @@ struct CoreChannel: Identifiable, Codable, Hashable {
 struct CoreUserLite: Identifiable, Codable, Hashable {
     var id: String
     var fullName: String?
-    var avatarURLString: String?
+    var avatarURLString: String? {
+        didSet { avatarURL = Self.resolveAvatarURL(avatarURLString) }
+    }
     var roleId: Int?
+    /// Resuelta una sola vez al crear/decodificar el usuario: las filas la leen
+    /// en cada render y la resolución de rutas relativas no es gratis.
+    private(set) var avatarURL: URL?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -320,17 +327,116 @@ struct CoreUserLite: Identifiable, Codable, Hashable {
         case roleId = "rol_id"
     }
 
+    nonisolated init(id: String, fullName: String? = nil, avatarURLString: String? = nil, roleId: Int? = nil) {
+        self.id = id
+        self.fullName = fullName
+        self.avatarURLString = avatarURLString
+        self.roleId = roleId
+        self.avatarURL = Self.resolveAvatarURL(avatarURLString)
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        fullName = try container.decodeIfPresent(String.self, forKey: .fullName)
+        avatarURLString = try container.decodeIfPresent(String.self, forKey: .avatarURLString)
+        roleId = try container.decodeIfPresent(Int.self, forKey: .roleId)
+        avatarURL = Self.resolveAvatarURL(avatarURLString)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encodeIfPresent(fullName, forKey: .fullName)
+        try container.encodeIfPresent(avatarURLString, forKey: .avatarURLString)
+        try container.encodeIfPresent(roleId, forKey: .roleId)
+    }
+
     var displayName: String {
         fullName?.isEmpty == false ? fullName! : "Unknown"
     }
 
-    var avatarURL: URL? {
-        guard let avatarURLString else { return nil }
-        return CoreAvatarURLResolver.url(from: avatarURLString)
+    nonisolated private static func resolveAvatarURL(_ value: String?) -> URL? {
+        guard let value else { return nil }
+        return CoreAvatarURLResolver.url(from: value)
     }
 }
 
-enum CoreAvatarURLResolver {
+/// Decodifica `metadata.iconImage` (data:URL base64 subido desde la web, o
+/// URL remota) a una miniatura del tamaño en píxeles que se va a pintar, con
+/// caché en memoria. Compartido por la app y la Share Extension; la decodificación
+/// debe hacerse fuera del hilo principal (`Task.detached`).
+nonisolated enum ChannelIconDecoder {
+    private final class Cache: @unchecked Sendable {
+        let storage: NSCache<NSString, UIImage> = {
+            let cache = NSCache<NSString, UIImage>()
+            cache.totalCostLimit = 24 * 1024 * 1024
+            cache.countLimit = 300
+            return cache
+        }()
+    }
+
+    private static let cache = Cache()
+
+    /// Comprueba el prefijo sin copiar el valor (un data:URL puede pesar cientos de KB).
+    static func isDataURL(_ rawValue: String?) -> Bool {
+        rawValue?.drop(while: \.isWhitespace).hasPrefix("data:") == true
+    }
+
+    /// URL remota del icono; `nil` para data:URLs, vacíos o valores sin esquema.
+    static func remoteURL(from rawValue: String?) -> URL? {
+        guard let rawValue, !isDataURL(rawValue) else { return nil }
+        let raw = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, let url = URL(string: raw), url.scheme != nil else {
+            return nil
+        }
+        return url
+    }
+
+    static func cached(channelId: String, rawValue: String?, size: CGFloat, scale: CGFloat) -> UIImage? {
+        guard let rawValue, isDataURL(rawValue) else { return nil }
+        return cache.storage.object(forKey: cacheKey(channelId: channelId, rawValue: rawValue, size: size, scale: scale))
+    }
+
+    /// Decodifica y guarda en caché. Síncrono y costoso: llamar fuera del hilo principal.
+    static func decode(channelId: String, rawValue: String?, size: CGFloat, scale: CGFloat) -> UIImage? {
+        guard let rawValue, isDataURL(rawValue) else { return nil }
+        let key = cacheKey(channelId: channelId, rawValue: rawValue, size: size, scale: scale)
+        if let hit = cache.storage.object(forKey: key) { return hit }
+        guard let image = thumbnail(fromDataURL: rawValue, size: size, scale: scale) else { return nil }
+        let cost = Int(image.size.width * image.size.height * image.scale * image.scale * 4)
+        cache.storage.setObject(image, forKey: key, cost: cost)
+        return image
+    }
+
+    /// Miniatura sin caché (vistas previas de edición, donde el contenido cambia).
+    static func thumbnail(fromDataURL dataURL: String, size: CGFloat, scale: CGFloat) -> UIImage? {
+        guard let comma = dataURL.firstIndex(of: ","),
+              let data = Data(base64Encoded: String(dataURL[dataURL.index(after: comma)...])),
+              let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary) else {
+            return nil
+        }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: Int((size * scale).rounded(.up)),
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return nil
+        }
+        return UIImage(cgImage: cgImage, scale: scale, orientation: .up)
+    }
+
+    /// Longitud + últimos bytes del base64 como huella barata: dos imágenes
+    /// distintas con la misma longitud no comparten entrada sin recorrer todo el valor.
+    private static func cacheKey(channelId: String, rawValue: String, size: CGFloat, scale: CGFloat) -> NSString {
+        let fingerprint = String(decoding: rawValue.utf8.suffix(32), as: UTF8.self)
+        return "\(channelId)|\(rawValue.utf8.count)|\(fingerprint)|\(Int((size * scale).rounded(.up)))" as NSString
+    }
+}
+
+nonisolated enum CoreAvatarURLResolver {
     private static let storagePrefix = "/storage/v1/object/public/avatars/"
 
     static func url(from value: String) -> URL? {
@@ -341,7 +447,7 @@ enum CoreAvatarURLResolver {
             return absoluteURL
         }
 
-        let supabaseURL = CoreEnvironment.load().supabaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let supabaseURL = CoreEnvironment.shared.supabaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard !supabaseURL.isEmpty else { return nil }
 
         let storagePath: String
@@ -385,7 +491,7 @@ struct CoreReaction: Identifiable, Codable, Hashable {
         case createdAt = "created_at"
     }
 
-    init(
+    nonisolated init(
         id: String,
         empresaId: Int,
         messageId: String,
@@ -479,25 +585,119 @@ struct CoreAttachment: Identifiable, Codable, Hashable {
     }
 }
 
-struct CorePendingAttachment: Identifiable, Hashable {
+/// Adjunto pendiente de subir. Vive en memoria (`data`) o en disco
+/// (`fileURL`, con `data` vacío) para no cargar archivos grandes en RAM.
+nonisolated struct CorePendingAttachment: Identifiable, Hashable, Sendable {
     let id: UUID
     var data: Data
+    var fileURL: URL?
     var fileName: String
     var mimeType: String
+    private var fileSizeBytes: Int
 
     init(id: UUID = UUID(), data: Data, fileName: String, mimeType: String) {
         self.id = id
         self.data = data
+        self.fileURL = nil
         self.fileName = fileName
         self.mimeType = mimeType
+        self.fileSizeBytes = data.count
+    }
+
+    init(id: UUID = UUID(), fileURL: URL, fileName: String, mimeType: String, sizeBytes: Int? = nil) {
+        self.id = id
+        self.data = Data()
+        self.fileURL = fileURL
+        self.fileName = fileName
+        self.mimeType = mimeType
+        self.fileSizeBytes = sizeBytes
+            ?? (try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+            ?? 0
     }
 
     var sizeBytes: Int {
-        data.count
+        data.isEmpty ? fileSizeBytes : data.count
     }
 
     var isGIF: Bool {
         mimeType == "image/gif"
+    }
+
+    var isFileBacked: Bool {
+        data.isEmpty && fileURL != nil
+    }
+
+    /// URL local que puede renderizarse mientras el adjunto se sube.
+    var localURL: URL? {
+        fileURL
+    }
+}
+
+/// Carpeta de trabajo para adjuntos pendientes (app y Share Extension).
+/// Usa el contenedor del App Group para que ambos procesos compartan la
+/// misma ruta; cae a la carpeta temporal si el grupo no está disponible.
+nonisolated enum PendingUploadStorage {
+    static let directory: URL = {
+        let base = FileManager.default
+            .containerURL(forSecurityApplicationGroupIdentifier: CoreConfigurationStore.appGroupIdentifier)?
+            .appendingPathComponent("Library/Caches", isDirectory: true)
+            ?? FileManager.default.temporaryDirectory
+        let url = base.appendingPathComponent("pending-uploads", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }()
+
+    static func makeURL(for fileName: String) -> URL {
+        let ext = (fileName as NSString).pathExtension
+        let name = ext.isEmpty ? UUID().uuidString : "\(UUID().uuidString).\(ext)"
+        return directory.appendingPathComponent(name)
+    }
+
+    /// Copia (o escribe) el adjunto a disco y devuelve una versión respaldada
+    /// por archivo, liberando los bytes en memoria.
+    static func persist(_ attachment: CorePendingAttachment) throws -> CorePendingAttachment {
+        if attachment.isFileBacked { return attachment }
+        let url = makeURL(for: attachment.fileName)
+        try attachment.data.write(to: url, options: .atomic)
+        return CorePendingAttachment(
+            id: attachment.id,
+            fileURL: url,
+            fileName: attachment.fileName,
+            mimeType: attachment.mimeType,
+            sizeBytes: attachment.data.count
+        )
+    }
+
+    /// Copia un archivo externo (picker, provider de la extensión) a la carpeta
+    /// de trabajo sin cargarlo en memoria.
+    static func importFile(at source: URL, fileName: String) throws -> URL {
+        let destination = makeURL(for: fileName)
+        try FileManager.default.copyItem(at: source, to: destination)
+        return destination
+    }
+
+    static func remove(_ attachments: [CorePendingAttachment]) {
+        for attachment in attachments {
+            guard let url = attachment.fileURL, url.path.hasPrefix(directory.path) else { continue }
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    /// Borra archivos huérfanos de sesiones anteriores, salvo los nombres en
+    /// `keeping` (adjuntos de borradores).
+    static func purgeStale(olderThan age: TimeInterval = 24 * 60 * 60, keeping: Set<String> = []) {
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey]
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: Array(keys)
+        ) else { return }
+        let cutoff = Date().addingTimeInterval(-age)
+        for file in files where !keeping.contains(file.lastPathComponent) {
+            let modified = (try? file.resourceValues(forKeys: keys))?.contentModificationDate ?? .distantPast
+            if modified < cutoff {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
     }
 }
 
@@ -544,7 +744,7 @@ struct CoreMessageMetadata: Codable, Hashable {
         case expiresAt
     }
 
-    init(
+    nonisolated init(
         attachments: [CoreMetadataAttachment]? = nil,
         replyTo: CoreMessageReplyTo? = nil,
         kind: String? = nil,
@@ -706,6 +906,9 @@ struct CoreMessage: Identifiable, Codable, Hashable {
     var reactions: [CoreReaction]?
     var attachments: [CoreAttachment]?
     var replyCount: Int?
+    /// Estado local de envío; solo existe en mensajes creados en este
+    /// dispositivo que aún no confirmó el servidor. No se serializa.
+    var localState: LocalSendState? = nil
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -724,6 +927,11 @@ struct CoreMessage: Identifiable, Codable, Hashable {
     var authorName: String {
         author?.displayName ?? "Unknown"
     }
+}
+
+enum LocalSendState: Hashable {
+    case sending
+    case failed
 }
 
 struct CoreMessagePin: Identifiable, Codable, Hashable {
@@ -796,6 +1004,21 @@ enum MessageReceipt {
     case readBySome
     /// ✓✓ (azul) Lo leyeron todos los miembros.
     case readByAll
+
+    /// Versión pura de `CoreChannelsStore.receipt(for:in:)` para calcularla
+    /// con miembros y marcas de lectura ya resueltos una sola vez por lista.
+    static func compute(message: CoreMessage, members: [CoreUserLite], reads: [String: Date]) -> MessageReceipt {
+        var recipients = 0
+        var readCount = 0
+        for member in members where member.id != message.userId {
+            recipients += 1
+            if let readAt = reads[member.id], readAt >= message.createdAt {
+                readCount += 1
+            }
+        }
+        guard recipients > 0, readCount > 0 else { return .sent }
+        return readCount < recipients ? .readBySome : .readByAll
+    }
 }
 
 /// Detecta el formato real de una imagen por sus "magic bytes".
@@ -840,9 +1063,9 @@ struct CorePollOption: Identifiable, Hashable {
 }
 
 extension Array where Element == CoreReaction {
-    var groupedByEmoji: [(emoji: String, count: Int)] {
+    var groupedByEmoji: [(emoji: String, count: Int, userIds: [String])] {
         Dictionary(grouping: self, by: \.emoji)
-            .map { ($0.key, $0.value.count) }
+            .map { ($0.key, $0.value.count, $0.value.map(\.userId)) }
             .sorted { $0.emoji < $1.emoji }
     }
 }
@@ -894,10 +1117,14 @@ enum CoreFormat {
         return text.isEmpty ? "ZC" : text
     }
 
-    static func relativeTime(_ date: Date) -> String {
+    private static let relativeTimeFormatter: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: date, relativeTo: Date())
+        return formatter
+    }()
+
+    static func relativeTime(_ date: Date) -> String {
+        relativeTimeFormatter.localizedString(for: date, relativeTo: Date())
     }
 
     static func conversationTime(_ date: Date) -> String {

@@ -62,7 +62,12 @@ private struct CoreVoiceTokenErrorResponse: Decodable {
 
 @MainActor
 final class CoreVoiceRoomStore: NSObject, ObservableObject, RoomDelegate, @unchecked Sendable {
-    @Published private(set) var connectionState: CoreVoiceConnectionState = .disconnected
+    @Published private(set) var connectionState: CoreVoiceConnectionState = .disconnected {
+        didSet {
+            // Sin esto la pantalla se bloquea a los segundos y la sala se corta.
+            UIApplication.shared.isIdleTimerDisabled = isConnected
+        }
+    }
     @Published private(set) var participants: [CoreVoiceParticipant] = []
     @Published private(set) var connectedChannel: CoreChannel?
     @Published private(set) var isMuted = false
@@ -254,10 +259,13 @@ final class CoreVoiceRoomStore: NSObject, ObservableObject, RoomDelegate, @unche
         next.append(contentsOf: room.remoteParticipants.values.map {
             participantRow($0, isLocal: false, fallbackName: "Participant")
         })
-        participants = next.sorted {
+        let sorted = next.sorted {
             if $0.isLocal != $1.isLocal { return $0.isLocal }
             if $0.isSpeaking != $1.isSpeaking { return $0.isSpeaking }
             return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+        if sorted != participants {
+            participants = sorted
         }
         refreshScreenShare(room)
     }
@@ -268,16 +276,23 @@ final class CoreVoiceRoomStore: NSObject, ObservableObject, RoomDelegate, @unche
                   let track = publication.track as? VideoTrack else {
                 continue
             }
-            screenShareOwnerName = participant.name?
+            let ownerName = participant.name?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .nilIfBlank ?? "Participante"
+            if screenShareOwnerName != ownerName {
+                screenShareOwnerName = ownerName
+            }
             if screenShareTrack !== track {
                 screenShareTrack = track
             }
             return
         }
-        screenShareTrack = nil
-        screenShareOwnerName = nil
+        if screenShareTrack != nil {
+            screenShareTrack = nil
+        }
+        if screenShareOwnerName != nil {
+            screenShareOwnerName = nil
+        }
     }
 
     private func participantRow(
@@ -310,7 +325,7 @@ final class CoreVoiceRoomStore: NSObject, ObservableObject, RoomDelegate, @unche
         channelId: String,
         configuration: CoreAppConfiguration
     ) async throws -> CoreVoiceTokenResponse {
-        let environment = CoreEnvironment.load()
+        let environment = CoreEnvironment.shared
         guard let baseURL = URL(string: environment.appURL),
               let url = URL(string: "/api/core/voice-token", relativeTo: baseURL) else {
             throw CoreVoiceError.invalidAppURL

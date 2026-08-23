@@ -15,7 +15,7 @@
 				<key>NSExtensionActivationSupportsImageWithMaxCount</key>
 				<integer>10</integer>
 				<key>NSExtensionActivationSupportsMovieWithMaxCount</key>
-				<integer>5</integer>
+				<integer>2</integer>
 				<key>NSExtensionActivationSupportsFileWithMaxCount</key>
 				<integer>10</integer>
 			</dict>

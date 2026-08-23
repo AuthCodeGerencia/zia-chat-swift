@@ -58,7 +58,11 @@ enum GiphyClient {
         let (data, _) = try await URLSession.shared.data(from: url)
         let decoded = try JSONDecoder().decode(GiphyResponse.self, from: data)
         return decoded.data.compactMap { item in
-            let preview = item.images.fixedWidth?.url ?? item.images.downsizedMedium?.url
+            // Rendiciones pequeñas para la rejilla: se animan en celdas de 90 pt.
+            let preview = item.images.fixedWidthSmall?.url
+                ?? item.images.previewGif?.url
+                ?? item.images.fixedWidth?.url
+                ?? item.images.downsizedMedium?.url
             let original = item.images.original?.url ?? item.url
             guard let preview, let original else { return nil }
             return GiphyGif(
@@ -85,11 +89,15 @@ private struct GiphyItem: Decodable {
 private struct GiphyImages: Decodable {
     let original: GiphyImage?
     let fixedWidth: GiphyImage?
+    let fixedWidthSmall: GiphyImage?
+    let previewGif: GiphyImage?
     let downsizedMedium: GiphyImage?
 
     enum CodingKeys: String, CodingKey {
         case original
         case fixedWidth = "fixed_width"
+        case fixedWidthSmall = "fixed_width_small"
+        case previewGif = "preview_gif"
         case downsizedMedium = "downsized_medium"
     }
 }
@@ -236,7 +244,7 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
 // MARK: - Store helpers
 
 extension CoreChannelsStore {
-    var giphyAPIKey: String { CoreEnvironment.load().giphyAPIKey }
+    var giphyAPIKey: String { CoreEnvironment.shared.giphyAPIKey }
 
     func loadStickers() async -> [CoreSticker] {
         guard configuration.isUsable else { return [] }
@@ -398,7 +406,7 @@ struct ComposerToolsTray: View {
                                 .fill(tool.tint.opacity(0.15))
                                 .frame(width: 46, height: 46)
                             Image(systemName: tool.systemImage)
-                                .font(.system(size: 19, weight: .medium))
+                                .font(.title3.weight(.medium))
                                 .foregroundStyle(tool.tint)
                         }
                         Text(tool.title)
@@ -561,11 +569,10 @@ struct GifPickerPanel: View {
                     LazyVGrid(columns: columns, spacing: 6) {
                         ForEach(results) { gif in
                             Button { onSelect(gif) } label: {
-                                AsyncImage(url: URL(string: gif.previewURL)) { phase in
-                                    switch phase {
-                                    case .success(let image):
-                                        image.resizable().scaledToFill()
-                                    default:
+                                Group {
+                                    if let url = URL(string: gif.previewURL) {
+                                        AnimatedImageView(url: url)
+                                    } else {
                                         Rectangle().fill(Color.gray.opacity(0.12))
                                     }
                                 }
@@ -574,11 +581,12 @@ struct GifPickerPanel: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                             }
                             .buttonStyle(.plain)
+                            .accessibilityLabel(gif.title.isEmpty ? "GIF" : "GIF \(gif.title)")
                         }
                     }
                 }
             }
-            .frame(maxHeight: 220)
+            .frame(maxHeight: .infinity)
         }
         .padding(12)
         .background(Color.white)
@@ -610,7 +618,7 @@ struct GifPickerPanel: View {
 // MARK: - Sticker picker
 
 struct StickerPickerPanel: View {
-    @ObservedObject var store: CoreChannelsStore
+    let store: CoreChannelsStore
     let onSelect: (CoreSticker) -> Void
 
     @State private var stickers: [CoreSticker] = []
@@ -706,11 +714,10 @@ struct StickerPickerPanel: View {
                     LazyVGrid(columns: columns, spacing: 8) {
                         ForEach(filtered) { sticker in
                             Button { onSelect(sticker) } label: {
-                                AsyncImage(url: URL(string: sticker.imageURL)) { phase in
-                                    switch phase {
-                                    case .success(let image):
-                                        image.resizable().scaledToFit()
-                                    default:
+                                Group {
+                                    if let url = URL(string: sticker.imageURL) {
+                                        AnimatedImageView(url: url, contentMode: .scaleAspectFit, targetSize: CGSize(width: 64, height: 64))
+                                    } else {
                                         Rectangle().fill(Color.gray.opacity(0.12))
                                     }
                                 }
@@ -718,11 +725,12 @@ struct StickerPickerPanel: View {
                                 .frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.plain)
+                            .accessibilityLabel("Sticker \(sticker.name)")
                         }
                     }
                 }
             }
-            .frame(maxHeight: 200)
+            .frame(maxHeight: .infinity)
         }
         .padding(12)
         .background(Color.white)
@@ -827,10 +835,12 @@ struct VoiceNoteBar: View {
         HStack(spacing: 14) {
             Button(action: onCancel) {
                 Image(systemName: "trash")
-                    .font(.system(size: 18))
+                    .font(.title3)
                     .foregroundStyle(.red)
+                    .frame(width: 44, height: 44)
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Descartar nota de voz")
 
             Circle()
                 .fill(Color.red)
@@ -845,13 +855,14 @@ struct VoiceNoteBar: View {
 
             Button(action: onSend) {
                 Image(systemName: "paperplane.fill")
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.callout.weight(.semibold))
                     .foregroundStyle(.white)
-                    .frame(width: 38, height: 38)
+                    .frame(width: 44, height: 44)
                     .background(Color(red: 0.08, green: 0.65, blue: 0.42))
                     .clipShape(Circle())
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Enviar nota de voz")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -1009,14 +1020,16 @@ struct AudioMessageView: View {
                 player.toggle(url: url)
             } label: {
                 if player.isLoading {
-                    ProgressView().frame(width: 34, height: 34)
+                    ProgressView().frame(width: 44, height: 44)
                 } else {
                     Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                        .font(.system(size: 34))
+                        .font(.largeTitle)
                         .foregroundStyle(tint)
+                        .frame(width: 44, height: 44)
                 }
             }
             .buttonStyle(.plain)
+            .accessibilityLabel(player.isPlaying ? "Pausar nota de voz" : "Reproducir nota de voz")
 
             VStack(alignment: .leading, spacing: 2) {
                 Slider(

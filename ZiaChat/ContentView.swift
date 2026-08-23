@@ -5,14 +5,14 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
-    @StateObject private var store = CoreChannelsStore()
+    @StateObject private var store = ContentView.makeStore()
     @StateObject private var voiceStore = CoreVoiceRoomStore()
     @StateObject private var pushService = PushNotificationService.shared
     @State private var showingSettings = false
     @State private var showingNewChannel = false
     @State private var navigationPath: [CoreChannel.ID] = []
     @State private var pushNavigationTask: Task<Void, Never>?
-    @State private var foregroundRefreshTask: Task<Void, Never>?
+    @State private var lastScenePhase: ScenePhase?
 
     var body: some View {
         Group {
@@ -21,6 +21,7 @@ struct ContentView: View {
                     ChannelListView(
                         store: store,
                         voiceStore: voiceStore,
+                        connectedVoiceChannel: voiceStore.connectedChannel,
                         showingSettings: $showingSettings,
                         showingNewChannel: $showingNewChannel,
                         navigationPath: $navigationPath
@@ -38,12 +39,19 @@ struct ContentView: View {
                                     store: store,
                                     voiceStore: voiceStore,
                                     channel: channel,
+                                    connectedVoiceChannelId: voiceStore.connectedChannel?.id,
+                                    isVoiceConnected: voiceStore.isConnected,
                                     navigationPath: $navigationPath
                                 )
                             }
                         } else {
                             MissingChannelView()
                         }
+                    }
+                }
+                .onChange(of: navigationPath) { _, path in
+                    if path.isEmpty {
+                        store.closeActiveConversation()
                     }
                 }
             } else {
@@ -63,7 +71,7 @@ struct ContentView: View {
                     await voiceStore.leave()
                     await pushService.updateBadgeCount(0)
                 }
-            } else {
+            } else if !CoreChannelsStore.isDemo {
                 Task {
                     await pushService.requestAuthorizationAndRegister()
                     await pushService.registerCurrentToken(configuration: store.configuration)
@@ -73,7 +81,7 @@ struct ContentView: View {
             }
         }
         .onChange(of: pushService.deviceToken) { _, token in
-            guard token != nil else { return }
+            guard token != nil, !CoreChannelsStore.isDemo else { return }
             Task { await pushService.registerCurrentToken(configuration: store.configuration) }
         }
         .onChange(of: pushService.pendingDestination) { _, destination in
@@ -81,14 +89,11 @@ struct ContentView: View {
             schedulePendingPushNavigation()
         }
         .onChange(of: pushService.foregroundEvent) { _, event in
-            guard event != nil, scenePhase == .active else { return }
-            foregroundRefreshTask?.cancel()
-            foregroundRefreshTask = Task {
-                guard store.configuration.isUsable, scenePhase == .active else { return }
-                _ = try? await store.ensureFreshSession()
-                guard !Task.isCancelled, scenePhase == .active else { return }
-                await store.refresh()
-                guard !Task.isCancelled, scenePhase == .active else { return }
+            guard event != nil, scenePhase == .active, store.configuration.isUsable else { return }
+            // Las suscripciones en vivo ya traen el mensaje; solo hay que
+            // asegurarse de que siguen conectadas.
+            Task {
+                await store.reconnectRealtimeIfNeeded()
                 await syncAppBadge()
             }
         }
@@ -100,30 +105,19 @@ struct ContentView: View {
             Task { await syncAppBadge() }
         }
         .onChange(of: store.configuration.accessToken) { _, _ in
+            guard !CoreChannelsStore.isDemo else { return }
             Task { await pushService.registerCurrentToken(configuration: store.configuration) }
         }
         .onChange(of: scenePhase) { _, phase in
-            store.setSceneActive(phase == .active)
-            if phase != .active {
-                foregroundRefreshTask?.cancel()
-                foregroundRefreshTask = nil
-            }
-            guard phase == .active else { return }
-            Task {
-                guard store.configuration.isUsable else {
-                    await pushService.updateBadgeCount(0)
-                    return
-                }
-                _ = try? await store.ensureFreshSession()
-                await store.refresh()
-                await store.reconnectRealtimeIfNeeded()
-                await syncAppBadge()
-                schedulePendingPushNavigation()
-            }
+            handleScenePhaseChange(phase)
         }
         .task {
             guard store.configuration.isUsable else {
                 await pushService.updateBadgeCount(0)
+                return
+            }
+            if CoreChannelsStore.isDemo {
+                openDemoChannelIfRequested()
                 return
             }
             _ = try? await store.ensureFreshSession()
@@ -136,7 +130,53 @@ struct ContentView: View {
         .preferredColorScheme(.light)
     }
 
+    private func handleScenePhaseChange(_ phase: ScenePhase) {
+        store.setSceneActive(phase == .active)
+        // Solo background -> active vuelve a descargar; el paso inactive -> active
+        // del arranque ya está cubierto por el `.task` inicial.
+        let resumedFromBackground = lastScenePhase == .background
+        if phase == .active || phase == .background {
+            lastScenePhase = phase
+        }
+        guard phase == .active else { return }
+        Task {
+            guard store.configuration.isUsable, !CoreChannelsStore.isDemo else {
+                await pushService.updateBadgeCount(0)
+                return
+            }
+            if resumedFromBackground {
+                _ = try? await store.ensureFreshSession()
+            }
+            // Un refresh de arranque cancelado por un paso a inactive se retoma aquí.
+            if resumedFromBackground || !store.hasCompletedRefresh {
+                await store.refresh()
+            }
+            await store.reconnectRealtimeIfNeeded()
+            await syncAppBadge()
+            schedulePendingPushNavigation()
+        }
+    }
+
+    private static func makeStore() -> CoreChannelsStore {
+        #if DEBUG
+        if CoreChannelsStore.isDemo {
+            return CoreChannelsStore.demo()
+        }
+        #endif
+        return CoreChannelsStore()
+    }
+
+    /// `-zia-demo-open`: abre el primer canal de texto sin tocar la lista.
+    private func openDemoChannelIfRequested() {
+        guard ZiaDemoMode.opensFirstChannel,
+              navigationPath.isEmpty,
+              let channel = store.textChannels.first else { return }
+        store.selectedChannelId = channel.id
+        navigationPath = [channel.id]
+    }
+
     private func syncAppBadge() async {
+        guard !CoreChannelsStore.isDemo else { return }
         let unreadCount = store.textChannels.reduce(0) { $0 + $1.unreadCount }
             + store.directMessages.reduce(0) { $0 + $1.unreadCount }
         await pushService.updateBadgeCount(unreadCount)
@@ -149,8 +189,7 @@ struct ContentView: View {
             return
         }
         pushNavigationTask = Task {
-            // Let SwiftUI finish restoring the NavigationStack after a notification launch.
-            try? await Task.sleep(for: .milliseconds(350))
+            await Task.yield()
             guard !Task.isCancelled, scenePhase == .active else {
                 pushNavigationTask = nil
                 return
@@ -178,14 +217,17 @@ struct ContentView: View {
                     channelId: destination.channelId,
                     conversationId: destination.conversationId
                 ) {
-                    // A notification can arrive while this conversation still has
-                    // cached messages. Refresh it explicitly because ChatDetailView's
-                    // task may not run again when the user is already on this channel.
-                    await store.open(channel, force: true)
+                    // Navigate first; ChatDetailView's task loads the conversation.
+                    // It does not re-run when the user is already on this channel,
+                    // so refresh explicitly in that case.
+                    let alreadyOpen = navigationPath == [channel.id]
                     store.selectedChannelId = channel.id
                     navigationPath = [channel.id]
                     pushService.consume(destination)
                     pushService.lastError = nil
+                    if alreadyOpen {
+                        Task { await store.open(channel, force: true) }
+                    }
                     return
                 }
             } catch {
@@ -338,7 +380,7 @@ private struct LoginView: View {
                         showingSettings = true
                     } label: {
                         Image(systemName: "gearshape.fill")
-                            .frame(width: 38, height: 38)
+                            .frame(width: 44, height: 44)
                             .background(Color.white.opacity(0.14))
                             .clipShape(Circle())
                     }
@@ -462,16 +504,39 @@ enum ChannelListFilter: CaseIterable {
     }
 }
 
-private enum ChannelListItem: Identifiable {
-    case channel(CoreChannel)
-    case direct(CoreDirectMessage)
-
-    var id: String {
-        switch self {
-        case let .channel(channel): channel.id
-        case let .direct(message): message.id
-        }
+/// Fila del index con sus claves de orden ya resueltas para ordenar en una
+/// sola pasada.
+private struct ChannelListItem: Identifiable {
+    enum Kind {
+        case channel(CoreChannel)
+        case direct(CoreDirectMessage)
     }
+
+    let kind: Kind
+    let id: String
+    let sortDate: Date
+    let sortName: String
+    let isUnread: Bool
+
+    nonisolated static func activityOrder(_ first: ChannelListItem, _ second: ChannelListItem) -> Bool {
+        if first.sortDate != second.sortDate {
+            return first.sortDate > second.sortDate
+        }
+        return first.sortName.localizedCaseInsensitiveCompare(second.sortName) == .orderedAscending
+    }
+}
+
+/// Listas derivadas del store, calculadas una sola vez por evaluación del
+/// body de `ChannelListView` en vez de en cada chip, sección y badge.
+private struct ChannelListSnapshot {
+    let chatItems: [ChannelListItem]
+    let unreadItems: [ChannelListItem]
+    let favoriteItems: [ChannelListItem]
+    let directMessages: [CoreDirectMessage]
+    let threadItems: [ChannelThreadItem]
+    let unreadThreadItems: [ChannelThreadItem]
+    let readThreadItems: [ChannelThreadItem]
+    let totalUnreadCount: Int
 }
 
 /// Un thread mostrado en el filtro "Hilos" del index, junto con su canal.
@@ -484,7 +549,8 @@ struct ChannelThreadItem: Identifiable {
 
 private struct ChannelListView: View {
     @ObservedObject var store: CoreChannelsStore
-    @ObservedObject var voiceStore: CoreVoiceRoomStore
+    let voiceStore: CoreVoiceRoomStore
+    let connectedVoiceChannel: CoreChannel?
     @Binding var showingSettings: Bool
     @Binding var showingNewChannel: Bool
     @Binding var navigationPath: [CoreChannel.ID]
@@ -494,13 +560,15 @@ private struct ChannelListView: View {
     @State private var showNewDM = false
     @State private var selectedThreadItem: ChannelThreadItem?
     @ObservedObject private var threadReads = ThreadReadTracker.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var isSearching: Bool {
         !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var body: some View {
-        List {
+        let snapshot = makeSnapshot()
+        return List {
             if !store.configuration.isUsable {
                 ConfigurationBanner {
                     showingSettings = true
@@ -511,8 +579,8 @@ private struct ChannelListView: View {
             if isSearching {
                 channelSearchContent
             } else {
-                filterChipsRow
-                defaultChannelContent
+                filterChipsRow(snapshot)
+                defaultChannelContent(snapshot)
             }
         }
         .listStyle(.plain)
@@ -521,8 +589,9 @@ private struct ChannelListView: View {
         .contentMargins(.horizontal, 0, for: .scrollContent)
         .listSectionSpacing(0)
         .overlay {
-            if store.isLoading && store.channels.isEmpty && store.directMessages.isEmpty {
-                ProgressView("Loading channels")
+            if store.channels.isEmpty && store.directMessages.isEmpty
+                && (store.isLoading || !store.hasLoadedChatList || !store.configuration.isUsable) {
+                ProgressView("Cargando chats")
             } else if store.channels.isEmpty && store.directMessages.isEmpty && store.configuration.isUsable {
                 ContentUnavailableView(
                     "No hay chats",
@@ -532,15 +601,18 @@ private struct ChannelListView: View {
             }
         }
         .refreshable {
-            await store.refresh()
+            await store.refresh(force: true)
             if channelFilter == .hilos {
                 await store.loadAllChannelThreads(force: true)
             }
         }
-        .task(id: store.textChannels.count) {
+        .task(id: store.configuration.userId) {
             // Precarga los threads para que el chip "Hilos" muestre su badge
-            // de nuevos mensajes sin tener que entrar al filtro.
-            guard !store.textChannels.isEmpty else { return }
+            // de nuevos mensajes sin tener que entrar al filtro. Espera al
+            // refresh inicial para no competir con la lista de chats.
+            guard store.configuration.isUsable else { return }
+            await store.refresh()
+            guard !Task.isCancelled, !store.textChannels.isEmpty else { return }
             await store.loadAllChannelThreads()
         }
         .sheet(item: $selectedThreadItem) { item in
@@ -576,12 +648,12 @@ private struct ChannelListView: View {
                     Image(systemName: "square.and.pencil")
                 }
                 .disabled(!store.configuration.isUsable)
-                .accessibilityLabel("New channel")
+                .accessibilityLabel("Nuevo canal")
             }
         }
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 0) {
-                if let channel = voiceStore.connectedChannel {
+                if let channel = connectedVoiceChannel {
                     ConnectedVoiceBar(
                         voiceStore: voiceStore,
                         channel: channel,
@@ -608,11 +680,74 @@ private struct ChannelListView: View {
         }
     }
 
-    private var filterChipsRow: some View {
+    private func makeSnapshot() -> ChannelListSnapshot {
+        let userId = store.configuration.userId
+        let channelItems = store.channels.map(channelItem)
+        let directItems = store.directMessages.map(directItem)
+        let chatItems = (channelItems + directItems).sorted(by: ChannelListItem.activityOrder)
+        let favoriteIds = store.favoriteChannelIds
+
+        let threadItems = store.textChannels
+            .flatMap { channel -> [ChannelThreadItem] in
+                guard let conversationId = channel.conversationId else { return [] }
+                return (store.channelThreads[conversationId] ?? []).map {
+                    ChannelThreadItem(channel: channel, summary: $0)
+                }
+            }
+            .sorted { $0.summary.lastReplyAt > $1.summary.lastReplyAt }
+        var unreadThreadItems: [ChannelThreadItem] = []
+        var readThreadItems: [ChannelThreadItem] = []
+        for item in threadItems {
+            if threadReads.isUnread(item.summary, currentUserId: userId) {
+                unreadThreadItems.append(item)
+            } else {
+                readThreadItems.append(item)
+            }
+        }
+
+        return ChannelListSnapshot(
+            chatItems: chatItems,
+            unreadItems: chatItems.filter(\.isUnread),
+            favoriteItems: chatItems.filter { favoriteIds.contains($0.id) },
+            directMessages: directItems.sorted(by: ChannelListItem.activityOrder).compactMap { item in
+                if case let .direct(dm) = item.kind { dm } else { nil }
+            },
+            threadItems: threadItems,
+            unreadThreadItems: unreadThreadItems,
+            readThreadItems: readThreadItems,
+            totalUnreadCount: store.textChannels.reduce(0) { $0 + $1.unreadCount }
+                + store.directMessages.reduce(0) { $0 + $1.unreadCount }
+        )
+    }
+
+    private func channelItem(_ channel: CoreChannel) -> ChannelListItem {
+        ChannelListItem(
+            kind: .channel(channel),
+            id: channel.id,
+            sortDate: channel.conversationId.flatMap { store.channelPreviews[$0]?.createdAt }
+                ?? channel.updatedAt
+                ?? channel.createdAt
+                ?? .distantPast,
+            sortName: channel.displayName,
+            isUnread: channel.unreadCount > 0 || channel.mentionCount > 0
+        )
+    }
+
+    private func directItem(_ dm: CoreDirectMessage) -> ChannelListItem {
+        ChannelListItem(
+            kind: .direct(dm),
+            id: dm.id,
+            sortDate: dm.lastMessageAt ?? .distantPast,
+            sortName: dm.peer.displayName,
+            isUnread: dm.unreadCount > 0 || dm.mentionCount > 0
+        )
+    }
+
+    private func filterChipsRow(_ snapshot: ChannelListSnapshot) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 ForEach(ChannelListFilter.allCases, id: \.self) { filter in
-                    filterChip(filter)
+                    filterChip(filter, snapshot: snapshot)
                 }
             }
             .padding(.horizontal, 12)
@@ -623,12 +758,17 @@ private struct ChannelListView: View {
         .listRowBackground(Color.white)
     }
 
-    private func filterChip(_ filter: ChannelListFilter) -> some View {
+    private func filterChip(_ filter: ChannelListFilter, snapshot: ChannelListSnapshot) -> some View {
         let isSelected = channelFilter == filter
         let chipBackground: Color = isSelected ? ZenitBrand.accent : Color(.systemGray6)
         let chipForeground: Color = isSelected ? .white : .primary
+        let badgeCount: Int = switch filter {
+        case .noLeidos: snapshot.totalUnreadCount
+        case .hilos: snapshot.unreadThreadItems.count
+        default: 0
+        }
         return Button {
-            withAnimation(.snappy) { channelFilter = filter }
+            withAnimation(reduceMotion ? nil : .snappy) { channelFilter = filter }
             if filter == .hilos {
                 Task { await store.loadAllChannelThreads() }
             }
@@ -640,18 +780,9 @@ private struct ChannelListView: View {
                 }
                 Text(filter.title)
                     .font(.caption.weight(.semibold))
-                if filter == .noLeidos, totalUnreadCount > 0 {
-                    Text(CoreFormat.badgeCount(totalUnreadCount))
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(isSelected ? ZenitBrand.accent : Color.white)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(isSelected ? Color.white : ZenitBrand.accent)
-                        .clipShape(Capsule())
-                }
-                if filter == .hilos, unreadThreadItems.count > 0 {
-                    Text(CoreFormat.badgeCount(unreadThreadItems.count))
-                        .font(.system(size: 10, weight: .bold))
+                if badgeCount > 0 {
+                    Text(CoreFormat.badgeCount(badgeCount))
+                        .font(.caption2.weight(.bold))
                         .foregroundStyle(isSelected ? ZenitBrand.accent : Color.white)
                         .padding(.horizontal, 5)
                         .padding(.vertical, 1)
@@ -666,34 +797,23 @@ private struct ChannelListView: View {
             .clipShape(Capsule())
         }
         .buttonStyle(.plain)
-    }
-
-    private var totalUnreadCount: Int {
-        store.textChannels.reduce(0) { $0 + $1.unreadCount }
-            + store.directMessages.reduce(0) { $0 + $1.unreadCount }
-    }
-
-    private var favoriteItems: [ChannelListItem] {
-        sortedItems(
-            store.channels
-                .filter { store.favoriteChannelIds.contains($0.id) }
-                .map(ChannelListItem.channel)
-        )
+        .accessibilityLabel(badgeCount > 0 ? "\(filter.title), \(badgeCount) sin leer" : filter.title)
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 
     @ViewBuilder
-    private var defaultChannelContent: some View {
+    private func defaultChannelContent(_ snapshot: ChannelListSnapshot) -> some View {
         switch channelFilter {
         case .todos:
-            allChannelsContent
+            allChannelsContent(snapshot)
         case .directos:
-            directMessagesContent
+            directMessagesContent(snapshot)
         case .hilos:
-            threadsContent
+            threadsContent(snapshot)
         case .favoritos:
-            favoritesContent
+            favoritesContent(snapshot)
         case .noLeidos:
-            unreadContent
+            unreadContent(snapshot)
         case .voz:
             voiceContent
         }
@@ -701,34 +821,9 @@ private struct ChannelListView: View {
 
     // MARK: - Filtro Hilos
 
-    /// Todos los threads de los canales de texto, ordenados por actividad.
-    private var allThreadItems: [ChannelThreadItem] {
-        store.textChannels
-            .flatMap { channel -> [ChannelThreadItem] in
-                guard let conversationId = channel.conversationId else { return [] }
-                return (store.channelThreads[conversationId] ?? []).map {
-                    ChannelThreadItem(channel: channel, summary: $0)
-                }
-            }
-            .sorted { $0.summary.lastReplyAt > $1.summary.lastReplyAt }
-    }
-
-    /// Threads con respuestas nuevas (de otros) desde la última vez que se abrieron.
-    private var unreadThreadItems: [ChannelThreadItem] {
-        allThreadItems.filter {
-            threadReads.isUnread($0.summary, currentUserId: store.configuration.userId)
-        }
-    }
-
-    private var readThreadItems: [ChannelThreadItem] {
-        allThreadItems.filter {
-            !threadReads.isUnread($0.summary, currentUserId: store.configuration.userId)
-        }
-    }
-
     @ViewBuilder
-    private var threadsContent: some View {
-        if store.isLoadingAllThreads && allThreadItems.isEmpty {
+    private func threadsContent(_ snapshot: ChannelListSnapshot) -> some View {
+        if store.isLoadingAllThreads && snapshot.threadItems.isEmpty {
             HStack {
                 Spacer()
                 ProgressView("Cargando hilos…")
@@ -737,7 +832,7 @@ private struct ChannelListView: View {
             .padding(.top, 32)
             .listRowSeparator(.hidden)
             .listRowBackground(Color.white)
-        } else if allThreadItems.isEmpty {
+        } else if snapshot.threadItems.isEmpty {
             ContentUnavailableView(
                 "Sin hilos",
                 systemImage: "bubble.left.and.bubble.right",
@@ -745,9 +840,9 @@ private struct ChannelListView: View {
             )
             .listRowSeparator(.hidden)
         } else {
-            if !unreadThreadItems.isEmpty {
+            if !snapshot.unreadThreadItems.isEmpty {
                 Section {
-                    ForEach(unreadThreadItems) { item in
+                    ForEach(snapshot.unreadThreadItems) { item in
                         indexThreadRow(item, isUnread: true)
                     }
                 } header: {
@@ -755,13 +850,13 @@ private struct ChannelListView: View {
                 }
             }
 
-            if !readThreadItems.isEmpty {
+            if !snapshot.readThreadItems.isEmpty {
                 Section {
-                    ForEach(readThreadItems) { item in
+                    ForEach(snapshot.readThreadItems) { item in
                         indexThreadRow(item, isUnread: false)
                     }
                 } header: {
-                    if !unreadThreadItems.isEmpty {
+                    if !snapshot.unreadThreadItems.isEmpty {
                         Label("Todos", systemImage: "bubble.left.and.bubble.right")
                     }
                 }
@@ -778,7 +873,7 @@ private struct ChannelListView: View {
     }
 
     @ViewBuilder
-    private var directMessagesContent: some View {
+    private func directMessagesContent(_ snapshot: ChannelListSnapshot) -> some View {
         Section {
             Button {
                 showNewDM = true
@@ -790,7 +885,7 @@ private struct ChannelListView: View {
             .listRowBackground(Color.white)
         }
 
-        if store.directMessages.isEmpty {
+        if snapshot.directMessages.isEmpty {
             ContentUnavailableView(
                 "Sin mensajes directos",
                 systemImage: "person.2",
@@ -799,12 +894,8 @@ private struct ChannelListView: View {
             .listRowSeparator(.hidden)
         } else {
             Section {
-                ForEach(sortedDirectMessages) { dm in
-                    DirectMessageRow(dm: dm, currentUserId: store.configuration.userId)
-                        .contentShape(Rectangle())
-                        .onTapGesture { openDM(dm) }
-                        .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
-                        .listRowBackground(Color.white)
+                ForEach(snapshot.directMessages) { dm in
+                    directMessageRow(dm)
                 }
             }
         }
@@ -816,17 +907,17 @@ private struct ChannelListView: View {
     }
 
     @ViewBuilder
-    private var allChannelsContent: some View {
+    private func allChannelsContent(_ snapshot: ChannelListSnapshot) -> some View {
         Section {
-            ForEach(allChatItems) { item in
+            ForEach(snapshot.chatItems) { item in
                 chatRow(item)
             }
         }
     }
 
     @ViewBuilder
-    private var favoritesContent: some View {
-        if favoriteItems.isEmpty {
+    private func favoritesContent(_ snapshot: ChannelListSnapshot) -> some View {
+        if snapshot.favoriteItems.isEmpty {
             ContentUnavailableView(
                 "Sin favoritos",
                 systemImage: "star",
@@ -835,7 +926,7 @@ private struct ChannelListView: View {
             .listRowSeparator(.hidden)
         } else {
             Section {
-                ForEach(favoriteItems) { item in
+                ForEach(snapshot.favoriteItems) { item in
                     chatRow(item)
                 }
             }
@@ -843,8 +934,8 @@ private struct ChannelListView: View {
     }
 
     @ViewBuilder
-    private var unreadContent: some View {
-        if unreadItems.isEmpty {
+    private func unreadContent(_ snapshot: ChannelListSnapshot) -> some View {
+        if snapshot.unreadItems.isEmpty {
             ContentUnavailableView(
                 "Todo leído",
                 systemImage: "checkmark.circle",
@@ -853,7 +944,7 @@ private struct ChannelListView: View {
             .listRowSeparator(.hidden)
         } else {
             Section {
-                ForEach(unreadItems) { item in
+                ForEach(snapshot.unreadItems) { item in
                     chatRow(item)
                 }
             }
@@ -872,85 +963,55 @@ private struct ChannelListView: View {
         } else {
             Section {
                 ForEach(store.voiceChannels) { channel in
-                    ChannelNavigationRow(store: store, channel: channel, navigationPath: $navigationPath, onEdit: { channelToEdit = $0 })
+                    channelRow(channel)
                 }
             }
         }
     }
 
-    private var allChatItems: [ChannelListItem] {
-        sortedItems(
-            store.channels.map(ChannelListItem.channel)
-                + store.directMessages.map(ChannelListItem.direct)
+    @ViewBuilder
+    private func chatRow(_ item: ChannelListItem) -> some View {
+        switch item.kind {
+        case let .channel(channel):
+            channelRow(channel)
+        case let .direct(message):
+            directMessageRow(message)
+        }
+    }
+
+    private func directMessageRow(_ dm: CoreDirectMessage) -> some View {
+        DirectMessageNavigationRow(
+            dm: dm,
+            currentUserId: store.configuration.userId,
+            isFavorite: store.favoriteChannelIds.contains(dm.id),
+            isMuted: store.isMuted(dm.id),
+            draft: store.drafts[dm.id]?.previewText,
+            onSelect: { openDM(dm) },
+            onToggleFavorite: { store.toggleFavorite(dm.id) },
+            onToggleMuted: { store.toggleMuted(dm.id) },
+            onMarkRead: { Task { await store.markChannelAsRead(dm.chatTarget) } }
         )
     }
 
-    private var sortedDirectMessages: [CoreDirectMessage] {
-        store.directMessages.sorted {
-            if $0.lastMessageAt != $1.lastMessageAt {
-                return ($0.lastMessageAt ?? .distantPast) > ($1.lastMessageAt ?? .distantPast)
-            }
-            return $0.peer.displayName.localizedCaseInsensitiveCompare($1.peer.displayName) == .orderedAscending
-        }
-    }
-
-    private var unreadItems: [ChannelListItem] {
-        allChatItems.filter { item in
-            switch item {
-            case let .channel(channel):
-                channel.unreadCount > 0 || channel.mentionCount > 0
-            case let .direct(message):
-                message.unreadCount > 0 || message.mentionCount > 0
-            }
-        }
-    }
-
-    private func sortedItems(_ items: [ChannelListItem]) -> [ChannelListItem] {
-        items.sorted { first, second in
-            let firstDate = lastMessageDate(for: first)
-            let secondDate = lastMessageDate(for: second)
-            if firstDate != secondDate {
-                return (firstDate ?? .distantPast) > (secondDate ?? .distantPast)
-            }
-            return displayName(for: first).localizedCaseInsensitiveCompare(displayName(for: second)) == .orderedAscending
-        }
-    }
-
-    private func lastMessageDate(for item: ChannelListItem) -> Date? {
-        switch item {
-        case let .channel(channel):
-            return channel.conversationId.flatMap { store.channelPreviews[$0]?.createdAt }
-                ?? channel.updatedAt
-                ?? channel.createdAt
-        case let .direct(message):
-            return message.lastMessageAt
-        }
-    }
-
-    private func displayName(for item: ChannelListItem) -> String {
-        switch item {
-        case let .channel(channel): channel.displayName
-        case let .direct(message): message.peer.displayName
-        }
-    }
-
-    @ViewBuilder
-    private func chatRow(_ item: ChannelListItem) -> some View {
-        switch item {
-        case let .channel(channel):
-            ChannelNavigationRow(
-                store: store,
-                channel: channel,
-                navigationPath: $navigationPath,
-                onEdit: { channelToEdit = $0 }
-            )
-        case let .direct(message):
-            DirectMessageRow(dm: message, currentUserId: store.configuration.userId)
-                .contentShape(Rectangle())
-                .onTapGesture { openDM(message) }
-                .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
-                .listRowBackground(Color.white)
-        }
+    /// La fila recibe valores planos: solo se re-evalúa cuando cambia su propio
+    /// canal, no con cada publicación del store.
+    private func channelRow(_ channel: CoreChannel) -> some View {
+        ChannelNavigationRow(
+            channel: channel,
+            preview: channel.conversationId.flatMap { store.channelPreviews[$0] },
+            currentUserId: store.configuration.userId,
+            isFavorite: store.favoriteChannelIds.contains(channel.id),
+            isMuted: store.isMuted(channel.id),
+            draft: channel.conversationId.flatMap { store.drafts[$0]?.previewText },
+            onSelect: {
+                store.selectedChannelId = channel.id
+                navigationPath = [channel.id]
+            },
+            onToggleFavorite: { store.toggleFavorite(channel.id) },
+            onToggleMuted: { store.toggleMuted(channel.id) },
+            onMarkRead: { Task { await store.markChannelAsRead(channel) } },
+            onSettings: { channelToEdit = channel }
+        )
     }
 
     @ViewBuilder
@@ -998,7 +1059,7 @@ private struct ChannelBottomBar: View {
         HStack {
             VStack(spacing: 3) {
                 Image(systemName: "bubble.left.and.bubble.right.fill")
-                    .font(.system(size: 20, weight: .semibold))
+                    .font(.title3.weight(.semibold))
                 Text("Chats")
                     .font(.caption2.weight(.semibold))
             }
@@ -1015,7 +1076,7 @@ private struct ChannelBottomBar: View {
             } label: {
                 VStack(spacing: 3) {
                     Image(systemName: "person.crop.circle")
-                        .font(.system(size: 21, weight: .semibold))
+                        .font(.title2.weight(.semibold))
                     Text("Perfil")
                         .font(.caption2.weight(.semibold))
                 }
@@ -1035,15 +1096,25 @@ private struct ChannelBottomBar: View {
 private struct DirectMessageRow: View {
     let dm: CoreDirectMessage
     let currentUserId: String
+    var isFavorite: Bool = false
+    var isMuted: Bool = false
+    var draft: String? = nil
 
-    private var previewText: String {
+    private var isUnread: Bool {
+        dm.unreadCount > 0 || dm.mentionCount > 0
+    }
+
+    private var previewText: Text {
+        if let draft, !draft.isEmpty {
+            return Text("Borrador: ").fontWeight(.semibold).foregroundStyle(.red) + Text(draft)
+        }
         guard let content = dm.lastMessageContent, !content.isEmpty else {
-            return "Inicia la conversación"
+            return Text("Inicia la conversación")
         }
         let firstName = dm.peer.displayName.split(whereSeparator: \.isWhitespace).first.map(String.init)
             ?? dm.peer.displayName
         let prefix = dm.lastMessageUserId == currentUserId ? "Tú: " : "\(firstName): "
-        return prefix + content
+        return Text(prefix + content)
     }
 
     var body: some View {
@@ -1051,12 +1122,21 @@ private struct DirectMessageRow: View {
             AvatarView(name: dm.peer.displayName, avatarURL: dm.peer.avatarURL, size: 40)
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(dm.peer.displayName)
-                    .font(.body.weight(.semibold))
-                    .lineLimit(1)
-                Text(previewText)
+                HStack(spacing: 6) {
+                    Text(dm.peer.displayName)
+                        .font(.body.weight(isUnread ? .bold : .regular))
+                        .lineLimit(1)
+
+                    if isMuted {
+                        Image(systemName: "bell.slash.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("Silenciado")
+                    }
+                }
+                previewText
                     .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(isUnread ? .primary : .secondary)
                     .lineLimit(1)
             }
 
@@ -1068,15 +1148,100 @@ private struct DirectMessageRow: View {
                         .font(.caption2)
                         .foregroundStyle(dm.unreadCount > 0 ? ZenitBrand.accent : .secondary)
                 }
-                if dm.unreadCount > 0 {
-                    CountBadge(
-                        text: CoreFormat.badgeCount(dm.unreadCount),
-                        color: dm.mentionCount > 0 ? .red : ZenitBrand.accent
-                    )
+                HStack(spacing: 6) {
+                    if isFavorite {
+                        Image(systemName: "pin.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("Fijado")
+                    }
+                    if dm.unreadCount > 0 {
+                        CountBadge(
+                            text: CoreFormat.badgeCount(dm.unreadCount),
+                            color: dm.mentionCount > 0 ? .red : ZenitBrand.accent
+                        )
+                    }
                 }
             }
         }
+        .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)
+        .accessibilityValue(isUnread ? "\(dm.unreadCount) sin leer" : "")
+    }
+}
+
+/// Fila de DM con las mismas acciones que un canal: leído (swipe completo),
+/// fijar y silenciar. `markChannelAsRead` ya acepta el canal fantasma del DM.
+private struct DirectMessageNavigationRow: View {
+    let dm: CoreDirectMessage
+    let currentUserId: String
+    let isFavorite: Bool
+    let isMuted: Bool
+    var draft: String? = nil
+    let onSelect: () -> Void
+    let onToggleFavorite: () -> Void
+    let onToggleMuted: () -> Void
+    let onMarkRead: () -> Void
+
+    private var isUnread: Bool {
+        dm.unreadCount > 0 || dm.mentionCount > 0
+    }
+
+    var body: some View {
+        DirectMessageRow(
+            dm: dm,
+            currentUserId: currentUserId,
+            isFavorite: isFavorite,
+            isMuted: isMuted,
+            draft: draft
+        )
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onSelect)
+        .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
+        .listRowBackground(Color.white)
+        .contextMenu {
+            Button(action: onToggleFavorite) {
+                Label(
+                    isFavorite ? "Quitar pin" : "Fijar",
+                    systemImage: isFavorite ? "pin.slash.fill" : "pin.fill"
+                )
+            }
+            if isUnread {
+                Button(action: onMarkRead) {
+                    Label("Marcar como leído", systemImage: "checkmark.circle")
+                }
+            }
+            Button(action: onToggleMuted) {
+                Label(
+                    isMuted ? "Activar notificaciones" : "Silenciar",
+                    systemImage: isMuted ? "bell" : "bell.slash"
+                )
+            }
+        }
+        .swipeActions(edge: .leading, allowsFullSwipe: isUnread) {
+            if isUnread {
+                Button(action: onMarkRead) {
+                    Label("Leído", systemImage: "checkmark.circle.fill")
+                }
+                .tint(ZenitBrand.accent)
+            }
+            Button(action: onToggleFavorite) {
+                Label(
+                    isFavorite ? "Quitar pin" : "Fijar",
+                    systemImage: isFavorite ? "pin.slash.fill" : "pin.fill"
+                )
+            }
+            .tint(.orange)
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button(action: onToggleMuted) {
+                Label(
+                    isMuted ? "Activar" : "Silenciar",
+                    systemImage: isMuted ? "bell" : "bell.slash"
+                )
+            }
+            .tint(ZenitBrand.olive)
+        }
     }
 }
 
@@ -1199,79 +1364,78 @@ private struct ChannelSearchResultRow: View {
 }
 
 private struct ChannelNavigationRow: View {
-    @ObservedObject var store: CoreChannelsStore
     let channel: CoreChannel
-    @Binding var navigationPath: [CoreChannel.ID]
-    var onEdit: ((CoreChannel) -> Void)? = nil
+    let preview: CoreMessage?
+    let currentUserId: String
+    let isFavorite: Bool
+    let isMuted: Bool
+    var draft: String? = nil
+    let onSelect: () -> Void
+    let onToggleFavorite: () -> Void
+    let onToggleMuted: () -> Void
+    let onMarkRead: () -> Void
+    let onSettings: () -> Void
+
+    private var isUnread: Bool {
+        channel.unreadCount > 0 || channel.mentionCount > 0
+    }
 
     var body: some View {
         ChannelRowView(
             channel: channel,
-            preview: channel.conversationId.flatMap { store.channelPreviews[$0] },
-            currentUserId: store.configuration.userId,
-            isFavorite: store.favoriteChannelIds.contains(channel.id),
-            isMuted: store.isMuted(channel.id)
+            preview: preview,
+            currentUserId: currentUserId,
+            isFavorite: isFavorite,
+            isMuted: isMuted,
+            draft: draft
         )
         .contentShape(Rectangle())
-        .onTapGesture {
-            store.selectedChannelId = channel.id
-            navigationPath = [channel.id]
-        }
+        .onTapGesture(perform: onSelect)
         .accessibilityAddTraits(.isButton)
         .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
         .listRowBackground(Color.white)
         .contextMenu {
-            if let onEdit {
-                Button {
-                    onEdit(channel)
-                } label: {
-                    Label("Configurar canal", systemImage: "gearshape")
-                }
+            Button(action: onSettings) {
+                Label("Configurar canal", systemImage: "gearshape")
             }
-            Button {
-                store.toggleFavorite(channel.id)
-            } label: {
+            Button(action: onToggleFavorite) {
                 Label(
-                    store.favoriteChannelIds.contains(channel.id) ? "Quitar pin" : "Fijar",
-                    systemImage: store.favoriteChannelIds.contains(channel.id) ? "pin.slash.fill" : "pin.fill"
+                    isFavorite ? "Quitar pin" : "Fijar",
+                    systemImage: isFavorite ? "pin.slash.fill" : "pin.fill"
                 )
             }
-            if channel.unreadCount > 0 || channel.mentionCount > 0 {
-                Button {
-                    Task { await store.markChannelAsRead(channel) }
-                } label: {
+            if isUnread {
+                Button(action: onMarkRead) {
                     Label("Marcar como leído", systemImage: "checkmark.circle")
                 }
             }
-            Button {
-                store.toggleMuted(channel.id)
-            } label: {
+            Button(action: onToggleMuted) {
                 Label(
-                    store.isMuted(channel.id) ? "Activar notificaciones" : "Silenciar",
-                    systemImage: store.isMuted(channel.id) ? "bell" : "bell.slash"
+                    isMuted ? "Activar notificaciones" : "Silenciar",
+                    systemImage: isMuted ? "bell" : "bell.slash"
                 )
             }
         }
-        .swipeActions(edge: .leading, allowsFullSwipe: false) {
-            Button {
-                store.toggleFavorite(channel.id)
-            } label: {
+        .swipeActions(edge: .leading, allowsFullSwipe: isUnread) {
+            if isUnread {
+                Button(action: onMarkRead) {
+                    Label("Leído", systemImage: "checkmark.circle.fill")
+                }
+                .tint(ZenitBrand.accent)
+            }
+            Button(action: onToggleFavorite) {
                 Label(
-                    store.favoriteChannelIds.contains(channel.id) ? "Unpin" : "Pin",
-                    systemImage: store.favoriteChannelIds.contains(channel.id) ? "pin.slash.fill" : "pin.fill"
+                    isFavorite ? "Quitar pin" : "Fijar",
+                    systemImage: isFavorite ? "pin.slash.fill" : "pin.fill"
                 )
             }
             .tint(.orange)
         }
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-            if let onEdit {
-                Button {
-                    onEdit(channel)
-                } label: {
-                    Label("Configurar", systemImage: "gearshape.fill")
-                }
-                .tint(ZenitBrand.olive)
+            Button(action: onSettings) {
+                Label("Configurar", systemImage: "gearshape.fill")
             }
+            .tint(ZenitBrand.olive)
         }
     }
 }
@@ -1282,6 +1446,11 @@ private struct ChannelRowView: View {
     let currentUserId: String
     let isFavorite: Bool
     var isMuted: Bool = false
+    var draft: String? = nil
+
+    private var isUnread: Bool {
+        channel.unreadCount > 0 || channel.mentionCount > 0
+    }
 
     var body: some View {
         HStack(spacing: 11) {
@@ -1290,7 +1459,7 @@ private struct ChannelRowView: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(channel.displayName)
-                        .font(.body.weight(.semibold))
+                        .font(.body.weight(isUnread ? .bold : .regular))
                         .lineLimit(1)
 
                     if channel.visibility == .private {
@@ -1310,7 +1479,9 @@ private struct ChannelRowView: View {
                 ChannelPreviewText(
                     preview: preview,
                     fallback: channel.subtitle,
-                    currentUserId: currentUserId
+                    currentUserId: currentUserId,
+                    isUnread: isUnread,
+                    draft: draft
                 )
             }
 
@@ -1328,7 +1499,7 @@ private struct ChannelRowView: View {
                         Image(systemName: "pin.fill")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                            .accessibilityLabel("Pinned")
+                            .accessibilityLabel("Fijado")
                     }
 
                     if channel.mentionCount > 0 {
@@ -1346,6 +1517,8 @@ private struct ChannelRowView: View {
             }
         }
         .padding(.vertical, 8)
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(isUnread ? "\(max(channel.unreadCount, channel.mentionCount)) sin leer" : "")
     }
 }
 
@@ -1353,6 +1526,8 @@ private struct ChannelPreviewText: View {
     let preview: CoreMessage?
     let fallback: String
     let currentUserId: String
+    var isUnread: Bool = false
+    var draft: String? = nil
 
     private var authorPrefix: String {
         guard let preview else { return "" }
@@ -1366,7 +1541,17 @@ private struct ChannelPreviewText: View {
     }
 
     var body: some View {
-        if let preview {
+        if let draft, !draft.isEmpty {
+            HStack(spacing: 5) {
+                Text("Borrador:")
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.red)
+                Text(draft)
+                    .foregroundStyle(.secondary)
+            }
+            .font(.subheadline)
+            .lineLimit(1)
+        } else if let preview {
             HStack(spacing: 5) {
                 Text(authorPrefix)
                     .fontWeight(.semibold)
@@ -1384,7 +1569,7 @@ private struct ChannelPreviewText: View {
                 }
             }
             .font(.subheadline)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(isUnread ? .primary : .secondary)
             .lineLimit(1)
         } else {
             Text(fallback)
@@ -1395,16 +1580,39 @@ private struct ChannelPreviewText: View {
     }
 }
 
+private struct MessageRowModel: Identifiable {
+    let message: CoreMessage
+    let showAuthorInfo: Bool
+    let showsDayBoundary: Bool
+    let showsNewMessagesDivider: Bool
+    var id: String { message.id }
+
+    /// Mensajes del mismo autor separados por más de este intervalo vuelven a
+    /// mostrar avatar y nombre (misma regla que Slack).
+    static let groupingWindow: TimeInterval = 5 * 60
+}
+
+/// Valores resueltos una sola vez por render de la lista para que cada fila
+/// no repita búsquedas lineales sobre miembros, lecturas, pins e hilos.
+private struct MessageListContext {
+    let currentUserId: String
+    let members: [CoreUserLite]
+    let reads: [String: Date]
+    let unreadThreadIds: Set<String>
+    let pinnedMessageIds: Set<String>
+    let oldestMessageId: String?
+}
+
 private struct ChatDetailView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var store: CoreChannelsStore
-    @ObservedObject var voiceStore: CoreVoiceRoomStore
+    let voiceStore: CoreVoiceRoomStore
     let channel: CoreChannel
+    let connectedVoiceChannelId: CoreChannel.ID?
+    let isVoiceConnected: Bool
     @Binding var navigationPath: [CoreChannel.ID]
     @State private var showVoicePanel = false
-    @State private var draft = ""
-    @State private var replyTarget: CoreMessage?
-    @State private var editTarget: CoreMessage?
+    @State private var composerState = ComposerState()
     @StateObject private var typingService = CoreTypingService()
     @State private var showChannelSearch = false
     @State private var channelSearchText = ""
@@ -1413,14 +1621,20 @@ private struct ChatDetailView: View {
     @State private var didSearchInChannel = false
     @State private var highlightedMessageId: String?
     @State private var pendingJumpId: String?
-    @State private var pendingAttachments: [CorePendingAttachment] = []
     @State private var selectedMessage: CoreMessage?
     @State private var threadRoot: CoreMessage?
     @State private var messageToForward: CoreMessage?
     @State private var messageInfoTarget: CoreMessage?
     @State private var showThreadsOverview = false
+    @State private var showChannelDetails = false
+    @State private var errorBanner: String?
+    @State private var errorBannerTask: Task<Void, Never>?
     @ObservedObject private var threadReads = ThreadReadTracker.shared
     @FocusState private var isComposerFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// La lista está invertida: offset ~0 es el final de la conversación.
+    @State private var isNearBottom = true
+    @State private var unseenCount = 0
     private let bottomID = "chat-bottom-anchor"
 
     var messages: [CoreMessage] {
@@ -1437,14 +1651,18 @@ private struct ChatDetailView: View {
         }.count
     }
 
-    private func hasUnreadThread(_ messageId: String) -> Bool {
-        guard let summary = threadSummaries.first(where: { $0.id == messageId }) else { return false }
-        return threadReads.isUnread(summary, currentUserId: store.configuration.userId)
+    private var unreadThreadIds: Set<String> {
+        let userId = store.configuration.userId
+        return Set(threadSummaries.lazy.filter { threadReads.isUnread($0, currentUserId: userId) }.map(\.id))
     }
 
     var body: some View {
         VStack(spacing: 0) {
             topBar
+
+            if let errorBanner {
+                errorBannerView(errorBanner)
+            }
 
             if let latestPin {
                 pinnedMessageBar(latestPin)
@@ -1484,21 +1702,25 @@ private struct ChatDetailView: View {
                     isPinned: store.isPinned(selectedMessage),
                     onDismiss: { self.selectedMessage = nil },
                     onReply: {
-                        replyTarget = selectedMessage
+                        composerState.replyTarget = selectedMessage
                         isComposerFocused = true
                         self.selectedMessage = nil
                     },
                     onEdit: {
-                        editTarget = selectedMessage
-                        replyTarget = nil
-                        draft = selectedMessage.content
+                        composerState.editTarget = selectedMessage
+                        composerState.replyTarget = nil
+                        composerState.draft = selectedMessage.content
                         isComposerFocused = true
                         self.selectedMessage = nil
                     },
                     onDelete: {
                         let target = selectedMessage
                         self.selectedMessage = nil
-                        Task { await store.deleteMessage(target) }
+                        if target.localState != nil {
+                            store.discardFailed(messageId: target.id)
+                        } else {
+                            Task { await store.deleteMessage(target) }
+                        }
                     },
                     onForward: {
                         messageToForward = selectedMessage
@@ -1515,6 +1737,7 @@ private struct ChatDetailView: View {
                     onTogglePin: {
                         let target = selectedMessage
                         self.selectedMessage = nil
+                        Haptics.snap()
                         Task { await store.togglePin(target) }
                     },
                     onInfo: {
@@ -1553,31 +1776,74 @@ private struct ChatDetailView: View {
         .sheet(isPresented: $showThreadsOverview) {
             ChannelThreadsView(store: store, channel: channel)
         }
+        .sheet(isPresented: $showChannelDetails) {
+            ChannelDetailsSheet(store: store, channel: channel) { messageId in
+                pendingJumpId = messageId
+            }
+        }
+        .composerDraftPersistence(
+            store: store,
+            key: channel.conversationId,
+            state: composerState,
+            replyCandidates: messages
+        )
         .task(id: channel.conversationId) {
             guard let conversationId = channel.conversationId else { return }
             await store.loadConversationReads(for: channel)
             await typingService.connect(conversationId: conversationId, configuration: store.configuration)
         }
-        .onChange(of: messages.count) { _, _ in
-            // Al llegar/enviarse mensajes, refresca las marcas de lectura para
-            // que las palomitas se actualicen.
-            Task { await store.loadConversationReads(for: channel) }
+        .onAppear {
+            store.setVisibleConversation(channel.conversationId)
         }
         .onDisappear {
+            store.clearVisibleConversation(channel.conversationId)
             Task { await typingService.disconnect() }
         }
-        .onChange(of: draft) { oldValue, newValue in
-            guard newValue != oldValue else { return }
-            if newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                typingService.userStoppedTyping(configuration: store.configuration)
-            } else {
-                typingService.userIsTyping(configuration: store.configuration)
-            }
+        .onChange(of: store.lastError) { _, newValue in
+            guard let newValue, !newValue.isEmpty else { return }
+            showErrorBanner(newValue)
         }
     }
 
+    private func showErrorBanner(_ text: String) {
+        errorBannerTask?.cancel()
+        withAnimation(.snappy) { errorBanner = text }
+        errorBannerTask = Task {
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled else { return }
+            withAnimation(.snappy) { errorBanner = nil }
+        }
+    }
+
+    private func errorBannerView(_ text: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.red)
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+            Spacer()
+            Button {
+                errorBannerTask?.cancel()
+                withAnimation(.snappy) { errorBanner = nil }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Cerrar aviso")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.red.opacity(0.08))
+        .overlay(alignment: .bottom) { Divider() }
+        .transition(.move(edge: .top).combined(with: .opacity))
+    }
+
     private var isConnectedToChannelVoice: Bool {
-        voiceStore.connectedChannel?.id == channel.id && voiceStore.isConnected
+        connectedVoiceChannelId == channel.id && isVoiceConnected
     }
 
     // MARK: - Secciones del body (separadas para ayudar al type-checker)
@@ -1588,7 +1854,7 @@ private struct ChatDetailView: View {
             unreadThreads: unreadThreadCount,
             voiceActive: isConnectedToChannelVoice,
             onBack: { dismiss() },
-            onRefresh: { Task { await store.open(channel, force: true) } },
+            onShowDetails: { showChannelDetails = true },
             onShowThreads: channel.conversationId == nil ? nil : { showThreadsOverview = true },
             // Los DMs no tienen fila en core_channels, así que no tienen sala de voz.
             onToggleVoice: channel.isDirectMessage ? nil : { withAnimation(.snappy) { showVoicePanel.toggle() } },
@@ -1698,8 +1964,23 @@ private struct ChatDetailView: View {
     private var messagesArea: some View {
         ScrollViewReader { proxy in
             messagesScroll
-                .onChange(of: messages.last?.id) { _, _ in
-                    scrollToBottom(proxy: proxy, animated: true)
+                .onScrollGeometryChange(for: Bool.self) { geometry in
+                    geometry.contentOffset.y < 80
+                } action: { _, nearBottom in
+                    guard nearBottom != isNearBottom else { return }
+                    isNearBottom = nearBottom
+                    if nearBottom {
+                        unseenCount = 0
+                    }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    if unseenCount > 0 {
+                        newMessagesPill(proxy: proxy)
+                    }
+                }
+                .animation(.snappy, value: unseenCount > 0)
+                .onChange(of: messages.last?.id) { previousId, _ in
+                    handleLatestMessageChange(previousId: previousId, proxy: proxy)
                 }
                 .onChange(of: pendingJumpId) { _, target in
                     guard let target else { return }
@@ -1708,31 +1989,57 @@ private struct ChatDetailView: View {
                     }
                 }
                 .task(id: channel.id) {
+                    unseenCount = 0
                     await store.open(channel)
-                    await store.loadMessagePins(for: channel)
-                    await store.loadPolls(for: channel)
-                    await store.loadChannelThreads(for: channel)
+                    async let pinsLoad: Void = store.loadMessagePins(for: channel)
+                    async let pollsLoad: Void = store.loadPolls(for: channel)
+                    async let threadsLoad: Void = store.loadChannelThreads(for: channel)
+                    _ = await (pinsLoad, pollsLoad, threadsLoad)
                     scrollToBottom(proxy: proxy, animated: false)
                 }
         }
     }
 
     private var messagesScroll: some View {
-        ScrollView {
+        let list = messages
+        let conversationId = channel.conversationId ?? ""
+        let calendar = Calendar.current
+        let rows = list.indices.map { index in
+            let message = list[index]
+            let previous = index == list.startIndex ? nil : list[index - 1]
+            return MessageRowModel(
+                message: message,
+                showAuthorInfo: previous.map {
+                    $0.userId != message.userId
+                        || message.createdAt.timeIntervalSince($0.createdAt) > MessageRowModel.groupingWindow
+                } ?? true,
+                showsDayBoundary: previous.map { !calendar.isDate($0.createdAt, inSameDayAs: message.createdAt) } ?? true,
+                showsNewMessagesDivider: message.id == store.newMessagesDividerId[conversationId]
+            )
+        }
+        let context = MessageListContext(
+            currentUserId: store.configuration.userId,
+            members: store.members(for: channel),
+            reads: store.conversationReads[conversationId] ?? [:],
+            unreadThreadIds: unreadThreadIds,
+            pinnedMessageIds: Set((store.messagePins[conversationId] ?? []).map(\.messageId)),
+            oldestMessageId: list.first?.id
+        )
+        return ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 Color.clear
                     .frame(height: 1)
                     .id(bottomID)
 
-                if store.isLoadingMessages[channel.conversationId ?? ""] == true {
+                if store.isLoadingMessages[conversationId] == true {
                     ProgressView()
                         .frame(maxWidth: .infinity)
                         .padding()
                         .scaleEffect(y: -1)
                 }
 
-                ForEach(messages.reversed()) { message in
-                    messageRow(message)
+                ForEach(rows.reversed()) { row in
+                    messageRow(row, context: context)
                 }
 
                 if store.isLoadingOlderMessages[channel.conversationId ?? ""] == true {
@@ -1754,7 +2061,7 @@ private struct ChatDetailView: View {
             isComposerFocused = false
         }
         .overlay {
-            if messages.isEmpty && store.isLoadingMessages[channel.conversationId ?? ""] != true {
+            if list.isEmpty && store.isLoadingMessages[conversationId] != true {
                 ContentUnavailableView(
                     "No messages yet",
                     systemImage: "bubble.left",
@@ -1764,34 +2071,75 @@ private struct ChatDetailView: View {
         }
     }
 
-    private func messageRow(_ message: CoreMessage) -> some View {
+    private func messageRow(_ row: MessageRowModel, context: MessageListContext) -> some View {
+        let message = row.message
+        let isMine = message.userId == context.currentUserId
         let rowBackground: Color = message.id == highlightedMessageId ? ZenitBrand.tealSoft : Color.clear
-        let showAuthorInfo: Bool
-        if let index = messages.firstIndex(where: { $0.id == message.id }), index > messages.startIndex {
-            showAuthorInfo = messages[messages.index(before: index)].userId != message.userId
-        } else {
-            showAuthorInfo = true
-        }
 
-        return MessageBubble(
+        return VStack(alignment: .leading, spacing: 0) {
+            if row.showsDayBoundary {
+                DaySeparator(date: message.createdAt)
+            }
+            if row.showsNewMessagesDivider {
+                newMessagesDivider
+            }
+            messageBubble(message, isMine: isMine, showAuthorInfo: row.showAuthorInfo, context: context)
+                .padding(.horizontal, 6)
+                .padding(.vertical, row.showAuthorInfo ? 6 : 1)
+                .background(rowBackground)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+        }
+        .id(message.id)
+        .scaleEffect(y: -1)
+        .onAppear {
+            guard message.id == context.oldestMessageId else { return }
+            Task { await store.loadOlderMessages(in: channel) }
+        }
+    }
+
+    private var newMessagesDivider: some View {
+        HStack(spacing: 8) {
+            Rectangle()
+                .fill(Color.red.opacity(0.55))
+                .frame(height: 1)
+            Text("Nuevos mensajes")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.red)
+            Rectangle()
+                .fill(Color.red.opacity(0.55))
+                .frame(height: 1)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 8)
+        .accessibilityAddTraits(.isHeader)
+    }
+
+    private func messageBubble(
+        _ message: CoreMessage,
+        isMine: Bool,
+        showAuthorInfo: Bool,
+        context: MessageListContext
+    ) -> some View {
+        MessageBubble(
             message: message,
-            isMine: message.userId == store.configuration.userId,
+            isMine: isMine,
             showAuthorInfo: showAuthorInfo,
-            mentionableUsers: store.members(for: channel),
+            mentionableUsers: context.members,
             currentUserName: store.configuration.displayName,
             poll: store.polls[message.id],
-            hasUnreadThread: hasUnreadThread(message.id),
-            isPinned: store.isPinned(message),
-            receipt: message.userId == store.configuration.userId
-                ? store.receipt(for: message, in: channel)
+            hasUnreadThread: context.unreadThreadIds.contains(message.id),
+            isPinned: context.pinnedMessageIds.contains(message.id),
+            receipt: isMine && message.localState == nil
+                ? MessageReceipt.compute(message: message, members: context.members, reads: context.reads)
                 : nil,
+            currentUserId: context.currentUserId,
             onVote: { optionId in
                 if let poll = store.polls[message.id] {
                     Task { await store.votePoll(poll, optionId: optionId) }
                 }
             },
             onReply: {
-                replyTarget = message
+                composerState.replyTarget = message
                 isComposerFocused = true
             },
             onLongPress: { selectedMessage = message },
@@ -1801,17 +2149,63 @@ private struct ChatDetailView: View {
             },
             onReact: { emoji in
                 Task { await store.react(to: message, emoji: emoji) }
+            },
+            onRetry: {
+                Task { await store.retrySend(messageId: message.id) }
             }
         )
-        .padding(.horizontal, 6)
-        .padding(.vertical, showAuthorInfo ? 6 : 1)
-        .background(rowBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .id(message.id)
-        .scaleEffect(y: -1)
-        .onAppear {
-            guard message.id == messages.first?.id else { return }
-            Task { await store.loadOlderMessages(in: channel) }
+        .equatable()
+    }
+
+    private func newMessagesPill(proxy: ScrollViewProxy) -> some View {
+        Button {
+            Haptics.tap()
+            unseenCount = 0
+            scrollToBottom(proxy: proxy, animated: true)
+        } label: {
+            HStack(spacing: 6) {
+                Text(unseenCount == 1 ? "1 nuevo" : "\(unseenCount) nuevos")
+                    .font(.caption.weight(.semibold))
+                Image(systemName: "arrow.down")
+                    .font(.caption.weight(.bold))
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(ZenitBrand.accent)
+            .clipShape(Capsule())
+            .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+        }
+        .buttonStyle(.plain)
+        .padding(.trailing, 14)
+        .padding(.bottom, 12)
+        .transition(reduceMotion ? .opacity : .scale.combined(with: .opacity))
+        .accessibilityLabel("\(unseenCount) mensajes nuevos, ir al final")
+    }
+
+    /// Desplaza al final solo si el usuario ya estaba ahí o el mensaje es
+    /// propio; si está leyendo historial, cuenta el mensaje para la píldora.
+    private func handleLatestMessageChange(previousId: String?, proxy: ScrollViewProxy) {
+        guard let latest = messages.last else { return }
+        let isMine = latest.userId == store.configuration.userId
+        let prefix = CoreChannelsStore.optimisticMessageIdPrefix
+        // El envío propio cambia de id al confirmarlo el servidor; ese
+        // reemplazo no debe volver a desplazar la lista.
+        if isMine, previousId?.hasPrefix(prefix) == true, !latest.id.hasPrefix(prefix) {
+            return
+        }
+        if isMine || isNearBottom {
+            scrollToBottom(proxy: proxy, animated: true)
+            return
+        }
+        // Una página puede traer varios mensajes a la vez; si el último
+        // cambió por un borrado, la lista se encogió y no hay nada nuevo.
+        if let previousId, let index = messages.lastIndex(where: { $0.id == previousId }) {
+            let added = messages.count - index - 1
+            guard added > 0 else { return }
+            unseenCount += added
+        } else {
+            unseenCount += 1
         }
     }
 
@@ -1837,29 +2231,34 @@ private struct ChatDetailView: View {
         ComposerView(
             store: store,
             channel: channel,
-            draft: $draft,
-            replyTarget: $replyTarget,
-            editTarget: $editTarget,
-            attachments: $pendingAttachments,
+            state: composerState,
             mentionableUsers: store.members(for: channel),
-            isSending: store.isSending,
             isFocused: $isComposerFocused,
+            onTypingChange: { isTyping in
+                if isTyping {
+                    typingService.userIsTyping(configuration: store.configuration)
+                } else {
+                    typingService.userStoppedTyping(configuration: store.configuration)
+                }
+            },
             onSend: handleSend
         )
     }
 
-    private func handleSend() {
-        let text = draft
-        let quoted = replyTarget
-        let editing = editTarget
-        let attachments = pendingAttachments
-        draft = ""
-        replyTarget = nil
-        editTarget = nil
-        pendingAttachments = []
+    private func handleSend(
+        _ text: String,
+        attachments: [CorePendingAttachment],
+        replyTo quoted: CoreMessage?,
+        editing: CoreMessage?
+    ) {
+        Haptics.tap()
         Task {
             if let editing {
-                await store.editMessage(editing, newContent: text)
+                if await !store.editMessage(editing, newContent: text),
+                   composerState.draft.isEmpty, composerState.editTarget == nil {
+                    composerState.editTarget = editing
+                    composerState.draft = text
+                }
             } else {
                 await store.send(
                     text,
@@ -2016,14 +2415,12 @@ private struct ChatDetailView: View {
 
     private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
         guard !messages.isEmpty else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            if animated {
-                withAnimation(.snappy) {
-                    proxy.scrollTo(bottomID, anchor: .top)
-                }
-            } else {
+        if animated {
+            withAnimation(.snappy) {
                 proxy.scrollTo(bottomID, anchor: .top)
             }
+        } else {
+            proxy.scrollTo(bottomID, anchor: .top)
         }
     }
 }
@@ -2217,28 +2614,28 @@ private struct ChatTopBar: View {
     var unreadThreads: Int = 0
     var voiceActive: Bool = false
     let onBack: () -> Void
-    let onRefresh: () -> Void
+    let onShowDetails: () -> Void
     var onShowThreads: (() -> Void)? = nil
     var onToggleVoice: (() -> Void)? = nil
     var onToggleSearch: (() -> Void)? = nil
 
+    private static let controlSize: CGFloat = 44
+
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 4) {
             Button(action: onBack) {
                 Image(systemName: "chevron.left")
-                    .font(.system(size: 20, weight: .semibold))
-                    .frame(width: 38, height: 38)
+                    .font(.title3.weight(.semibold))
+                    .frame(width: Self.controlSize, height: Self.controlSize)
             }
             .buttonStyle(.plain)
             .foregroundStyle(.primary)
-            .accessibilityLabel("Back")
+            .accessibilityLabel("Atrás")
 
-            ChannelLogoView(channel: channel, size: 32)
+            Button(action: onShowDetails) {
+                HStack(spacing: 8) {
+                    ChannelLogoView(channel: channel, size: 32)
 
-            Button {
-                onShowThreads?()
-            } label: {
-                HStack(spacing: 6) {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(channel.displayName)
                             .font(.subheadline.weight(.semibold))
@@ -2247,40 +2644,54 @@ private struct ChatTopBar: View {
                         Text(
                             channel.isDirectMessage
                                 ? "Mensaje directo"
-                                : (channel.visibility == .private ? "Private channel" : "Channel")
+                                : (channel.visibility == .private ? "Canal privado" : "Canal")
                         )
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                     }
 
-                    if onShowThreads != nil {
-                        Image(systemName: "chevron.down")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.secondary)
-
-                        if unreadThreads > 0 {
-                            Text("\(unreadThreads)")
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(ZenitBrand.accent)
-                                .clipShape(Capsule())
-                        }
-                    }
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
                 }
+                .frame(minHeight: Self.controlSize)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .disabled(onShowThreads == nil)
-            .accessibilityLabel("Ver threads del canal")
+            .accessibilityLabel(channel.isDirectMessage ? "Detalles de la conversación" : "Detalles del canal")
 
-            Spacer()
+            Spacer(minLength: 0)
+
+            if let onShowThreads {
+                Button(action: onShowThreads) {
+                    Image(systemName: "bubble.left.and.bubble.right")
+                        .font(.body.weight(.semibold))
+                        .frame(width: Self.controlSize, height: Self.controlSize)
+                        .overlay(alignment: .topTrailing) {
+                            if unreadThreads > 0 {
+                                Text(CoreFormat.badgeCount(unreadThreads))
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(ZenitBrand.accent)
+                                    .clipShape(Capsule())
+                                    .offset(x: -2, y: 6)
+                            }
+                        }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.primary)
+                .accessibilityLabel(
+                    unreadThreads > 0 ? "Ver threads del canal, \(unreadThreads) sin leer" : "Ver threads del canal"
+                )
+            }
 
             if let onToggleSearch {
                 Button(action: onToggleSearch) {
                     Image(systemName: "magnifyingglass")
-                        .font(.system(size: 18, weight: .semibold))
-                        .frame(width: 34, height: 38)
+                        .font(.body.weight(.semibold))
+                        .frame(width: Self.controlSize, height: Self.controlSize)
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.primary)
@@ -2290,33 +2701,33 @@ private struct ChatTopBar: View {
             if let onToggleVoice {
                 Button(action: onToggleVoice) {
                     Image(systemName: voiceActive ? "speaker.wave.2.fill" : "speaker.wave.2")
-                        .font(.system(size: 19, weight: .semibold))
-                        .frame(width: 38, height: 38)
+                        .font(.title3.weight(.semibold))
+                        .frame(width: Self.controlSize, height: Self.controlSize)
                         .overlay(alignment: .topTrailing) {
                             if voiceActive {
                                 Circle()
                                     .fill(Color.green)
                                     .frame(width: 9, height: 9)
-                                    .offset(x: -4, y: 6)
+                                    .offset(x: -7, y: 9)
                             }
                         }
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(voiceActive ? ZenitBrand.accent : .primary)
-                .accessibilityLabel("Voz del canal")
+                .accessibilityLabel(voiceActive ? "Voz del canal, conectado" : "Voz del canal")
             }
 
-            Button(action: onRefresh) {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 19, weight: .semibold))
-                    .frame(width: 38, height: 38)
+            Button(action: onShowDetails) {
+                Image(systemName: "info.circle")
+                    .font(.title3.weight(.semibold))
+                    .frame(width: Self.controlSize, height: Self.controlSize)
             }
             .buttonStyle(.plain)
             .foregroundStyle(.primary)
-            .accessibilityLabel("Refresh messages")
+            .accessibilityLabel("Información del canal")
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 2)
         .background(Color.white)
         .overlay(alignment: .bottom) {
             Divider()
@@ -2643,19 +3054,19 @@ private struct ConnectedVoiceBar: View {
                 Task { await voiceStore.toggleMute() }
             } label: {
                 Image(systemName: voiceStore.isMuted ? "mic.slash.fill" : "mic.fill")
-                    .frame(width: 34, height: 34)
+                    .frame(width: 44, height: 44)
             }
             .buttonStyle(.borderless)
-            .accessibilityLabel(voiceStore.isMuted ? "Unmute" : "Mute")
+            .accessibilityLabel(voiceStore.isMuted ? "Activar micrófono" : "Silenciar micrófono")
 
             Button(role: .destructive) {
                 Task { await voiceStore.leave() }
             } label: {
                 Image(systemName: "phone.down.fill")
-                    .frame(width: 34, height: 34)
+                    .frame(width: 44, height: 44)
             }
             .buttonStyle(.borderless)
-            .accessibilityLabel("Leave voice channel")
+            .accessibilityLabel("Salir del canal de voz")
         }
         .padding(.horizontal)
         .padding(.vertical, 9)
@@ -2690,8 +3101,17 @@ private extension String {
     )
 
     var stickerReferences: [MessageStickerReference] {
+        parseStickers().refs
+    }
+
+    /// Una sola pasada del regex: devuelve los stickers y el texto sin sus marcas.
+    func parseStickers() -> (text: String, refs: [MessageStickerReference]) {
         let fullRange = NSRange(startIndex..<endIndex, in: self)
-        return Self.stickerReferenceRegex.matches(in: self, range: fullRange).compactMap { match in
+        let matches = Self.stickerReferenceRegex.matches(in: self, range: fullRange)
+        guard !matches.isEmpty else {
+            return (trimmingCharacters(in: .whitespacesAndNewlines), [])
+        }
+        let refs = matches.compactMap { match -> MessageStickerReference? in
             guard
                 let nameRange = Range(match.range(at: 1), in: self),
                 let urlRange = Range(match.range(at: 2), in: self),
@@ -2705,13 +3125,11 @@ private extension String {
                 url: url
             )
         }
-    }
-
-    var removingStickerReferences: String {
-        let fullRange = NSRange(startIndex..<endIndex, in: self)
-        return Self.stickerReferenceRegex
-            .stringByReplacingMatches(in: self, range: fullRange, withTemplate: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let stripped = NSMutableString(string: self)
+        for match in matches.reversed() {
+            stripped.replaceCharacters(in: match.range, with: "")
+        }
+        return ((stripped as String).trimmingCharacters(in: .whitespacesAndNewlines), refs)
     }
 }
 
@@ -2727,7 +3145,7 @@ private struct StickerMessageView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(stickers) { sticker in
-                AttachmentMediaView(url: sticker.url, isGIF: true)
+                AnimatedImageView(url: sticker.url, contentMode: .scaleAspectFit, targetSize: CGSize(width: 170, height: 170))
                 .frame(width: 170, height: 170)
                 .contentShape(Rectangle())
                 .accessibilityLabel("Sticker \(sticker.name)")
@@ -2746,19 +3164,64 @@ private struct MessageBubble: View {
     var hasUnreadThread: Bool = false
     var isPinned: Bool = false
     var receipt: MessageReceipt? = nil
+    var currentUserId: String = ""
     var onVote: (String) -> Void = { _ in }
     let onReply: () -> Void
     let onLongPress: () -> Void
     let onThread: () -> Void
     let onMentionTap: (CoreUserLite) -> Void
     let onReact: (String) -> Void
+    var onRetry: () -> Void = {}
+    // Derivados del mensaje una sola vez (regex de stickers y detector de
+    // enlaces) en vez de en cada evaluación del body.
+    private let isVoiceNoteOnly: Bool
+    private let textContent: String
+    private let stickers: [MessageStickerReference]
+    private let linkURL: URL?
 
-    private var isVoiceNoteOnly: Bool {
-        message.content == "Nota de voz" && (message.attachments?.contains { $0.isAudio } ?? false)
-    }
-
-    private var textContent: String {
-        message.content.removingStickerReferences
+    init(
+        message: CoreMessage,
+        isMine: Bool,
+        showAuthorInfo: Bool,
+        mentionableUsers: [CoreUserLite],
+        currentUserName: String,
+        poll: CorePoll? = nil,
+        hasUnreadThread: Bool = false,
+        isPinned: Bool = false,
+        receipt: MessageReceipt? = nil,
+        currentUserId: String = "",
+        onVote: @escaping (String) -> Void = { _ in },
+        onReply: @escaping () -> Void,
+        onLongPress: @escaping () -> Void,
+        onThread: @escaping () -> Void,
+        onMentionTap: @escaping (CoreUserLite) -> Void,
+        onReact: @escaping (String) -> Void,
+        onRetry: @escaping () -> Void = {}
+    ) {
+        self.message = message
+        self.isMine = isMine
+        self.showAuthorInfo = showAuthorInfo
+        self.mentionableUsers = mentionableUsers
+        self.currentUserName = currentUserName
+        self.poll = poll
+        self.hasUnreadThread = hasUnreadThread
+        self.isPinned = isPinned
+        self.receipt = receipt
+        self.currentUserId = currentUserId
+        self.onVote = onVote
+        self.onReply = onReply
+        self.onLongPress = onLongPress
+        self.onThread = onThread
+        self.onMentionTap = onMentionTap
+        self.onReact = onReact
+        self.onRetry = onRetry
+        let isVoiceNoteOnly = message.content == "Nota de voz"
+            && (message.attachments?.contains { $0.isAudio } ?? false)
+        let (textContent, stickers) = message.content.parseStickers()
+        self.isVoiceNoteOnly = isVoiceNoteOnly
+        self.textContent = textContent
+        self.stickers = stickers
+        self.linkURL = isVoiceNoteOnly ? nil : textContent.firstDetectedURL
     }
 
     var body: some View {
@@ -2766,12 +3229,11 @@ private struct MessageBubble: View {
             if isMine {
                 Spacer(minLength: 52)
             } else {
-                if showAuthorInfo {
-                    AvatarView(name: message.authorName, avatarURL: message.author?.avatarURL)
-                } else {
-                    Color.clear
-                        .frame(width: 30, height: 30)
-                }
+                // Se mantiene en el árbol (en vez de alternar con Color.clear)
+                // para que la fila no vuelva a pedir el avatar al agruparse.
+                AvatarView(name: message.authorName, avatarURL: message.author?.avatarURL)
+                    .opacity(showAuthorInfo ? 1 : 0)
+                    .accessibilityHidden(!showAuthorInfo)
             }
 
             VStack(alignment: isMine ? .trailing : .leading, spacing: 5) {
@@ -2834,16 +3296,23 @@ private struct MessageBubble: View {
                     .shadow(color: .black.opacity(isMine ? 0.03 : 0.06), radius: 1, y: 1)
                 }
 
-                if !message.stickerReferences.isEmpty {
-                    StickerMessageView(stickers: message.stickerReferences)
+                if !stickers.isEmpty {
+                    StickerMessageView(stickers: stickers)
                 }
 
-                if !isVoiceNoteOnly, let linkURL = textContent.firstDetectedURL {
+                if let linkURL {
                     LinkPreviewCard(url: linkURL)
                 }
 
                 if let attachments = message.attachments, !attachments.isEmpty {
                     AttachmentStrip(attachments: attachments)
+                        .overlay {
+                            if message.localState == .sending {
+                                ProgressView()
+                                    .padding(10)
+                                    .background(.ultraThinMaterial, in: Circle())
+                            }
+                        }
                 }
 
                 if let poll {
@@ -2853,15 +3322,7 @@ private struct MessageBubble: View {
                 HStack(spacing: 6) {
                     if let reactions = message.reactions, !reactions.isEmpty {
                         ForEach(reactions.groupedByEmoji, id: \.emoji) { item in
-                            HStack(spacing: 3) {
-                                EmojiGlyph(item.emoji, size: 14)
-                                Text(String(item.count))
-                                    .font(.caption2.weight(.semibold))
-                            }
-                            .padding(.horizontal, 7)
-                                .padding(.vertical, 3)
-                                .background(.thinMaterial)
-                                .clipShape(Capsule())
+                            reactionChip(item)
                         }
                     }
 
@@ -2872,7 +3333,7 @@ private struct MessageBubble: View {
                             .accessibilityLabel("Mensaje anclado")
                     }
 
-                    Text(CoreFormat.relativeTime(message.createdAt))
+                    Text(message.createdAt.formatted(date: .omitted, time: .shortened))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
 
@@ -2882,9 +3343,23 @@ private struct MessageBubble: View {
                             .foregroundStyle(.secondary)
                     }
 
-                    if isMine, let receipt {
+                    if isMine, message.localState == .sending {
+                        Image(systemName: "clock")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("Enviando")
+                    } else if isMine, let receipt {
                         ReceiptTicks(receipt: receipt)
                     }
+                }
+
+                if message.localState == .failed {
+                    Button(action: onRetry) {
+                        Label("No se envió · Toca para reintentar", systemImage: "exclamationmark.circle.fill")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.red)
+                    }
+                    .buttonStyle(.plain)
                 }
 
                 if let replyCount = message.replyCount, replyCount > 0 {
@@ -2909,12 +3384,24 @@ private struct MessageBubble: View {
                 }
             }
             .contentShape(Rectangle())
-            .onLongPressGesture(minimumDuration: 0.35, perform: onLongPress)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(accessibilityLabel)
+            .accessibilityActions {
+                Button("Responder", action: onReply)
+                Button("Reaccionar", action: onLongPress)
+                Button("Ver hilo", action: onThread)
+                Button("Más opciones", action: onLongPress)
+            }
+            .onLongPressGesture(minimumDuration: 0.35) {
+                Haptics.press()
+                onLongPress()
+            }
             // Deslizar el mensaje hacia la derecha = responder (estilo WhatsApp).
             .simultaneousGesture(
                 DragGesture(minimumDistance: 35)
                     .onEnded { value in
                         if value.translation.width > 60, abs(value.translation.height) < 40 {
+                            Haptics.press()
                             onReply()
                         }
                     }
@@ -2924,6 +3411,45 @@ private struct MessageBubble: View {
                 Spacer(minLength: 52)
             }
         }
+    }
+
+    private func reactionChip(_ item: (emoji: String, count: Int, userIds: [String])) -> some View {
+        let mine = !currentUserId.isEmpty && item.userIds.contains(currentUserId)
+        return Button {
+            Haptics.select()
+            onReact(item.emoji)
+        } label: {
+            HStack(spacing: 3) {
+                EmojiGlyph(item.emoji, size: 14)
+                Text(String(item.count))
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(mine ? ZenitBrand.accent : .primary)
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(mine ? AnyShapeStyle(ZenitBrand.tealSoft) : AnyShapeStyle(.thinMaterial))
+            .clipShape(Capsule())
+            .overlay {
+                if mine {
+                    Capsule().stroke(ZenitBrand.accent, lineWidth: 1)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(item.emoji) \(item.count)")
+    }
+
+    /// Con `children: .combine` el texto de la burbuja se anexa solo; aquí va
+    /// el contexto que VoiceOver no puede inferir del contenido.
+    private var accessibilityLabel: String {
+        var parts = [isMine ? "Tú" : message.authorName, message.createdAt.formatted(date: .omitted, time: .shortened)]
+        if let attachments = message.attachments, !attachments.isEmpty {
+            parts.append(attachments.count == 1 ? "1 adjunto" : "\(attachments.count) adjuntos")
+        }
+        if let replyCount = message.replyCount, replyCount > 0 {
+            parts.append(replyCount == 1 ? "1 respuesta" : "\(replyCount) respuestas")
+        }
+        return parts.joined(separator: ", ")
     }
 
     private var authorColor: Color {
@@ -2936,6 +3462,23 @@ private struct MessageBubble: View {
         ]
         let value = message.userId.unicodeScalars.reduce(0) { $0 + Int($1.value) }
         return colors[value % colors.count]
+    }
+}
+
+/// Solo los datos que pintan la burbuja cuentan para el diff; las closures
+/// cambian en cada render y no deben invalidarla.
+extension MessageBubble: Equatable {
+    static func == (lhs: MessageBubble, rhs: MessageBubble) -> Bool {
+        lhs.message == rhs.message
+            && lhs.isMine == rhs.isMine
+            && lhs.showAuthorInfo == rhs.showAuthorInfo
+            && lhs.poll == rhs.poll
+            && lhs.hasUnreadThread == rhs.hasUnreadThread
+            && lhs.isPinned == rhs.isPinned
+            && lhs.receipt == rhs.receipt
+            && lhs.currentUserId == rhs.currentUserId
+            && lhs.currentUserName == rhs.currentUserName
+            && lhs.mentionableUsers == rhs.mentionableUsers
     }
 }
 
@@ -3172,7 +3715,7 @@ struct ReceiptTicks: View {
                 Image(systemName: "checkmark")
             }
         }
-        .font(.system(size: 10, weight: .bold))
+        .font(.caption2.weight(.bold))
         .foregroundStyle(color)
         .accessibilityLabel(accessibilityText)
     }
@@ -3201,6 +3744,7 @@ private struct MessageActionOverlay: View {
     var onInfo: (() -> Void)? = nil
     var onSaveSticker: (() -> Void)? = nil
     let onReact: (String) -> Void
+    @State private var showAllReactions = false
 
     private let reactions = ["👍", "❤️", "😂", "😮", "😢", "🙏"]
 
@@ -3212,58 +3756,94 @@ private struct MessageActionOverlay: View {
                 .onTapGesture(perform: onDismiss)
 
             VStack(alignment: isMine ? .trailing : .leading, spacing: 8) {
-                HStack(spacing: 4) {
-                    ForEach(reactions, id: \.self) { emoji in
+                if message.localState == nil {
+                    HStack(spacing: 4) {
+                        ForEach(reactions, id: \.self) { emoji in
+                            Button {
+                                Haptics.select()
+                                onReact(emoji)
+                            } label: {
+                                EmojiGlyph(emoji, size: 28)
+                                    .frame(width: 44, height: 44)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Reaccionar con \(emoji)")
+                        }
                         Button {
-                            onReact(emoji)
+                            withAnimation(.snappy) { showAllReactions.toggle() }
                         } label: {
-                            EmojiGlyph(emoji, size: 28)
-                                .frame(width: 40, height: 40)
+                            Image(systemName: showAllReactions ? "xmark.circle.fill" : "plus.circle.fill")
+                                .font(.title)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 44, height: 44)
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel(showAllReactions ? "Cerrar emojis" : "Más reacciones")
                     }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(.regularMaterial)
+                    .clipShape(Capsule())
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(.regularMaterial)
-                .clipShape(Capsule())
 
-                MessageContextPreview(message: message, isMine: isMine)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-
-                VStack(spacing: 0) {
-                    MessageActionRow(title: "Responder", systemImage: "arrowshape.turn.up.left", action: onReply)
-                    Divider().padding(.leading, 16)
-                    MessageActionRow(title: "Responder en thread", systemImage: "bubble.left.and.bubble.right", action: onThread)
-                    Divider().padding(.leading, 16)
-                    MessageActionRow(title: "Reenviar", systemImage: "arrowshape.turn.up.right", action: onForward)
-                    Divider().padding(.leading, 16)
-                    MessageActionRow(title: "Copiar", systemImage: "doc.on.doc", action: onCopy)
-                    Divider().padding(.leading, 16)
-                    MessageActionRow(
-                        title: isPinned ? "Desanclar" : "Anclar",
-                        systemImage: isPinned ? "pin.slash" : "pin",
-                        action: onTogglePin
+                if showAllReactions {
+                    WhatsAppEmojiPicker(
+                        onSelect: { emoji in
+                            Haptics.select()
+                            onReact(emoji)
+                        },
+                        onDelete: {}
                     )
-                    if let onInfo {
-                        Divider().padding(.leading, 16)
-                        MessageActionRow(title: "Vistos por", systemImage: "checkmark.circle", action: onInfo)
+                    .background(.regularMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                } else {
+                    MessageContextPreview(message: message, isMine: isMine)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+
+                    VStack(spacing: 0) {
+                        if message.localState != nil {
+                            // Un mensaje aún no confirmado no existe en el servidor:
+                            // solo copiar, y descartar si falló.
+                            MessageActionRow(title: "Copiar", systemImage: "doc.on.doc", action: onCopy)
+                            if message.localState == .failed, let onDelete {
+                                Divider().padding(.leading, 16)
+                                MessageActionRow(title: "Eliminar", systemImage: "trash", tint: .red, action: onDelete)
+                            }
+                        } else {
+                            MessageActionRow(title: "Responder", systemImage: "arrowshape.turn.up.left", action: onReply)
+                            Divider().padding(.leading, 16)
+                            MessageActionRow(title: "Responder en thread", systemImage: "bubble.left.and.bubble.right", action: onThread)
+                            Divider().padding(.leading, 16)
+                            MessageActionRow(title: "Reenviar", systemImage: "arrowshape.turn.up.right", action: onForward)
+                            Divider().padding(.leading, 16)
+                            MessageActionRow(title: "Copiar", systemImage: "doc.on.doc", action: onCopy)
+                            Divider().padding(.leading, 16)
+                            MessageActionRow(
+                                title: isPinned ? "Desanclar" : "Anclar",
+                                systemImage: isPinned ? "pin.slash" : "pin",
+                                action: onTogglePin
+                            )
+                            if let onInfo {
+                                Divider().padding(.leading, 16)
+                                MessageActionRow(title: "Vistos por", systemImage: "checkmark.circle", action: onInfo)
+                            }
+                            if let onSaveSticker {
+                                Divider().padding(.leading, 16)
+                                MessageActionRow(title: "Guardar sticker", systemImage: "square.and.arrow.down", action: onSaveSticker)
+                            }
+                            if isMine, let onEdit {
+                                Divider().padding(.leading, 16)
+                                MessageActionRow(title: "Editar", systemImage: "pencil", action: onEdit)
+                            }
+                            if isMine, let onDelete {
+                                Divider().padding(.leading, 16)
+                                MessageActionRow(title: "Eliminar", systemImage: "trash", tint: .red, action: onDelete)
+                            }
+                        }
                     }
-                    if let onSaveSticker {
-                        Divider().padding(.leading, 16)
-                        MessageActionRow(title: "Guardar sticker", systemImage: "square.and.arrow.down", action: onSaveSticker)
-                    }
-                    if isMine, let onEdit {
-                        Divider().padding(.leading, 16)
-                        MessageActionRow(title: "Editar", systemImage: "pencil", action: onEdit)
-                    }
-                    if isMine, let onDelete {
-                        Divider().padding(.leading, 16)
-                        MessageActionRow(title: "Eliminar", systemImage: "trash", tint: .red, action: onDelete)
-                    }
+                    .background(.regularMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
-                .background(.regularMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
             }
             .frame(maxWidth: 300, alignment: isMine ? .trailing : .leading)
             .padding(.horizontal, 24)
@@ -3378,39 +3958,59 @@ private struct ForwardMessageView: View {
     }
 }
 
-private struct ChannelLogoView: View {
+struct ChannelLogoView: View {
     let channel: CoreChannel
     let size: CGFloat
 
-    private var iconSource: ChannelIconSource? {
-        ChannelIconSource(rawValue: channel.metadata?.iconImage)
+    @Environment(\.displayScale) private var displayScale
+    @State private var decoded: UIImage?
+
+    private var rawIcon: String? { channel.metadata?.iconImage }
+
+    private var dataIcon: UIImage? {
+        decoded ?? ChannelIconDecoder.cached(channelId: channel.id, rawValue: rawIcon, size: size, scale: displayScale)
     }
 
-    @ViewBuilder
     var body: some View {
         Group {
-            switch iconSource {
-            case .data(let image)?:
+            if let image = dataIcon {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFill()
-            case .remote(let url)?:
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    default:
-                        fallback
-                    }
+            } else if let url = ChannelIconDecoder.remoteURL(from: rawIcon) {
+                RemoteImage(url: url, targetSize: CGSize(width: size, height: size)) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                } placeholder: {
+                    fallback
                 }
-            case nil:
+            } else {
                 fallback
             }
         }
         .frame(width: size, height: size)
         .clipShape(RoundedRectangle(cornerRadius: min(10, size * 0.24), style: .continuous))
+        .task(id: rawIcon) {
+            guard ChannelIconDecoder.isDataURL(rawIcon) else {
+                decoded = nil
+                return
+            }
+            let channelId = channel.id
+            let raw = rawIcon
+            let size = size
+            let scale = displayScale
+            if let hit = ChannelIconDecoder.cached(channelId: channelId, rawValue: raw, size: size, scale: scale) {
+                decoded = hit
+                return
+            }
+            decoded = nil
+            let image = await Task.detached(priority: .userInitiated) {
+                ChannelIconDecoder.decode(channelId: channelId, rawValue: raw, size: size, scale: scale)
+            }.value
+            guard !Task.isCancelled else { return }
+            decoded = image
+        }
     }
 
     private var fallback: some View {
@@ -3424,44 +4024,13 @@ private struct ChannelLogoView: View {
     }
 }
 
-/// Resolves a channel `iconImage` string into a renderable source.
-/// Supports both base64 `data:` URLs (PNGs uploaded from the web app) and
-/// regular remote URLs. `AsyncImage` does not load `data:` URLs, so those are
-/// decoded into a `UIImage` up front.
-private enum ChannelIconSource {
-    case data(UIImage)
-    case remote(URL)
-
-    init?(rawValue: String?) {
-        guard let raw = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
-            return nil
-        }
-
-        if raw.hasPrefix("data:") {
-            guard let commaIndex = raw.firstIndex(of: ","),
-                  let imageData = Data(base64Encoded: String(raw[raw.index(after: commaIndex)...])),
-                  let image = UIImage(data: imageData) else {
-                return nil
-            }
-            self = .data(image)
-            return
-        }
-
-        guard let url = URL(string: raw), url.scheme != nil else { return nil }
-        self = .remote(url)
-    }
-}
-
 private struct ThreadView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var store: CoreChannelsStore
     let channel: CoreChannel
     let root: CoreMessage
 
-    @State private var draft = ""
-    @State private var attachments: [CorePendingAttachment] = []
-    @State private var unusedReplyTarget: CoreMessage?
-    @State private var unusedEditTarget: CoreMessage?
+    @State private var composerState = ComposerState()
     @FocusState private var isFocused: Bool
     private let bottomID = "thread-bottom"
 
@@ -3470,7 +4039,9 @@ private struct ThreadView: View {
     }
 
     var body: some View {
-        NavigationStack {
+        let members = store.members(for: channel)
+        let currentUserName = store.configuration.displayName
+        return NavigationStack {
             VStack(spacing: 0) {
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -3478,9 +4049,10 @@ private struct ThreadView: View {
                             ThreadMessageRow(
                                 message: root,
                                 isRoot: true,
-                                mentionableUsers: store.members(for: channel),
-                                currentUserName: store.configuration.displayName
+                                mentionableUsers: members,
+                                currentUserName: currentUserName
                             )
+                            .equatable()
 
                             if store.isLoadingThread[root.id] == true {
                                 ProgressView()
@@ -3497,9 +4069,11 @@ private struct ThreadView: View {
                                     ThreadMessageRow(
                                         message: reply,
                                         isRoot: false,
-                                        mentionableUsers: store.members(for: channel),
-                                        currentUserName: store.configuration.displayName
+                                        mentionableUsers: members,
+                                        currentUserName: currentUserName,
+                                        onRetry: { Task { await store.retrySend(messageId: reply.id) } }
                                     )
+                                    .equatable()
                                 }
                             }
 
@@ -3518,18 +4092,11 @@ private struct ThreadView: View {
                     store: store,
                     channel: channel,
                     threadParentId: root.id,
-                    draft: $draft,
-                    replyTarget: $unusedReplyTarget,
-                    editTarget: $unusedEditTarget,
-                    attachments: $attachments,
-                    mentionableUsers: store.members(for: channel),
-                    isSending: store.isSending,
+                    state: composerState,
+                    mentionableUsers: members,
                     isFocused: $isFocused,
-                    onSend: {
-                        let text = draft
-                        let pending = attachments
-                        draft = ""
-                        attachments = []
+                    onSend: { text, pending, _, _ in
+                        Haptics.tap()
                         Task {
                             await store.sendThreadReply(
                                 text,
@@ -3541,6 +4108,7 @@ private struct ThreadView: View {
                     }
                 )
             }
+            .composerDraftPersistence(store: store, key: root.id, state: composerState)
             .navigationTitle("Thread")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -3569,6 +4137,7 @@ private struct ThreadMessageRow: View {
     let isRoot: Bool
     let mentionableUsers: [CoreUserLite]
     let currentUserName: String
+    var onRetry: () -> Void = {}
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -3578,9 +4147,17 @@ private struct ThreadMessageRow: View {
                 HStack(spacing: 6) {
                     Text(message.authorName)
                         .font(.subheadline.weight(.semibold))
-                    Text(CoreFormat.relativeTime(message.createdAt))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    TimelineView(.periodic(from: .now, by: 60)) { _ in
+                        Text(CoreFormat.relativeTime(message.createdAt))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if message.localState == .sending {
+                        Image(systemName: "clock")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("Enviando")
+                    }
                 }
 
                 if !message.content.isEmpty {
@@ -3591,6 +4168,15 @@ private struct ThreadMessageRow: View {
                         mentionableUsers: mentionableUsers,
                         currentUserName: currentUserName
                     )
+                }
+
+                if message.localState == .failed {
+                    Button(action: onRetry) {
+                        Label("No se envió · Toca para reintentar", systemImage: "exclamationmark.circle.fill")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.red)
+                    }
+                    .buttonStyle(.plain)
                 }
 
                 if let linkURL = message.content.firstDetectedURL {
@@ -3614,6 +4200,15 @@ private struct ThreadMessageRow: View {
         .overlay(alignment: .bottom) {
             if isRoot { Divider() }
         }
+    }
+}
+
+extension ThreadMessageRow: Equatable {
+    static func == (lhs: ThreadMessageRow, rhs: ThreadMessageRow) -> Bool {
+        lhs.message == rhs.message
+            && lhs.isRoot == rhs.isRoot
+            && lhs.currentUserName == rhs.currentUserName
+            && lhs.mentionableUsers == rhs.mentionableUsers
     }
 }
 
@@ -3829,18 +4424,18 @@ private enum ComposerPanel: Equatable {
 }
 
 private struct ComposerView: View {
-    @ObservedObject var store: CoreChannelsStore
+    let store: CoreChannelsStore
     let channel: CoreChannel
     var threadParentId: String? = nil
-    @Binding var draft: String
-    @Binding var replyTarget: CoreMessage?
-    @Binding var editTarget: CoreMessage?
-    @Binding var attachments: [CorePendingAttachment]
+    @Bindable var state: ComposerState
     let mentionableUsers: [CoreUserLite]
-    let isSending: Bool
     var isFocused: FocusState<Bool>.Binding
-    let onSend: () -> Void
+    var onTypingChange: ((Bool) -> Void)? = nil
+    /// (texto, adjuntos, mensaje citado, mensaje en edición)
+    let onSend: (String, [CorePendingAttachment], CoreMessage?, CoreMessage?) -> Void
     @State private var activePanel: ComposerPanel = .none
+    @ObservedObject private var keyboard = KeyboardObserver.shared
+    @State private var mentionSuggestions: [CoreUserLite] = []
     @State private var showFileImporter = false
     @State private var showPhotoPicker = false
     @StateObject private var voiceRecorder = VoiceNoteRecorder()
@@ -3851,23 +4446,42 @@ private struct ComposerView: View {
     @State private var showMediaEditor = false
 
     var canSend: Bool {
-        (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty) &&
-        !isLoadingPhotos &&
-        !isSending
+        (!state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !state.attachments.isEmpty) &&
+        !isLoadingPhotos
     }
 
-    private var mentionSuggestions: [CoreUserLite] {
-        guard let query = mentionQuery else { return [] }
+    /// Los paneles que sustituyen al teclado miden lo mismo que él para que el
+    /// intercambio no mueva la lista dos veces.
+    private var panelHeight: CGFloat {
+        keyboard.lastHeight ?? 300
+    }
+
+    private static let panelAnimation: Animation = .easeInOut(duration: 0.25)
+
+    private static func mentionSuggestions(for draft: String, in users: [CoreUserLite]) -> [CoreUserLite] {
+        guard let query = mentionQuery(in: draft) else { return [] }
         return Array(
-            mentionableUsers
+            users
                 .filter { query.isEmpty || $0.displayName.localizedCaseInsensitiveContains(query) }
                 .prefix(6)
         )
     }
 
+    private func send() {
+        let text = state.draft
+        let quoted = state.replyTarget
+        let editing = state.editTarget
+        let pending = state.attachments
+        state.draft = ""
+        state.replyTarget = nil
+        state.editTarget = nil
+        state.attachments = []
+        onSend(text, pending, quoted, editing)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            if let editTarget {
+            if let editTarget = state.editTarget {
                 HStack(spacing: 10) {
                     Image(systemName: "pencil")
                         .foregroundStyle(ZenitBrand.accent)
@@ -3882,8 +4496,8 @@ private struct ComposerView: View {
                     }
                     Spacer()
                     Button {
-                        self.editTarget = nil
-                        draft = ""
+                        state.editTarget = nil
+                        state.draft = ""
                     } label: {
                         Image(systemName: "xmark.circle.fill")
                             .foregroundStyle(.secondary)
@@ -3895,7 +4509,7 @@ private struct ComposerView: View {
                 .background(ZenitBrand.tealSoft)
             }
 
-            if let replyTarget {
+            if let replyTarget = state.replyTarget {
                 HStack(spacing: 10) {
                     Rectangle()
                         .fill(ZenitBrand.accent)
@@ -3916,7 +4530,7 @@ private struct ComposerView: View {
                     }
                     Spacer()
                     Button {
-                        self.replyTarget = nil
+                        state.replyTarget = nil
                     } label: {
                         Image(systemName: "xmark.circle.fill")
                             .foregroundStyle(.secondary)
@@ -3929,13 +4543,13 @@ private struct ComposerView: View {
                 .background(ZenitBrand.tealSoft)
             }
 
-            if !attachments.isEmpty || isLoadingPhotos || attachmentError != nil {
+            if !state.attachments.isEmpty || isLoadingPhotos || attachmentError != nil {
                 PendingAttachmentStrip(
-                    attachments: attachments,
+                    attachments: state.attachments,
                     isLoading: isLoadingPhotos,
                     error: attachmentError,
                     onRemove: { id in
-                        attachments.removeAll { $0.id == id }
+                        state.attachments.removeAll { $0.id == id }
                     }
                 )
             }
@@ -3973,14 +4587,14 @@ private struct ComposerView: View {
                         toggleToolsMenu()
                     } label: {
                         Image(systemName: activePanel == .menu ? "xmark" : "plus")
-                            .font(.system(size: 21, weight: .medium))
-                            .frame(width: 34, height: 38)
+                            .font(.title2.weight(.medium))
+                            .frame(minWidth: 44, minHeight: 44)
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(activePanel == .menu ? Color.accentColor : .secondary)
                     .accessibilityLabel("Herramientas")
 
-                    TextField("Mensaje", text: $draft, axis: .vertical)
+                    TextField("Mensaje", text: $state.draft, axis: .vertical)
                         .textFieldStyle(.plain)
                         .focused(isFocused)
                         .lineLimit(1...5)
@@ -3988,29 +4602,29 @@ private struct ComposerView: View {
                         .submitLabel(.send)
                         .onSubmit {
                             if canSend {
-                                onSend()
+                                send()
                             }
                         }
                         .onTapGesture {
-                            activePanel = .none
+                            withAnimation(Self.panelAnimation) { activePanel = .none }
                         }
                 }
                 .padding(.horizontal, 4)
                 .background(Color(red: 0.95, green: 0.96, blue: 0.96))
                 .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
 
-                Button(action: onSend) {
+                Button(action: send) {
                     Image(systemName: "paperplane.fill")
-                        .font(.system(size: 17, weight: .semibold))
+                        .font(.body.weight(.semibold))
                         .foregroundStyle(.white)
-                        .frame(width: 42, height: 42)
+                        .frame(width: 44, height: 44)
                         .background(Color(red: 0.08, green: 0.65, blue: 0.42))
                         .clipShape(Circle())
                 }
                 .buttonStyle(.plain)
                 .disabled(!canSend)
                 .opacity(canSend ? 1 : 0.35)
-                .accessibilityLabel("Send message")
+                .accessibilityLabel("Enviar mensaje")
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 7)
@@ -4018,19 +4632,34 @@ private struct ComposerView: View {
 
             composerPanels
         }
+        .onChange(of: state.draft, initial: true) { _, newValue in
+            mentionSuggestions = Self.mentionSuggestions(for: newValue, in: mentionableUsers)
+        }
+        .onChange(of: mentionableUsers) { _, users in
+            mentionSuggestions = Self.mentionSuggestions(for: state.draft, in: users)
+        }
+        .onChange(of: state.draft) { oldValue, newValue in
+            guard newValue != oldValue, let onTypingChange else { return }
+            onTypingChange(!newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
         .onChange(of: selectedPhotos) { _, items in
             guard !items.isEmpty else { return }
             Task { await loadPhotos(items) }
         }
         .onChange(of: isFocused.wrappedValue) { _, focused in
             if focused, activePanel == .menu || activePanel == .emoji {
-                activePanel = .none
+                withAnimation(Self.panelAnimation) { activePanel = .none }
+            }
+        }
+        .onChange(of: attachmentError) { _, error in
+            if error != nil {
+                Haptics.error()
             }
         }
         .photosPicker(
             isPresented: $showPhotoPicker,
             selection: $selectedPhotos,
-            maxSelectionCount: max(1, 5 - attachments.count),
+            maxSelectionCount: max(1, 5 - state.attachments.count),
             matching: .any(of: [.images, .videos])
         )
         .fullScreenCover(isPresented: $showMediaEditor) {
@@ -4081,6 +4710,9 @@ private struct ComposerView: View {
                 ComposerToolsTray(
                     tools: ComposerTool.allCases.filter { threadParentId == nil || $0 != .poll }
                 ) { handleToolSelection($0) }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: panelHeight, alignment: .top)
+                    .background(Color.white)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             case .command:
                 CommandPalettePanel { insertCommand($0) }
@@ -4088,16 +4720,22 @@ private struct ComposerView: View {
                 PollComposerPanel { question, options in submitPoll(question, options) }
             case .gif:
                 GifPickerPanel(apiKey: store.giphyAPIKey) { sendGif($0) }
+                    .frame(height: panelHeight)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             case .sticker:
                 StickerPickerPanel(store: store) { sendSticker($0) }
+                    .frame(height: panelHeight)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             case .emoji:
                 WhatsAppEmojiPicker(
-                    onSelect: { draft.append($0) },
+                    gridHeight: nil,
+                    onSelect: { state.draft.append($0) },
                     onDelete: {
-                        guard !draft.isEmpty else { return }
-                        draft.removeLast()
+                        guard !state.draft.isEmpty else { return }
+                        state.draft.removeLast()
                     }
                 )
+                .frame(height: panelHeight)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             case .none:
                 EmptyView()
@@ -4106,7 +4744,8 @@ private struct ComposerView: View {
     }
 
     private func toggleToolsMenu() {
-        withAnimation(.snappy) {
+        Haptics.tap()
+        withAnimation(Self.panelAnimation) {
             if activePanel == .menu {
                 activePanel = .none
             } else {
@@ -4119,7 +4758,7 @@ private struct ComposerView: View {
     private func handleToolSelection(_ tool: ComposerTool) {
         switch tool {
         case .command:
-            withAnimation(.snappy) { activePanel = .command }
+            withAnimation(Self.panelAnimation) { activePanel = .command }
         case .file:
             activePanel = .none
             showFileImporter = true
@@ -4129,22 +4768,28 @@ private struct ComposerView: View {
         case .audio:
             startVoiceRecording()
         case .poll:
-            withAnimation(.snappy) { activePanel = .poll }
+            withAnimation(Self.panelAnimation) { activePanel = .poll }
         case .emoji:
-            isFocused.wrappedValue = false
-            withAnimation(.snappy) { activePanel = .emoji }
+            showKeyboardSizedPanel(.emoji)
         case .gif:
-            isFocused.wrappedValue = false
-            withAnimation(.snappy) { activePanel = .gif }
+            showKeyboardSizedPanel(.gif)
         case .sticker:
+            showKeyboardSizedPanel(.sticker)
+        }
+    }
+
+    /// Cierra el teclado y abre el panel en la misma animación, con la
+    /// altura del teclado, para que el compositor no salte dos veces.
+    private func showKeyboardSizedPanel(_ panel: ComposerPanel) {
+        withAnimation(Self.panelAnimation) {
             isFocused.wrappedValue = false
-            withAnimation(.snappy) { activePanel = .sticker }
+            activePanel = panel
         }
     }
 
     private func insertCommand(_ command: String) {
-        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        draft = trimmed.isEmpty ? "\(command) " : "\(draft) \(command) "
+        let trimmed = state.draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        state.draft = trimmed.isEmpty ? "\(command) " : "\(state.draft) \(command) "
         activePanel = .none
         isFocused.wrappedValue = true
     }
@@ -4178,6 +4823,7 @@ private struct ComposerView: View {
     }
 
     private func startVoiceRecording() {
+        Haptics.tap()
         activePanel = .none
         isFocused.wrappedValue = false
         attachmentError = nil
@@ -4197,42 +4843,84 @@ private struct ComposerView: View {
                 return
             }
             attachmentError = nil
-            let quoted = threadParentId == nil ? replyTarget : nil
+            let quoted = threadParentId == nil ? state.replyTarget : nil
+            state.replyTarget = nil
             await store.sendVoiceNote(
                 data: data,
                 in: channel,
                 parentMessageId: threadParentId,
                 replyTo: quoted
             )
-            if let error = store.lastError {
-                attachmentError = "No se pudo enviar la nota de voz: \(error)"
-            } else {
-                replyTarget = nil
-            }
         }
     }
 
     private func handleFileImport(_ result: Result<[URL], Error>) {
         guard case let .success(urls) = result else { return }
-        for url in urls.prefix(max(0, 5 - attachments.count)) {
-            let scoped = url.startAccessingSecurityScopedResource()
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            guard let data = try? Data(contentsOf: url) else { continue }
-            guard data.count <= 15 * 1_024 * 1_024 else {
-                attachmentError = "Cada archivo debe pesar 15 MB o menos."
-                continue
-            }
-            attachments.append(
-                CorePendingAttachment(
-                    data: data,
-                    fileName: url.lastPathComponent,
-                    mimeType: CoreChannelsStore.mimeType(forFileName: url.lastPathComponent)
-                )
+        let selected = urls.prefix(max(0, 5 - state.attachments.count)).map { url in
+            FileImportRequest(
+                url: url,
+                fileName: url.lastPathComponent,
+                mimeType: CoreChannelsStore.mimeType(forFileName: url.lastPathComponent)
             )
+        }
+        guard !selected.isEmpty else { return }
+        isLoadingPhotos = true
+        attachmentError = nil
+        Task {
+            let outcome = await Self.importFiles(selected)
+            state.attachments.append(contentsOf: outcome.attachments)
+            if outcome.rejectedOversized {
+                attachmentError = "Cada archivo debe pesar 15 MB o menos."
+            } else if outcome.unreadable {
+                attachmentError = "No se pudo leer uno de los archivos."
+            }
+            isLoadingPhotos = false
         }
     }
 
-    private var mentionQuery: String? {
+    private nonisolated struct FileImportRequest: Sendable {
+        let url: URL
+        let fileName: String
+        let mimeType: String
+    }
+
+    private nonisolated struct FileImportOutcome: Sendable {
+        var attachments: [CorePendingAttachment] = []
+        var rejectedOversized = false
+        var unreadable = false
+    }
+
+    /// Copia los archivos elegidos a disco fuera del MainActor sin cargarlos
+    /// en memoria; la subida se hace después con `fromFile:`.
+    @concurrent
+    private static func importFiles(_ requests: [FileImportRequest]) async -> FileImportOutcome {
+        var outcome = FileImportOutcome()
+        for request in requests {
+            let url = request.url
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            guard size <= 15 * 1_024 * 1_024 else {
+                outcome.rejectedOversized = true
+                continue
+            }
+            guard let copy = try? PendingUploadStorage.importFile(at: url, fileName: request.fileName) else {
+                outcome.unreadable = true
+                continue
+            }
+            outcome.attachments.append(
+                CorePendingAttachment(
+                    fileURL: copy,
+                    fileName: request.fileName,
+                    mimeType: request.mimeType,
+                    sizeBytes: size
+                )
+            )
+        }
+        return outcome
+    }
+
+    private static func mentionQuery(in draft: String) -> String? {
         guard let atIndex = draft.lastIndex(of: "@") else { return nil }
         if atIndex > draft.startIndex {
             let previous = draft[draft.index(before: atIndex)]
@@ -4245,8 +4933,8 @@ private struct ComposerView: View {
     }
 
     private func insertMention(_ user: CoreUserLite) {
-        guard let atIndex = draft.lastIndex(of: "@") else { return }
-        draft.replaceSubrange(atIndex..<draft.endIndex, with: "@\(user.displayName) ")
+        guard let atIndex = state.draft.lastIndex(of: "@") else { return }
+        state.draft.replaceSubrange(atIndex..<state.draft.endIndex, with: "@\(user.displayName) ")
         isFocused.wrappedValue = true
     }
 
@@ -4260,7 +4948,7 @@ private struct ComposerView: View {
 
         var editorItems: [MediaEditorItem] = []
 
-        for item in items.prefix(max(0, 5 - attachments.count)) {
+        for item in items.prefix(max(0, 5 - state.attachments.count)) {
             do {
                 let isVideo = item.supportedContentTypes.contains { $0.conforms(to: .movie) }
 
@@ -4296,7 +4984,7 @@ private struct ComposerView: View {
                         attachmentError = "Cada GIF debe pesar 15 MB o menos."
                         continue
                     }
-                    attachments.append(
+                    state.attachments.append(
                         CorePendingAttachment(
                             data: data,
                             fileName: "image-\(UUID().uuidString).gif",
@@ -4321,6 +5009,21 @@ private struct ComposerView: View {
             }
         }
 
+        // Las versiones reducidas de todas las fotos se generan en paralelo.
+        let prepared = await withTaskGroup(of: (Int, MediaEditorItem).self) { group in
+            for (index, item) in editorItems.enumerated() where !item.isVideo {
+                group.addTask { (index, await item.preparingPreviews()) }
+            }
+            var results: [(Int, MediaEditorItem)] = []
+            for await result in group {
+                results.append(result)
+            }
+            return results
+        }
+        for (index, item) in prepared {
+            editorItems[index] = item
+        }
+
         if !editorItems.isEmpty {
             mediaEditorItems = editorItems
             showMediaEditor = true
@@ -4332,7 +5035,8 @@ private struct ComposerView: View {
     private func sendEditedMedia(_ editedAttachments: [CorePendingAttachment], caption: String) {
         guard !editedAttachments.isEmpty else { return }
         attachmentError = nil
-        let quoted = threadParentId == nil ? replyTarget : nil
+        let quoted = threadParentId == nil ? state.replyTarget : nil
+        state.replyTarget = nil
         Task {
             await store.send(
                 caption,
@@ -4341,11 +5045,6 @@ private struct ComposerView: View {
                 parentMessageId: threadParentId,
                 replyTo: quoted
             )
-            if let error = store.lastError {
-                attachmentError = "No se pudo enviar: \(error)"
-            } else {
-                replyTarget = nil
-            }
         }
     }
 }
@@ -4469,33 +5168,47 @@ private extension Color {
     }
 }
 
-private enum ChannelImageProcessor {
+/// Reduce y codifica la imagen elegida para icono/fondo del canal. Síncrono y
+/// costoso (decodifica + JPEG + base64): ejecutar en `Task.detached`.
+private nonisolated enum ChannelImageProcessor {
     static func dataURL(from data: Data, maxBytes: Int) -> String? {
-        if data.count <= maxBytes, detectedMime(data) != nil {
-            return "data:\(detectedMime(data) ?? "image/jpeg");base64,\(data.base64EncodedString())"
+        if data.count <= maxBytes, let mime = detectedMime(data) {
+            return "data:\(mime);base64,\(data.base64EncodedString())"
         }
         guard let image = UIImage(data: data) else { return nil }
         var maxDimension: CGFloat = 1024
         for _ in 0..<6 {
-            let resized = resize(image, maxDimension: maxDimension)
-            var quality: CGFloat = 0.8
-            while quality >= 0.3 {
-                if let jpeg = resized.jpegData(compressionQuality: quality), jpeg.count <= maxBytes {
-                    return "data:image/jpeg;base64,\(jpeg.base64EncodedString())"
-                }
-                quality -= 0.15
+            guard let resized = resize(image, maxDimension: maxDimension) else { return nil }
+            if let jpeg = jpegData(resized, maxBytes: maxBytes) {
+                return "data:image/jpeg;base64,\(jpeg.base64EncodedString())"
             }
             maxDimension *= 0.7
         }
         return nil
     }
 
-    static func image(fromDataURL dataURL: String) -> UIImage? {
-        guard let comma = dataURL.firstIndex(of: ","),
-              let data = Data(base64Encoded: String(dataURL[dataURL.index(after: comma)...])) else {
-            return nil
+    /// Calidad 0.8 si cabe; si no, búsqueda binaria de la mayor calidad (≥ 0.3)
+    /// que quepa en `maxBytes`.
+    private static func jpegData(_ image: UIImage, maxBytes: Int) -> Data? {
+        guard let initial = image.jpegData(compressionQuality: 0.8) else { return nil }
+        if initial.count <= maxBytes { return initial }
+        var low: CGFloat = 0.3
+        var high: CGFloat = 0.8
+        var best: Data?
+        for _ in 0..<5 {
+            let mid = (low + high) / 2
+            guard let candidate = image.jpegData(compressionQuality: mid) else { break }
+            if candidate.count <= maxBytes {
+                best = candidate
+                low = mid
+            } else {
+                high = mid
+            }
         }
-        return UIImage(data: data)
+        if best == nil, let floor = image.jpegData(compressionQuality: 0.3), floor.count <= maxBytes {
+            best = floor
+        }
+        return best
     }
 
     private static func detectedMime(_ data: Data) -> String? {
@@ -4508,20 +5221,19 @@ private enum ChannelImageProcessor {
         return nil
     }
 
-    private static func resize(_ image: UIImage, maxDimension: CGFloat) -> UIImage {
-        let largestSide = max(image.size.width, image.size.height)
+    private static func resize(_ image: UIImage, maxDimension: CGFloat) -> UIImage? {
+        let pixelWidth = image.size.width * image.scale
+        let pixelHeight = image.size.height * image.scale
+        let largestSide = max(pixelWidth, pixelHeight)
         guard largestSide > maxDimension, largestSide > 0 else { return image }
-        let scale = maxDimension / largestSide
-        let newSize = CGSize(width: image.size.width * scale, height: image.size.height * scale)
-        let format = UIGraphicsImageRendererFormat.default()
-        format.scale = 1
-        return UIGraphicsImageRenderer(size: newSize, format: format).image { _ in
-            image.draw(in: CGRect(origin: .zero, size: newSize))
-        }
+        let factor = maxDimension / largestSide
+        return image.preparingThumbnail(
+            of: CGSize(width: (pixelWidth * factor).rounded(), height: (pixelHeight * factor).rounded())
+        )
     }
 }
 
-private struct ChannelSettingsView: View {
+struct ChannelSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var store: CoreChannelsStore
     /// nil = crear canal; con valor = configurar canal existente (paridad web).
@@ -4537,6 +5249,11 @@ private struct ChannelSettingsView: View {
     @State private var iconImage = ""
     @State private var iconPickerItem: PhotosPickerItem?
     @State private var backgroundPickerItem: PhotosPickerItem?
+    @State private var iconPreview: UIImage?
+    @State private var backgroundPreview: UIImage?
+    @State private var isProcessingIcon = false
+    @State private var isProcessingBackground = false
+    @Environment(\.displayScale) private var displayScale
     @State private var theme = ChannelThemeDraft()
     @State private var memberSearch = ""
     @State private var memberIds: Set<String>
@@ -4642,18 +5359,28 @@ private struct ChannelSettingsView: View {
             }
             .onChange(of: iconPickerItem) { _, item in
                 guard let item else { return }
-                loadPickedImage(item, maxBytes: 800_000, errorMessage: "El icono debe pesar menos de 800 KB") { dataURL in
+                loadPickedImage(item, maxBytes: 800_000, errorMessage: "El icono debe pesar menos de 800 KB", processing: $isProcessingIcon) { dataURL in
                     iconImage = dataURL
                 }
                 iconPickerItem = nil
             }
             .onChange(of: backgroundPickerItem) { _, item in
                 guard let item else { return }
-                loadPickedImage(item, maxBytes: 1_500_000, errorMessage: "La imagen debe pesar menos de 1.5 MB para guardarse en el tema del canal") { dataURL in
+                loadPickedImage(item, maxBytes: 1_500_000, errorMessage: "La imagen debe pesar menos de 1.5 MB para guardarse en el tema del canal", processing: $isProcessingBackground) { dataURL in
                     theme.backgroundImage = dataURL
                     theme.preset = "custom"
                 }
                 backgroundPickerItem = nil
+            }
+            .onChange(of: iconImage, initial: true) { _, dataURL in
+                refreshPreview(dataURL, size: 56) { image in
+                    if iconImage == dataURL { iconPreview = image }
+                }
+            }
+            .onChange(of: theme.backgroundImage, initial: true) { _, dataURL in
+                refreshPreview(dataURL, size: 400) { image in
+                    if theme.backgroundImage == dataURL { backgroundPreview = image }
+                }
             }
         }
     }
@@ -4736,7 +5463,7 @@ private struct ChannelSettingsView: View {
         Section {
             HStack(spacing: 12) {
                 Group {
-                    if let image = ChannelImageProcessor.image(fromDataURL: iconImage) {
+                    if let image = iconPreview {
                         Image(uiImage: image)
                             .resizable()
                             .scaledToFill()
@@ -4751,6 +5478,9 @@ private struct ChannelSettingsView: View {
 
                 PhotosPicker(selection: $iconPickerItem, matching: .images) {
                     Text(iconImage.isEmpty ? "Elegir imagen" : "Cambiar imagen")
+                }
+                if isProcessingIcon {
+                    ProgressView()
                 }
 
                 Spacer()
@@ -4793,6 +5523,9 @@ private struct ChannelSettingsView: View {
             HStack {
                 PhotosPicker(selection: $backgroundPickerItem, matching: .images) {
                     Label(theme.backgroundImage.isEmpty ? "Imagen de fondo" : "Cambiar imagen de fondo", systemImage: "photo")
+                }
+                if isProcessingBackground {
+                    ProgressView()
                 }
                 Spacer()
                 if !theme.backgroundImage.isEmpty {
@@ -4874,7 +5607,7 @@ private struct ChannelSettingsView: View {
         .background {
             ZStack {
                 Color(hexString: theme.background)
-                if let image = ChannelImageProcessor.image(fromDataURL: theme.backgroundImage) {
+                if let image = backgroundPreview {
                     Image(uiImage: image)
                         .resizable()
                         .scaledToFill()
@@ -5177,19 +5910,39 @@ private struct ChannelSettingsView: View {
         _ item: PhotosPickerItem,
         maxBytes: Int,
         errorMessage: String,
+        processing: Binding<Bool>,
         assign: @escaping (String) -> Void
     ) {
         Task {
             imageError = nil
+            processing.wrappedValue = true
+            defer { processing.wrappedValue = false }
             guard let data = try? await item.loadTransferable(type: Data.self) else {
                 imageError = "No se pudo cargar la imagen"
                 return
             }
-            if let dataURL = ChannelImageProcessor.dataURL(from: data, maxBytes: maxBytes) {
+            let dataURL = await Task.detached(priority: .userInitiated) {
+                ChannelImageProcessor.dataURL(from: data, maxBytes: maxBytes)
+            }.value
+            if let dataURL {
                 assign(dataURL)
             } else {
                 imageError = errorMessage
             }
+        }
+    }
+
+    private func refreshPreview(_ dataURL: String, size: CGFloat, assign: @escaping (UIImage?) -> Void) {
+        guard ChannelIconDecoder.isDataURL(dataURL) else {
+            assign(nil)
+            return
+        }
+        let scale = displayScale
+        Task {
+            let image = await Task.detached(priority: .userInitiated) {
+                ChannelIconDecoder.thumbnail(fromDataURL: dataURL, size: size, scale: scale)
+            }.value
+            assign(image)
         }
     }
 
@@ -5439,25 +6192,22 @@ private struct PendingAttachmentStrip: View {
     }
 }
 
-private struct AvatarView: View {
+struct AvatarView: View {
     let name: String
     let avatarURL: URL?
     var size: CGFloat = 30
 
     var body: some View {
-        AsyncImage(url: avatarURL) { phase in
-            switch phase {
-            case .success(let image):
-                image.resizable().scaledToFill()
-            default:
-                Circle()
-                    .fill(Color.accentColor.gradient)
-                    .overlay {
-                        Text(CoreFormat.initials(name))
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(.white)
-                    }
-            }
+        RemoteImage(url: avatarURL, targetSize: CGSize(width: size, height: size)) { image in
+            image.resizable().scaledToFill()
+        } placeholder: {
+            Circle()
+                .fill(Color.accentColor.gradient)
+                .overlay {
+                    Text(CoreFormat.initials(name))
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.white)
+                }
         }
         .frame(width: size, height: size)
         .clipShape(Circle())
@@ -5500,3 +6250,18 @@ private struct MissingChannelView: View {
 #Preview {
     ContentView()
 }
+
+#if DEBUG
+#Preview("Canales") {
+    NavigationStack {
+        ChannelListView(
+            store: .preview(),
+            voiceStore: CoreVoiceRoomStore(),
+            connectedVoiceChannel: nil,
+            showingSettings: .constant(false),
+            showingNewChannel: .constant(false),
+            navigationPath: .constant([])
+        )
+    }
+}
+#endif

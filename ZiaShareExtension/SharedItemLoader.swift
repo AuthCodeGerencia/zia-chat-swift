@@ -1,6 +1,7 @@
 import Foundation
 import UniformTypeIdentifiers
 import UIKit
+import ImageIO
 
 /// Contenido recibido desde otra app (WhatsApp, Fotos, Archivos, Safari...).
 struct SharedPayload {
@@ -13,12 +14,19 @@ struct SharedPayload {
 /// Convierte los NSItemProvider del extension context en texto + adjuntos
 /// listos para enviarse con ConvexCoreClient.
 enum SharedItemLoader {
-    /// Límite por archivo para no exceder la memoria de la extensión (~120 MB).
+    /// Límite por archivo. Los archivos viven en disco (App Group), así que el
+    /// tope real de memoria lo marca `maxTotalBytes`.
     static let maxAttachmentBytes = 45 * 1024 * 1024
+    /// Presupuesto total de la petición para no superar la memoria de la
+    /// extensión (~120 MB) al subir varios adjuntos.
+    static let maxTotalBytes = 60 * 1024 * 1024
+    /// Lado máximo (px) al que se reducen las imágenes compartidas.
+    static let maxImageDimension: CGFloat = 2048
 
     static func load(from items: [NSExtensionItem]) async -> SharedPayload {
         var payload = SharedPayload()
         var texts: [String] = []
+        var totalBytes = 0
 
         for item in items {
             for provider in item.attachments ?? [] {
@@ -33,9 +41,12 @@ enum SharedItemLoader {
                         texts.append(text)
                     }
                 } else if let attachment = await loadFile(provider) {
-                    if attachment.sizeBytes > maxAttachmentBytes {
+                    if attachment.sizeBytes > maxAttachmentBytes
+                        || totalBytes + attachment.sizeBytes > maxTotalBytes {
                         payload.oversizedFileNames.append(attachment.fileName)
+                        PendingUploadStorage.remove([attachment])
                     } else {
+                        totalBytes += attachment.sizeBytes
                         payload.attachments.append(attachment)
                     }
                 } else if let text = await loadText(provider), !text.isEmpty {
@@ -132,18 +143,77 @@ enum SharedItemLoader {
                     if accessed { url.stopAccessingSecurityScopedResource() }
                 }
 
-                guard let data = try? Data(contentsOf: url) else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-                continuation.resume(returning: makeAttachment(
-                    data: data,
+                // La URL solo es válida dentro de este bloque: se copia al
+                // contenedor compartido sin cargar el archivo en memoria.
+                continuation.resume(returning: makeFileAttachment(
+                    sourceURL: url,
                     provider: provider,
-                    typeIdentifier: typeIdentifier,
-                    sourceURL: url
+                    typeIdentifier: typeIdentifier
                 ))
             }
         }
+    }
+
+    /// Solo las fotos opacas se recodifican a JPEG; PNG/WebP/GIF conservan sus
+    /// bytes y extensión para no perder transparencia (stickers de WhatsApp).
+    private nonisolated static func isOpaquePhoto(_ type: UTType) -> Bool {
+        type.conforms(to: .jpeg) || type.conforms(to: .heic)
+            || type.conforms(to: .heif) || type.conforms(to: .tiff)
+    }
+
+    private nonisolated static func hasAlpha(_ image: UIImage) -> Bool {
+        guard let alphaInfo = image.cgImage?.alphaInfo else { return false }
+        switch alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast:
+            return false
+        default:
+            return true
+        }
+    }
+
+    private nonisolated static func makeFileAttachment(
+        sourceURL: URL,
+        provider: NSItemProvider,
+        typeIdentifier: String
+    ) -> CorePendingAttachment? {
+        let type = UTType(filenameExtension: sourceURL.pathExtension)
+            ?? UTType(typeIdentifier)
+            ?? .data
+        let fileName = sourceURL.lastPathComponent.isEmpty
+            ? self.fileName(provider: provider, type: type)
+            : sourceURL.lastPathComponent
+
+        if isOpaquePhoto(type), let jpeg = downsampledJPEG(at: sourceURL) {
+            return CorePendingAttachment(
+                data: jpeg,
+                fileName: ((fileName as NSString).deletingPathExtension) + ".jpg",
+                mimeType: "image/jpeg"
+            )
+        }
+
+        guard let copy = try? PendingUploadStorage.importFile(at: sourceURL, fileName: fileName) else {
+            return nil
+        }
+        return CorePendingAttachment(
+            fileURL: copy,
+            fileName: fileName,
+            mimeType: type.preferredMIMEType ?? "application/octet-stream"
+        )
+    }
+
+    /// Decodifica la imagen reducida a `maxImageDimension` con ImageIO (sin
+    /// cargar el bitmap completo) y la recodifica como JPEG.
+    private nonisolated static func downsampledJPEG(at url: URL) -> Data? {
+        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else { return nil }
+        let options = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxImageDimension,
+        ] as CFDictionary
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else { return nil }
+        return UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.85)
     }
 
     private static func loadDataRepresentation(
@@ -170,19 +240,17 @@ enum SharedItemLoader {
                         typeIdentifier: typeIdentifier
                     ))
                 } else if let image = value as? UIImage,
-                          let data = image.pngData() {
+                          let (data, type) = downsampledImageData(image) {
                     continuation.resume(returning: CorePendingAttachment(
                         data: data,
-                        fileName: fileName(provider: provider, type: .png),
-                        mimeType: UTType.png.preferredMIMEType ?? "image/png"
+                        fileName: fileName(provider: provider, type: type),
+                        mimeType: type.preferredMIMEType ?? "image/jpeg"
                     ))
-                } else if let url = value as? URL,
-                          let data = try? Data(contentsOf: url) {
-                    continuation.resume(returning: makeAttachment(
-                        data: data,
+                } else if let url = value as? URL, url.isFileURL {
+                    continuation.resume(returning: makeFileAttachment(
+                        sourceURL: url,
                         provider: provider,
-                        typeIdentifier: typeIdentifier,
-                        sourceURL: url
+                        typeIdentifier: typeIdentifier
                     ))
                 } else {
                     continuation.resume(returning: nil)
@@ -191,23 +259,48 @@ enum SharedItemLoader {
         }
     }
 
-    private static func makeAttachment(
+    /// Reduce la imagen a `maxImageDimension`; las imágenes con canal alfa se
+    /// codifican como PNG para conservar la transparencia.
+    private nonisolated static func downsampledImageData(_ image: UIImage) -> (Data, UTType)? {
+        let largest = max(image.size.width, image.size.height) * image.scale
+        var working = image
+        if largest > maxImageDimension {
+            let factor = maxImageDimension / largest
+            let target = CGSize(
+                width: (image.size.width * factor).rounded(),
+                height: (image.size.height * factor).rounded()
+            )
+            guard let thumbnail = image.preparingThumbnail(of: target) else { return nil }
+            working = thumbnail
+        }
+        if hasAlpha(image) {
+            return working.pngData().map { ($0, .png) }
+        }
+        return working.jpegData(compressionQuality: 0.85).map { ($0, .jpeg) }
+    }
+
+    private nonisolated static func makeAttachment(
         data: Data,
         provider: NSItemProvider,
-        typeIdentifier: String,
-        sourceURL: URL? = nil
+        typeIdentifier: String
     ) -> CorePendingAttachment {
-        let type = sourceURL.flatMap { UTType(filenameExtension: $0.pathExtension) }
-            ?? UTType(typeIdentifier)
-            ?? .data
+        let type = UTType(typeIdentifier) ?? .data
+        if isOpaquePhoto(type), let image = UIImage(data: data),
+           let (downsampled, outputType) = downsampledImageData(image) {
+            return CorePendingAttachment(
+                data: downsampled,
+                fileName: fileName(provider: provider, type: outputType),
+                mimeType: outputType.preferredMIMEType ?? "image/jpeg"
+            )
+        }
         return CorePendingAttachment(
             data: data,
-            fileName: sourceURL?.lastPathComponent ?? fileName(provider: provider, type: type),
+            fileName: fileName(provider: provider, type: type),
             mimeType: type.preferredMIMEType ?? "application/octet-stream"
         )
     }
 
-    private static func fileName(provider: NSItemProvider, type: UTType) -> String {
+    private nonisolated static func fileName(provider: NSItemProvider, type: UTType) -> String {
         let suggested = provider.suggestedName?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let suggested, !suggested.isEmpty {
             if (suggested as NSString).pathExtension.isEmpty,

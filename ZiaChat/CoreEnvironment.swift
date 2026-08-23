@@ -1,6 +1,6 @@
 import Foundation
 
-struct CoreEnvironment {
+nonisolated struct CoreEnvironment: Sendable {
     var supabaseURL: String = ""
     var supabaseAnonKey: String = ""
     var convexURL: String = ""
@@ -13,7 +13,11 @@ struct CoreEnvironment {
     private static let projectAppURL = "https://portal.agenciadevio.com"
     private static let projectGiphyAPIKey = "LwWVGWkTKc9oLNkkZmhyZlL1v0PlXmI0"
 
-    static func load(filePath: String = #filePath) -> CoreEnvironment {
+    /// Instancia única: `load()` copia el entorno del proceso y puede leer un
+    /// dotenv, así que no debe ejecutarse en rutas de render (avatares, etc.).
+    static let shared: CoreEnvironment = load()
+
+    private static func load() -> CoreEnvironment {
         let process = ProcessInfo.processInfo.environment
         var environment = CoreEnvironment(
             supabaseURL: process["NEXT_PUBLIC_SUPABASE_URL"] ?? "",
@@ -31,7 +35,7 @@ struct CoreEnvironment {
             return environment
         }
 
-        let envValues = dotenvValues(from: azankReactEnvURL(filePath: filePath))
+        let envValues = dotenvValues()
         if environment.supabaseURL.isEmpty {
             environment.supabaseURL = envValues["NEXT_PUBLIC_SUPABASE_URL"] ?? ""
         }
@@ -65,20 +69,21 @@ struct CoreEnvironment {
         return environment
     }
 
-    private static func azankReactEnvURL(filePath: String) -> URL {
-        URL(fileURLWithPath: filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("azank-react")
-            .appendingPathComponent(".env.local")
-    }
-
-    private static func dotenvValues(from url: URL) -> [String: String] {
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+    /// Solo en simulador de desarrollo: `ZIA_DOTENV_PATH` (variable de entorno
+    /// del esquema) apunta a un `.env.local`. En dispositivo/release no se toca disco.
+    private static func dotenvValues() -> [String: String] {
+        #if DEBUG && targetEnvironment(simulator)
+        guard let path = ProcessInfo.processInfo.environment["ZIA_DOTENV_PATH"], !path.isEmpty,
+              let text = try? String(contentsOfFile: path, encoding: .utf8) else {
             return [:]
         }
+        return parseDotenv(text)
+        #else
+        return [:]
+        #endif
+    }
 
+    private static func parseDotenv(_ text: String) -> [String: String] {
         var values: [String: String] = [:]
         for rawLine in text.components(separatedBy: .newlines) {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)

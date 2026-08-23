@@ -6,7 +6,6 @@ xcuserdata/
 # Swift Package Manager
 .build/
 .swiftpm/
-Package.resolved
 
 # macOS
 .DS_Store
@@ -19,3 +18,12 @@ Package.resolved
 *.ipa
 *.dSYM.zip
 *.dSYM
+
+# Tooling
+.pnpm-store/
+node_modules/
+supabase/.temp/
+
+# Secrets
+.env*
+Secrets.xcconfig

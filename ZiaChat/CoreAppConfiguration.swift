@@ -63,7 +63,7 @@ struct CoreAppConfiguration: Codable, Equatable {
         !anonKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    var hasSessionContext: Bool {
+    nonisolated var hasSessionContext: Bool {
         !accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !userId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         empresaId != nil
@@ -126,7 +126,7 @@ enum CoreConfigurationStore {
     }
 
     static func load() -> CoreAppConfiguration {
-        let environmentDefaults = CoreEnvironment.load()
+        let environmentDefaults = CoreEnvironment.shared
         // Lee primero del contenedor compartido (extensión + app); cae al
         // standard para sesiones guardadas antes de introducir el App Group.
         let sharedData = sharedDefaults?.data(forKey: key)

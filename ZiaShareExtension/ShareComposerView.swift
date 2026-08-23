@@ -40,7 +40,7 @@ struct ShareComposerView: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
-                        Button("Cancelar", action: onCancel)
+                        Button("Cancelar", action: cancel)
                             .disabled(phase == .sending)
                     }
                     ToolbarItem(placement: .confirmationAction) {
@@ -204,7 +204,7 @@ struct ShareComposerView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 24)
-            Button("Cerrar", action: onCancel)
+            Button("Cerrar", action: cancel)
                 .buttonStyle(.bordered)
                 .padding(.top, 6)
         }
@@ -262,6 +262,12 @@ struct ShareComposerView: View {
         }
     }
 
+    /// Al cancelar se borran las copias hechas en el contenedor compartido.
+    private func cancel() {
+        PendingUploadStorage.remove(attachments)
+        onCancel()
+    }
+
     private func send() async {
         if saveAsStickers {
             await saveStickers()
@@ -282,6 +288,7 @@ struct ShareComposerView: View {
                 content: messageText.trimmingCharacters(in: .whitespacesAndNewlines),
                 attachments: attachments
             )
+            PendingUploadStorage.remove(attachments)
             phase = .sent
             try? await Task.sleep(for: .milliseconds(700))
             onFinish()
@@ -299,12 +306,20 @@ struct ShareComposerView: View {
         do {
             let client = try ConvexCoreClient(configuration: configuration)
             for (index, attachment) in imageAttachments.enumerated() {
-                let format = StickerImageFormat.detect(attachment.data)
+                let data: Data
+                if attachment.isFileBacked, let url = attachment.fileURL {
+                    data = try Data(contentsOf: url)
+                } else {
+                    data = attachment.data
+                }
+                guard !data.isEmpty else { continue }
+                let format = StickerImageFormat.detect(data)
                 let base = (attachment.fileName as NSString).deletingPathExtension
                 let name = base.isEmpty ? "Sticker \(index + 1)" : base
                 let fileName = "sticker-\(Int(Date().timeIntervalSince1970 * 1000))-\(index).\(format.fileExtension)"
-                _ = try await client.uploadSticker(name: name, data: attachment.data, fileName: fileName, mimeType: format.mimeType)
+                _ = try await client.uploadSticker(name: name, data: data, fileName: fileName, mimeType: format.mimeType)
             }
+            PendingUploadStorage.remove(attachments)
             phase = .sent
             try? await Task.sleep(for: .milliseconds(900))
             onFinish()
@@ -336,42 +351,25 @@ private struct ShareChannelIcon: View {
     let channel: CoreChannel
     let size: CGFloat
 
-    private enum IconSource {
-        case data(UIImage)
-        case remote(URL)
+    @State private var decoded: UIImage?
 
-        init?(rawValue: String?) {
-            guard let raw = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
-                return nil
-            }
+    /// Máximo en píxeles: la extensión tiene ~120 MB, así que nunca se
+    /// decodifica el icono completo.
+    private static let maxPixel: CGFloat = 90
 
-            if raw.hasPrefix("data:") {
-                guard let commaIndex = raw.firstIndex(of: ","),
-                      let imageData = Data(base64Encoded: String(raw[raw.index(after: commaIndex)...])),
-                      let image = UIImage(data: imageData) else {
-                    return nil
-                }
-                self = .data(image)
-                return
-            }
+    private var rawIcon: String? { channel.metadata?.iconImage }
 
-            guard let url = URL(string: raw), url.scheme != nil else { return nil }
-            self = .remote(url)
-        }
-    }
-
-    private var iconSource: IconSource? {
-        IconSource(rawValue: channel.metadata?.iconImage)
+    private var dataIcon: UIImage? {
+        decoded ?? ChannelIconDecoder.cached(channelId: channel.id, rawValue: rawIcon, size: Self.maxPixel, scale: 1)
     }
 
     var body: some View {
         Group {
-            switch iconSource {
-            case .data(let image)?:
+            if let image = dataIcon {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFill()
-            case .remote(let url)?:
+            } else if let url = ChannelIconDecoder.remoteURL(from: rawIcon) {
                 AsyncImage(url: url) { phase in
                     switch phase {
                     case .success(let image):
@@ -382,12 +380,30 @@ private struct ShareChannelIcon: View {
                         fallback
                     }
                 }
-            case nil:
+            } else {
                 fallback
             }
         }
         .frame(width: size, height: size)
         .clipShape(RoundedRectangle(cornerRadius: min(10, size * 0.24), style: .continuous))
+        .task(id: rawIcon) {
+            guard ChannelIconDecoder.isDataURL(rawIcon) else {
+                decoded = nil
+                return
+            }
+            let channelId = channel.id
+            let raw = rawIcon
+            if let hit = ChannelIconDecoder.cached(channelId: channelId, rawValue: raw, size: Self.maxPixel, scale: 1) {
+                decoded = hit
+                return
+            }
+            decoded = nil
+            let image = await Task.detached(priority: .userInitiated) {
+                ChannelIconDecoder.decode(channelId: channelId, rawValue: raw, size: Self.maxPixel, scale: 1)
+            }.value
+            guard !Task.isCancelled else { return }
+            decoded = image
+        }
     }
 
     private var fallback: some View {

@@ -20,7 +20,32 @@ enum ConvexCoreError: LocalizedError {
     }
 }
 
-final class ConvexCoreClient {
+actor ConvexCoreClient {
+    /// Sesión para llamadas de API: timeouts cortos y espera de conectividad
+    /// para no colgar un minuto ni fallar en cortes breves de red.
+    static let apiSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 45
+        configuration.waitsForConnectivity = true
+        configuration.httpMaximumConnectionsPerHost = 6
+        return URLSession(configuration: configuration)
+    }()
+
+    static let uploadSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 300
+        configuration.waitsForConnectivity = true
+        configuration.httpMaximumConnectionsPerHost = 4
+        return URLSession(configuration: configuration)
+    }()
+
+    /// Perfiles de Supabase ya resueltos para pares de DM sin nombre/avatar.
+    @MainActor private static var peerProfileCache: [String: CoreUserLite] = [:]
+    /// Pares sin fila en Supabase; no se vuelven a pedir en cada refresh.
+    @MainActor private static var peerProfileMisses: Set<String> = []
+
     private let configuration: CoreAppConfiguration
     private let baseURL: URL
     private let decoder: JSONDecoder
@@ -32,10 +57,16 @@ final class ConvexCoreClient {
         guard !rawURL.isEmpty, let url = URL(string: rawURL) else { throw ConvexCoreError.invalidURL }
         self.configuration = configuration
         self.baseURL = url
-        self.decoder = JSONDecoder()
-        self.encoder = JSONEncoder()
-        decoder.dateDecodingStrategy = .custom(Self.decodeDate)
+        self.decoder = Self.makeDecoder()
+        let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .millisecondsSince1970
+        self.encoder = encoder
+    }
+
+    nonisolated private static func makeDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .custom(decodeDate)
+        return decoder
     }
 
     func listChannels() async throws -> [CoreChannel] {
@@ -47,10 +78,6 @@ final class ConvexCoreClient {
         return rows.map(\.coreChannel)
     }
 
-    func listChannelsFast() async throws -> [CoreChannel] {
-        try await listChannels()
-    }
-
     func listDirectMessages() async throws -> [CoreDirectMessage] {
         guard let empresaId = configuration.empresaId else { return [] }
         let rows: [ConvexDirectMessageDTO] = try await query(
@@ -58,7 +85,48 @@ final class ConvexCoreClient {
             ["empresaId": empresaId, "displayName": configuration.displayName.convexNilIfBlank as Any]
         )
         let directMessages = rows.map(\.coreDirectMessage)
-        return await hydrateDirectMessagePeersIfNeeded(directMessages)
+        return await MainActor.run { directMessages.map(Self.applyingCachedPeerProfile) }
+    }
+
+    nonisolated static func peerNeedsHydration(_ peer: CoreUserLite) -> Bool {
+        peer.avatarURLString?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false ||
+            peer.fullName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
+    }
+
+    @MainActor static func applyingCachedPeerProfile(_ dm: CoreDirectMessage) -> CoreDirectMessage {
+        guard peerNeedsHydration(dm.peer), let profile = peerProfileCache[dm.peer.id] else { return dm }
+        var hydrated = dm
+        hydrated.peer = merge(profile: profile, into: dm.peer)
+        return hydrated
+    }
+
+    /// Resuelve en Supabase los perfiles que faltan y devuelve solo los
+    /// encontrados; no bloquea la lista de DMs.
+    @MainActor func fetchMissingPeerProfiles(for directMessages: [CoreDirectMessage]) async -> [CoreUserLite] {
+        let missingPeerIds = Array(Set(directMessages.compactMap { dm in
+            Self.peerNeedsHydration(dm.peer)
+                && Self.peerProfileCache[dm.peer.id] == nil
+                && !Self.peerProfileMisses.contains(dm.peer.id) ? dm.peer.id : nil
+        }))
+        guard !missingPeerIds.isEmpty,
+              let profiles = try? await fetchSupabaseProfiles(userIds: missingPeerIds) else {
+            return []
+        }
+        for profile in profiles {
+            Self.peerProfileCache[profile.id] = profile
+        }
+        let found = Set(profiles.map(\.id))
+        Self.peerProfileMisses.formUnion(missingPeerIds.filter { !found.contains($0) })
+        return profiles
+    }
+
+    nonisolated private static func merge(profile: CoreUserLite, into peer: CoreUserLite) -> CoreUserLite {
+        CoreUserLite(
+            id: peer.id,
+            fullName: profile.fullName ?? peer.fullName,
+            avatarURLString: profile.avatarURLString ?? peer.avatarURLString,
+            roleId: profile.roleId ?? peer.roleId
+        )
     }
 
     func listMentionableUsers() async throws -> [CoreUserLite] {
@@ -99,7 +167,7 @@ final class ConvexCoreClient {
         request.httpMethod = "POST"
         request.setValue(mimeType, forHTTPHeaderField: "Content-Type")
         request.httpBody = data
-        let (responseData, response) = try await URLSession.shared.data(for: request)
+        let (responseData, response) = try await Self.uploadSession.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw ConvexCoreError.server(String(data: responseData, encoding: .utf8) ?? "No se pudo subir el sticker a Convex")
         }
@@ -244,19 +312,6 @@ final class ConvexCoreClient {
         try await listMessagePage(conversationId: conversationId, limit: 50)
     }
 
-    func enrichMessages(_ messages: [CoreMessage]) async throws -> [CoreMessage] {
-        messages
-    }
-
-    func enrichRealtimeMessage(_ message: CoreMessage) async -> CoreMessage {
-        (try? await getMessageById(message.id)) ?? message
-    }
-
-    func getMessageById(_ messageId: String) async throws -> CoreMessage? {
-        let row: ConvexMessageDTO? = try await query("messages:getById", ["messageId": messageId])
-        return row?.coreMessage
-    }
-
     func listThreadReplies(conversationId: String, parentMessageId: String) async throws -> [CoreMessage] {
         let page: ConvexMessagePageDTO = try await query(
             "messages:list",
@@ -326,16 +381,16 @@ final class ConvexCoreClient {
         let _: String = try await mutation("messages:markUnread", ["conversationId": conversationId])
     }
 
-    func react(messageId: String, emoji: String) async throws -> CoreMessage {
+    func react(messageId: String, emoji: String) async throws -> ConvexReactionToggle {
         let result: ConvexReactionToggleDTO = try await mutation(
             "messages:toggleReaction",
             ["messageId": messageId, "emoji": emoji]
         )
-        return result.message.coreMessage
-    }
-
-    func react(empresaId: Int, conversationId: String, messageId: String, emoji: String) async throws {
-        _ = try await react(messageId: messageId, emoji: emoji)
+        return ConvexReactionToggle(
+            message: result.message.coreMessage,
+            reaction: result.reaction?.coreReaction,
+            removed: result.removed
+        )
     }
 
     func updateMessage(messageId: String, content: String) async throws -> CoreMessage {
@@ -409,7 +464,7 @@ final class ConvexCoreClient {
     func listChannelThreads(conversationId: String) async throws -> [CoreThreadSummary] {
         let page: ConvexMessagePageDTO = try await query(
             "messages:list",
-            ["conversationId": conversationId, "parentMessageId": NSNull(), "limit": 100]
+            ["conversationId": conversationId, "parentMessageId": NSNull(), "limit": 30]
         )
         return page.messages
             .map(\.coreMessage)
@@ -425,57 +480,60 @@ final class ConvexCoreClient {
             .sorted { $0.lastReplyAt > $1.lastReplyAt }
     }
 
+    /// Sube los adjuntos en paralelo (máx. 3 a la vez) conservando el orden.
+    /// Los respaldados por archivo se envían con `upload(for:fromFile:)` para
+    /// no cargarlos en memoria.
     private func uploadAttachments(_ attachments: [CorePendingAttachment]) async throws -> [ConvexUploadedAttachment] {
-        var uploaded: [ConvexUploadedAttachment] = []
-        for attachment in attachments {
-            let uploadURL: String = try await mutation("messages:generateUploadUrl", [:])
-            guard let url = URL(string: uploadURL) else { throw ConvexCoreError.invalidURL }
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue(attachment.mimeType, forHTTPHeaderField: "Content-Type")
-            request.httpBody = attachment.data
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                throw ConvexCoreError.server(String(data: data, encoding: .utf8) ?? "No se pudo subir el adjunto a Convex")
+        guard !attachments.isEmpty else { return [] }
+
+        let maxConcurrent = 3
+        var results = [ConvexUploadedAttachment?](repeating: nil, count: attachments.count)
+        try await withThrowingTaskGroup(of: (Int, ConvexUploadedAttachment).self) { group in
+            var next = 0
+            func enqueue() {
+                guard next < attachments.count else { return }
+                let index = next
+                let attachment = attachments[index]
+                next += 1
+                // La URL de subida se pide dentro de cada tarea para que las
+                // mutaciones se solapen con las subidas en curso.
+                group.addTask {
+                    let uploadURL: String = try await self.mutation("messages:generateUploadUrl", [:])
+                    guard let url = URL(string: uploadURL) else { throw ConvexCoreError.invalidURL }
+                    return (index, try await Self.upload(attachment, to: url))
+                }
             }
-            let payload = try decoder.decode(ConvexUploadResponse.self, from: data)
-            uploaded.append(
-                ConvexUploadedAttachment(
-                    storageId: payload.storageId,
-                    fileName: attachment.fileName,
-                    mimeType: attachment.mimeType,
-                    sizeBytes: attachment.sizeBytes
-                )
-            )
+            for _ in 0..<min(maxConcurrent, attachments.count) { enqueue() }
+            while let (index, uploaded) = try await group.next() {
+                results[index] = uploaded
+                enqueue()
+            }
         }
-        return uploaded
+        return results.compactMap { $0 }
     }
 
-    private func hydrateDirectMessagePeersIfNeeded(_ directMessages: [CoreDirectMessage]) async -> [CoreDirectMessage] {
-        let missingPeerIds = Array(Set(directMessages.compactMap { dm in
-            dm.peer.avatarURLString?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false &&
-            dm.peer.fullName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-                ? nil
-                : dm.peer.id
-        }))
-        guard !missingPeerIds.isEmpty,
-              let profiles = try? await fetchSupabaseProfiles(userIds: missingPeerIds),
-              !profiles.isEmpty else {
-            return directMessages
+    @concurrent
+    private static func upload(_ attachment: CorePendingAttachment, to url: URL) async throws -> ConvexUploadedAttachment {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(attachment.mimeType, forHTTPHeaderField: "Content-Type")
+        let data: Data
+        let response: URLResponse
+        if attachment.isFileBacked, let fileURL = attachment.fileURL {
+            (data, response) = try await uploadSession.upload(for: request, fromFile: fileURL)
+        } else {
+            (data, response) = try await uploadSession.upload(for: request, from: attachment.data)
         }
-
-        let profilesById = Dictionary(uniqueKeysWithValues: profiles.map { ($0.id, $0) })
-        return directMessages.map { dm in
-            guard let profile = profilesById[dm.peer.id] else { return dm }
-            var hydrated = dm
-            hydrated.peer = CoreUserLite(
-                id: dm.peer.id,
-                fullName: profile.fullName ?? dm.peer.fullName,
-                avatarURLString: profile.avatarURLString ?? dm.peer.avatarURLString,
-                roleId: profile.roleId ?? dm.peer.roleId
-            )
-            return hydrated
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw ConvexCoreError.server(String(data: data, encoding: .utf8) ?? "No se pudo subir el adjunto a Convex")
         }
+        let payload = try JSONDecoder().decode(ConvexUploadResponse.self, from: data)
+        return ConvexUploadedAttachment(
+            storageId: payload.storageId,
+            fileName: attachment.fileName,
+            mimeType: attachment.mimeType,
+            sizeBytes: attachment.sizeBytes
+        )
     }
 
     private func fetchSupabaseProfiles(userIds: [String]) async throws -> [CoreUserLite] {
@@ -500,7 +558,7 @@ final class ConvexCoreClient {
         request.setValue(configuration.anonKey, forHTTPHeaderField: "apikey")
         request.setValue("Bearer \(configuration.accessToken)", forHTTPHeaderField: "Authorization")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await Self.apiSession.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             return []
         }
@@ -531,19 +589,43 @@ final class ConvexCoreClient {
             "args": [Self.jsonReady(args)],
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await Self.apiSession.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 || http.statusCode == 560 else {
             throw ConvexCoreError.server(String(data: data, encoding: .utf8) ?? "Convex request failed")
         }
-        let envelope = try decoder.decode(ConvexEnvelope.self, from: data)
-        guard envelope.status == "success", let value = envelope.value else {
+        return try decodeResponse(data)
+    }
+
+    /// Decodifica `value` directamente como `T`; solo cae al árbol `Any`
+    /// (cuatro pasadas) cuando el payload trae enteros codificados por Convex
+    /// o la decodificación directa falla.
+    private func decodeResponse<T: Decodable>(_ data: Data) throws -> T {
+        if !Self.containsConvexEncodedInteger(data) {
+            do {
+                let envelope = try decoder.decode(ConvexEnvelope<T>.self, from: data)
+                guard envelope.status == "success" else {
+                    throw ConvexCoreError.server(envelope.errorMessage ?? "Convex request failed")
+                }
+                if let value = envelope.value { return value }
+            } catch let error as ConvexCoreError {
+                throw error
+            } catch {}
+        }
+        let envelope = try decoder.decode(ConvexEnvelope<CoreJSONAny>.self, from: data)
+        guard envelope.status == "success", let value = envelope.value?.value else {
             throw ConvexCoreError.server(envelope.errorMessage ?? "Convex request failed")
         }
         let valueData = try Self.dataFromJSONValue(Self.jsonFromConvex(value))
         return try decoder.decode(T.self, from: valueData)
     }
 
-    static func slugifyCoreName(_ value: String) -> String {
+    private static let convexIntegerMarker = Data("\"$integer\"".utf8)
+
+    nonisolated private static func containsConvexEncodedInteger(_ data: Data) -> Bool {
+        data.range(of: convexIntegerMarker) != nil
+    }
+
+    nonisolated static func slugifyCoreName(_ value: String) -> String {
         let folded = value
             .folding(options: .diacriticInsensitive, locale: Locale(identifier: "en_US"))
             .lowercased()
@@ -623,9 +705,9 @@ final class ConvexCoreClient {
     }
 }
 
-private struct ConvexEnvelope: Decodable {
+private nonisolated struct ConvexEnvelope<Value: Decodable>: Decodable {
     var status: String
-    var value: Any?
+    var value: Value?
     var errorMessage: String?
 
     enum CodingKeys: String, CodingKey {
@@ -638,13 +720,11 @@ private struct ConvexEnvelope: Decodable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         status = try container.decode(String.self, forKey: .status)
         errorMessage = try? container.decodeIfPresent(String.self, forKey: .errorMessage)
-        if let decoded = try? container.decodeIfPresent(CoreJSONAny.self, forKey: .value) {
-            value = decoded.value
-        }
+        value = try? container.decode(Value.self, forKey: .value)
     }
 }
 
-private struct CoreJSONAny: Decodable {
+private nonisolated struct CoreJSONAny: Decodable {
     let value: Any
 
     init(from decoder: Decoder) throws {
@@ -668,32 +748,32 @@ private struct CoreJSONAny: Decodable {
     }
 }
 
-private struct ConvexCreateChannelResult: Decodable {
+private nonisolated struct ConvexCreateChannelResult: Decodable {
     var channelId: String
     var conversationId: String
 }
 
-private struct ConvexInviteResult: Decodable {
+private nonisolated struct ConvexInviteResult: Decodable {
     var token: String
 }
 
-struct ConvexPushTestResult: Decodable {
+nonisolated struct ConvexPushTestResult: Decodable, Sendable {
     var sent: Int
     var attempted: Int
     var rejected: Int
     var lastRejection: ConvexPushTestRejection?
 }
 
-struct ConvexPushTestRejection: Decodable {
+nonisolated struct ConvexPushTestRejection: Decodable, Sendable {
     var status: Int?
     var reason: String
 }
 
-private struct ConvexUploadResponse: Decodable {
+private nonisolated struct ConvexUploadResponse: Decodable, Sendable {
     var storageId: String
 }
 
-struct ConvexTypingStatus: Decodable, Hashable {
+nonisolated struct ConvexTypingStatus: Decodable, Hashable, Sendable {
     var userId: String
     var userName: String
     var isTyping: Bool
@@ -701,7 +781,7 @@ struct ConvexTypingStatus: Decodable, Hashable {
     var updatedAt: Date?
 }
 
-private struct ConvexUploadedAttachment {
+private nonisolated struct ConvexUploadedAttachment: Sendable {
     var storageId: String
     var fileName: String
     var mimeType: String
@@ -720,7 +800,7 @@ private struct ConvexUploadedAttachment {
     }
 }
 
-private struct ConvexChannelDTO: Decodable {
+private nonisolated struct ConvexChannelDTO: Decodable {
     var id: String
     var empresaId: Int
     var teamId: String?
@@ -791,7 +871,7 @@ private struct ConvexChannelDTO: Decodable {
     }
 }
 
-private struct ConvexDirectMessageDTO: Decodable {
+private nonisolated struct ConvexDirectMessageDTO: Decodable {
     var id: String
     var empresaId: Int
     var dmKey: String?
@@ -816,7 +896,7 @@ private struct ConvexDirectMessageDTO: Decodable {
     }
 }
 
-private struct ConvexLastMessageDTO: Decodable {
+private nonisolated struct ConvexLastMessageDTO: Decodable {
     var id: String
     var userId: String
     var content: String
@@ -825,13 +905,13 @@ private struct ConvexLastMessageDTO: Decodable {
     var author: CoreUserLite?
 }
 
-private struct ConvexChannelMemberDTO: Decodable {
+private nonisolated struct ConvexChannelMemberDTO: Decodable {
     var supabaseUserId: String
     var role: String?
     var user: CoreUserLite?
 }
 
-private struct ConvexBusinessUnitDTO: Decodable {
+private nonisolated struct ConvexBusinessUnitDTO: Decodable {
     var legacyId: Int?
     var name: String
 
@@ -841,12 +921,12 @@ private struct ConvexBusinessUnitDTO: Decodable {
     }
 }
 
-private struct ConvexMessagePageDTO: Decodable {
+private nonisolated struct ConvexMessagePageDTO: Decodable {
     var messages: [ConvexMessageDTO]
     var hasMore: Bool
 }
 
-private struct ConvexMessageDTO: Decodable {
+private nonisolated struct ConvexMessageDTO: Decodable {
     var id: String
     var empresaId: Int
     var conversationId: String
@@ -922,7 +1002,7 @@ private struct ConvexMessageDTO: Decodable {
     }
 }
 
-private struct ConvexReactionDTO: Decodable {
+private nonisolated struct ConvexReactionDTO: Decodable {
     var id: String
     var empresaId: Int
     var messageId: String
@@ -965,7 +1045,7 @@ private struct ConvexReactionDTO: Decodable {
     }
 }
 
-private struct ConvexAttachmentDTO: Decodable {
+private nonisolated struct ConvexAttachmentDTO: Decodable {
     var id: String
     var empresaId: Int
     var messageId: String?
@@ -1025,14 +1105,22 @@ private struct ConvexAttachmentDTO: Decodable {
     }
 }
 
-private struct ConvexReactionToggleDTO: Decodable {
+private nonisolated struct ConvexReactionToggleDTO: Decodable {
     var removed: Bool
     var reaction: ConvexReactionDTO?
     var message: ConvexMessageDTO
 }
 
+/// Resultado de `messages:toggleReaction`: el mensaje actualizado y la
+/// reacción creada (si no se eliminó).
+nonisolated struct ConvexReactionToggle: Sendable {
+    var message: CoreMessage
+    var reaction: CoreReaction?
+    var removed: Bool
+}
+
 private extension Encodable {
-    func convexJSONObject() throws -> [String: Any] {
+    nonisolated func convexJSONObject() throws -> [String: Any] {
         let data = try JSONEncoder().encode(self)
         let object = try JSONSerialization.jsonObject(with: data)
         return object as? [String: Any] ?? [:]
@@ -1040,14 +1128,14 @@ private extension Encodable {
 }
 
 private extension CoreMessageMetadata {
-    func nonEmptyConvexJSONObject() throws -> [String: Any]? {
+    nonisolated func nonEmptyConvexJSONObject() throws -> [String: Any]? {
         let object = try convexJSONObject()
         return object.values.allSatisfy { $0 is NSNull } ? nil : object
     }
 }
 
 private extension String {
-    var convexNilIfBlank: String? {
+    nonisolated var convexNilIfBlank: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }

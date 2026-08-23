@@ -74,7 +74,7 @@ final class CoreTypingService: ObservableObject {
     }
 
     private func send(isTyping: Bool, configuration: CoreAppConfiguration) async {
-        guard let conversationId = connectedConversationId else { return }
+        guard let conversationId = connectedConversationId, !ZiaDemoMode.isEnabled else { return }
         let name = configuration.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         let client = try? ConvexCoreClient(configuration: configuration)
         try? await client?.setTyping(

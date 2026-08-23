@@ -26,6 +26,12 @@ final class PushNotificationService: NSObject, ObservableObject, UNUserNotificat
     @Published private(set) var foregroundEvent: ForegroundPushNotificationEvent?
     @Published private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
     @Published var lastError: String?
+    /// La app se lanzó al tocar una notificación: el NavigationStack aún se
+    /// está restaurando cuando llega el tap, así que ese caso espera un poco.
+    var launchedFromNotification = false
+    /// En apps con escenas el tap que arranca la app suele llegar sin
+    /// launchOptions; la antigüedad del proceso cubre ese caso.
+    private let launchDate = Date()
 
     private override init() {
         super.init()
@@ -84,7 +90,7 @@ final class PushNotificationService: NSObject, ObservableObject, UNUserNotificat
     }
 
     func registerCurrentToken(configuration: CoreAppConfiguration) async {
-        guard let deviceToken, configuration.isUsable else { return }
+        guard let deviceToken, configuration.isUsable, !ZiaDemoMode.isEnabled else { return }
 
         do {
             let client = try ConvexCoreClient(configuration: configuration)
@@ -140,11 +146,13 @@ final class PushNotificationService: NSObject, ObservableObject, UNUserNotificat
         let destination = Self.destination(from: response.notification.request.content.userInfo)
         completionHandler()
 
-        Task.detached(priority: .userInitiated) {
-            // Keep notification routing outside UIKit's scene-restoration transaction.
-            try? await Task.sleep(for: .milliseconds(750))
-            guard !Task.isCancelled else { return }
-            await PushNotificationService.shared.receive(destination: destination)
+        Task { @MainActor in
+            let service = PushNotificationService.shared
+            if service.launchedFromNotification || Date().timeIntervalSince(service.launchDate) < 2 {
+                service.launchedFromNotification = false
+                try? await Task.sleep(for: .milliseconds(750))
+            }
+            service.receive(destination: destination)
         }
     }
 
@@ -175,6 +183,8 @@ final class ZiaChatAppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         PushNotificationService.shared.configure()
+        PushNotificationService.shared.launchedFromNotification =
+            launchOptions?[.remoteNotification] != nil
         Task {
             try? await UNUserNotificationCenter.current().setBadgeCount(0)
         }

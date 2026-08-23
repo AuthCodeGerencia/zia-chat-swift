@@ -149,7 +149,26 @@ struct EmojiAwareText: View {
         }
     }
 
+    private static let mentionRegexCache = NSCache<NSString, NSRegularExpression>()
+
+    /// Texto sin "@" ni indicios de enlace (ver LinkDetection.mayContainLink)
+    /// no puede tener menciones ni enlaces: evita el detector y el regex de
+    /// menciones en la mayoría de mensajes.
+    private static func mayContainRichContent(_ text: String) -> Bool {
+        text.contains("@") || LinkDetection.mayContainLink(text)
+    }
+
+    private static func mentionRegex(for names: [String]) -> NSRegularExpression? {
+        let key = names.joined(separator: "\u{1}") as NSString
+        if let cached = mentionRegexCache.object(forKey: key) { return cached }
+        let pattern = "@(\(names.map(NSRegularExpression.escapedPattern).joined(separator: "|")))(?=$|[\\s.,!?;:)])"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+        mentionRegexCache.setObject(regex, forKey: key)
+        return regex
+    }
+
     private var needsInteractiveRendering: Bool {
+        guard Self.mayContainRichContent(value) else { return false }
         if value.range(of: #"(?i)(https?://|www\.)\S+"#, options: .regularExpression) != nil {
             return true
         }
@@ -161,17 +180,21 @@ struct EmojiAwareText: View {
     private var attributedValue: AttributedString {
         #if canImport(UIKit)
         let baseColor = color == .white ? UIColor.white : UIColor.label
-        let result = NSMutableAttributedString(
-            string: value,
-            attributes: [
-                .font: UIFont.preferredFont(forTextStyle: .body),
-                .foregroundColor: baseColor
-            ]
-        )
+        let baseAttributes: [NSAttributedString.Key: Any] = [
+            .font: UIFont.preferredFont(forTextStyle: .body),
+            .foregroundColor: baseColor
+        ]
+        guard Self.mayContainRichContent(value) else {
+            return (try? AttributedString(
+                NSAttributedString(string: value, attributes: baseAttributes),
+                including: \.uiKit
+            )) ?? AttributedString(value)
+        }
+        let result = NSMutableAttributedString(string: value, attributes: baseAttributes)
         let fullRange = NSRange(location: 0, length: result.length)
 
-        if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) {
-            detector.enumerateMatches(in: value, range: fullRange) { match, _, _ in
+        if LinkDetection.mayContainLink(value) {
+            LinkDetection.detector.enumerateMatches(in: value, range: fullRange) { match, _, _ in
                 guard let match, let rawURL = match.url else { return }
                 let url: URL?
                 if rawURL.scheme == nil, rawURL.absoluteString.hasPrefix("www.") {
@@ -198,9 +221,8 @@ struct EmojiAwareText: View {
         )
         .sorted { $0.count > $1.count }
 
-        if !names.isEmpty {
-            let pattern = "@(\(names.map(NSRegularExpression.escapedPattern).joined(separator: "|")))(?=$|[\\s.,!?;:)])"
-            if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
+        if !names.isEmpty, value.contains("@") {
+            if let regex = Self.mentionRegex(for: names) {
                 regex.enumerateMatches(in: value, range: fullRange) { match, _, _ in
                     guard let match else { return }
                     let token = (value as NSString).substring(with: match.range)
