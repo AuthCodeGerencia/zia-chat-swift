@@ -22,6 +22,7 @@ struct WhatsAppThreadView: View {
     @State private var showFileImporter = false
     @State private var isImportingAttachments = false
     @State private var viewerAttachment: CoreAttachment?
+    @StateObject private var audioRecorder = WhatsAppAudioRecorder()
     @FocusState private var composerFocused: Bool
 
     private static let maxMediaBytes = 25 * 1_024 * 1_024
@@ -48,6 +49,7 @@ struct WhatsAppThreadView: View {
             store.openChat(chatId)
         }
         .onDisappear {
+            audioRecorder.cancel()
             if store.activeChatId == chatId, !navigationPath.contains(WhatsAppRoute.navigationId(for: chatId)) {
                 store.closeChat()
             }
@@ -230,11 +232,17 @@ struct WhatsAppThreadView: View {
             let previous = items[index - 1]
             let sameAuthor = previous.fromMe == message.fromMe
                 && previous.isNote == message.isNote
-                && (previous.autorNombre ?? "") == (message.autorNombre ?? "")
+                && previous.authorKey == message.authorKey
                 && message.timestamp - previous.timestamp < 120_000
                 && !previous.isSystem && !message.isSystem
             return (message, sameAuthor)
         }
+    }
+
+    private var participantIndexes: [String: Int] {
+        let keys = Set(store.messages.filter { !$0.fromMe && !$0.isNote && !$0.isSystem }.map(\.authorKey))
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        return Dictionary(uniqueKeysWithValues: keys.enumerated().map { ($0.element, $0.offset) })
     }
 
     private var messagesArea: some View {
@@ -300,6 +308,13 @@ struct WhatsAppThreadView: View {
             WhatsAppBubble(
                 message: message,
                 grouped: grouped,
+                isGroup: chat?.isGroup == true,
+                participantIndex: participantIndexes[message.authorKey],
+                participant: store.participants.first {
+                    $0.waId == message.authorWaId
+                        || $0.aliases?.contains(message.authorWaId ?? "") == true
+                        || $0.nombre == message.displayAuthor
+                },
                 canQuote: store.caps.send && !message.isNote,
                 onQuote: { quoted = message; composerFocused = true },
                 onRetry: { Task { await run { try await store.retry(message) } } },
@@ -364,6 +379,42 @@ struct WhatsAppThreadView: View {
         if store.caps.send {
             VStack(spacing: 0) {
                 Rectangle().fill(ZenitBrand.hairline).frame(height: 0.5)
+                if audioRecorder.isRecording {
+                    HStack(spacing: 12) {
+                        Button(role: .destructive) {
+                            audioRecorder.cancel()
+                        } label: {
+                            Image(systemName: "trash")
+                                .frame(width: 38, height: 38)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Cancelar grabación")
+
+                        Circle()
+                            .fill(.red)
+                            .frame(width: 9, height: 9)
+                        Text(recordingTime(audioRecorder.duration))
+                            .font(.body.monospacedDigit().weight(.semibold))
+                        Text("Grabando nota de voz")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button {
+                            Task { await sendRecording() }
+                        } label: {
+                            Image(systemName: "arrow.up")
+                                .font(.body.weight(.bold))
+                                .foregroundStyle(.white)
+                                .frame(width: 38, height: 38)
+                                .background(ZenitBrand.accentFill)
+                                .clipShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Enviar nota de voz")
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 8)
+                } else {
                 HStack(alignment: .bottom, spacing: 6) {
                     Button {
                         noteMode.toggle()
@@ -412,27 +463,36 @@ struct WhatsAppThreadView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 18))
 
                     Button {
-                        Task { await send() }
+                        if canSend || noteMode {
+                            Task { await send() }
+                        } else {
+                            Task { await startRecording() }
+                        }
                     } label: {
                         Group {
                             if store.isSending || isImportingAttachments {
                                 ProgressView()
-                            } else {
+                            } else if canSend || noteMode {
                                 Image(systemName: "arrow.up")
                                     .font(.body.weight(.bold))
+                                    .foregroundStyle(.white)
+                            } else {
+                                Image(systemName: "mic.fill")
+                                    .font(.body.weight(.semibold))
                                     .foregroundStyle(.white)
                             }
                         }
                         .frame(width: 38, height: 38)
-                        .background(canSend ? ZenitBrand.accentFill : Color.gray.opacity(0.4))
+                        .background((canSend || !noteMode) ? ZenitBrand.accentFill : Color.gray.opacity(0.4))
                         .clipShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .disabled(!canSend)
-                    .accessibilityLabel(noteMode ? "Guardar nota" : "Enviar")
+                    .disabled(noteMode && !canSend)
+                    .accessibilityLabel(canSend || noteMode ? (noteMode ? "Guardar nota" : "Enviar") : "Grabar nota de voz")
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 8)
+                }
             }
             .background(ZenitBrand.surface)
         } else {
@@ -447,6 +507,38 @@ struct WhatsAppThreadView: View {
 
     private var canSend: Bool {
         !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !store.isSending && !isImportingAttachments
+    }
+
+    private func recordingTime(_ duration: TimeInterval) -> String {
+        let seconds = max(0, Int(duration))
+        return String(format: "%02d:%02d", seconds / 60, seconds % 60)
+    }
+
+    private func startRecording() async {
+        do {
+            try await audioRecorder.start()
+        } catch {
+            errorMessage = Self.describe(error)
+        }
+    }
+
+    private func sendRecording() async {
+        do {
+            let url = try audioRecorder.stop()
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            let attachment = CorePendingAttachment(
+                fileURL: url,
+                fileName: "nota-de-voz-\(UUID().uuidString.prefix(8)).m4a",
+                mimeType: "audio/mp4",
+                sizeBytes: size
+            )
+            let quotedMessage = quoted
+            quoted = nil
+            try await store.sendAttachments([attachment], caption: "", quoting: quotedMessage)
+            PendingUploadStorage.remove([attachment])
+        } catch {
+            errorMessage = Self.describe(error)
+        }
     }
 
     private func send() async {
@@ -559,12 +651,14 @@ struct WhatsAppThreadView: View {
     private func sendAttachments(_ attachments: [CorePendingAttachment]) async {
         guard !attachments.isEmpty else { return }
         let caption = draft
+        let quotedMessage = quoted
         draft = ""
         quoted = nil
         do {
-            try await store.sendAttachments(attachments, caption: caption)
+            try await store.sendAttachments(attachments, caption: caption, quoting: quotedMessage)
         } catch {
             draft = caption
+            quoted = quotedMessage
             errorMessage = Self.describe(error)
         }
         PendingUploadStorage.remove(attachments)
@@ -576,6 +670,9 @@ struct WhatsAppThreadView: View {
 private struct WhatsAppBubble: View {
     let message: WhatsAppMessage
     let grouped: Bool
+    let isGroup: Bool
+    let participantIndex: Int?
+    let participant: WhatsAppParticipant?
     let canQuote: Bool
     let onQuote: () -> Void
     let onRetry: () -> Void
@@ -583,20 +680,56 @@ private struct WhatsAppBubble: View {
 
     private var isMine: Bool { message.isMine }
     private var isNote: Bool { message.isNote }
+    private var alignsRight: Bool {
+        isMine || (isGroup && !isNote && (participantIndex ?? 0).isMultiple(of: 2) == false)
+    }
+
+    private var participantHue: Double {
+        Double(((participantIndex ?? 0) * 137 + 205) % 360) / 360
+    }
 
     private var bubbleColor: Color {
         if isNote { return Color.yellow.opacity(0.28) }
-        return isMine ? ZenitBrand.bubbleMine : ZenitBrand.surface
+        if isMine { return ZenitBrand.bubbleMine }
+        guard isGroup else { return ZenitBrand.surface }
+        return Color(hue: participantHue, saturation: 0.26, brightness: 0.99)
+    }
+
+    private var participantColor: Color {
+        Color(hue: participantHue, saturation: 0.78, brightness: 0.58)
     }
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 0) {
-            if isMine { Spacer(minLength: 48) }
+            if alignsRight { Spacer(minLength: 48) }
+            if isGroup && !isMine && !isNote && !alignsRight {
+                participantAvatar
+                    .padding(.trailing, 7)
+            }
             VStack(alignment: .leading, spacing: 4) {
                 if !grouped, !isMine {
                     Text(isNote ? "Nota interna · \(message.agenteNombre ?? "Agente")" : message.displayAuthor)
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(isNote ? Color.orange : ZenitBrand.accent)
+                        .foregroundStyle(isNote ? Color.orange : participantColor)
+                }
+                if let quote = message.quotedMessage {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(quote.author ?? "Mensaje citado")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(ZenitBrand.accent)
+                        Text(quote.body)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.black.opacity(0.055))
+                    .overlay(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 2).fill(ZenitBrand.accentFill).frame(width: 3)
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
                 }
                 attachment
                 if let body = message.visibleBody {
@@ -650,10 +783,24 @@ private struct WhatsAppBubble: View {
                     }
                 }
             }
-            if !isMine { Spacer(minLength: 48) }
+            if isGroup && !isMine && !isNote && alignsRight {
+                participantAvatar
+                    .padding(.leading, 7)
+            }
+            if !alignsRight { Spacer(minLength: 48) }
         }
         .padding(.top, grouped ? 0 : 6)
         .accessibilityElement(children: .combine)
+    }
+
+    private var participantAvatar: some View {
+        WhatsAppAvatar(
+            name: participant?.nombre ?? message.displayAuthor,
+            url: participant?.avatarURL ?? message.autorAvatarUrl.flatMap(URL.init(string:)),
+            size: 28
+        )
+        .opacity(grouped ? 0 : 1)
+        .accessibilityHidden(grouped)
     }
 
     @ViewBuilder
@@ -803,10 +950,18 @@ struct WhatsAppChatOptionsSheet: View {
                 }
 
                 if store.caps.assign {
-                    Section("Asignar a") {
-                        assignRow(title: "Sin asignar", agentId: nil, selected: current.agente == nil)
+                    Section("Agentes asignados") {
                         ForEach(store.agents) { agent in
-                            assignRow(title: agent.name, agentId: agent.id, selected: current.agente?.id == agent.id)
+                            assignRow(
+                                title: agent.name,
+                                agentId: agent.id,
+                                selected: current.assignedToIds.contains(agent.id)
+                            )
+                        }
+                        if current.assignedToIds.isEmpty {
+                            Text("Sin asignar")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
                         }
                     }
 
@@ -866,6 +1021,37 @@ struct WhatsAppChatOptionsSheet: View {
                         }
                     }
                 }
+
+                if current.isGroup {
+                    Section("Miembros · \(store.participants.count)") {
+                        if store.participants.isEmpty {
+                            Text("WhatsApp todavía no ha sincronizado los miembros.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(store.participants) { participant in
+                                HStack(spacing: 10) {
+                                    WhatsAppAvatar(name: participant.nombre, url: participant.avatarURL, size: 30)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(participant.nombre).lineLimit(1)
+                                        if let phone = WhatsAppFormat.phone(participant.telefono) {
+                                            Text(phone).font(.caption2).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    Spacer()
+                                    if participant.esAdmin {
+                                        Text("ADMIN")
+                                            .font(.caption2.weight(.semibold))
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 2)
+                                            .background(ZenitBrand.surfaceMuted)
+                                            .clipShape(Capsule())
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             .scrollContentBackground(.hidden)
             .background(ZenitBrand.cream)
@@ -879,9 +1065,15 @@ struct WhatsAppChatOptionsSheet: View {
         }
     }
 
-    private func assignRow(title: String, agentId: String?, selected: Bool) -> some View {
+    private func assignRow(title: String, agentId: String, selected: Bool) -> some View {
         Button {
-            perform { try await store.assign(to: agentId) }
+            var next = current.assignedToIds
+            if selected {
+                next.removeAll { $0 == agentId }
+            } else if !next.contains(agentId) {
+                next.append(agentId)
+            }
+            perform { try await store.assign(to: next) }
         } label: {
             HStack {
                 Text(title).foregroundStyle(.primary)

@@ -206,11 +206,25 @@ struct WhatsAppChatRow: View {
                     .font(.subheadline)
                     .foregroundStyle(isUnread ? .primary : .secondary)
                     .lineLimit(1)
-                if let tags = chat.subtitleTags {
-                    Text(tags)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(ZenitBrand.khaki)
-                        .lineLimit(1)
+                if chat.unidadNegocio != nil || chat.clienteEtiqueta != nil {
+                    HStack(spacing: 5) {
+                        if let unit = chat.unidadNegocio {
+                            Circle().fill(Color.green).frame(width: 7, height: 7)
+                            Text(unit)
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        if let company = chat.clienteEtiqueta {
+                            Text(company)
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(Color.white)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(ZenitBrand.accentFill)
+                                .clipShape(Capsule())
+                                .lineLimit(1)
+                        }
+                    }
                 }
             }
 
@@ -230,6 +244,17 @@ struct WhatsAppChatRow: View {
                 }
             }
         }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 5)
+        .background(isUnread ? ZenitBrand.accentFill.opacity(0.10) : Color.clear)
+        .overlay(alignment: .leading) {
+            if isUnread {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(ZenitBrand.accentFill)
+                    .frame(width: 4)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 9))
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)

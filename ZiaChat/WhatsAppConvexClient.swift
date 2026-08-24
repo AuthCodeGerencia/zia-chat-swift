@@ -92,6 +92,14 @@ final class WhatsAppConvexClient: @unchecked Sendable {
         realtime.subscribe(to: "mobileChat:listarEmpresas", with: ["profileId": profileId], yielding: [WhatsAppCompany].self)
     }
 
+    func subscribeParticipants(profileId: String, chatId: String) -> AnyPublisher<[WhatsAppParticipant], ClientError> {
+        realtime.subscribe(
+            to: "mobileChat:listarParticipantes",
+            with: ["profileId": profileId, "chatId": chatId],
+            yielding: [WhatsAppParticipant].self
+        )
+    }
+
     // MARK: - Mutaciones
 
     func sendText(profileId: String, chatId: String, body: String, quotedMessageId: String?) async throws {
@@ -106,7 +114,8 @@ final class WhatsAppConvexClient: @unchecked Sendable {
         storageId: String,
         filename: String,
         mimetype: String?,
-        caption: String?
+        caption: String?,
+        quotedMessageId: String?
     ) async throws {
         var args: [String: ConvexEncodable?] = [
             "profileId": profileId,
@@ -116,6 +125,7 @@ final class WhatsAppConvexClient: @unchecked Sendable {
         ]
         if let mimetype { args["mimetype"] = mimetype }
         if let caption, !caption.isEmpty { args["caption"] = caption }
+        if let quotedMessageId { args["quotedMessageId"] = quotedMessageId }
         try await realtime.mutation("mobileChat:enviarArchivo", with: args)
     }
 
@@ -131,6 +141,13 @@ final class WhatsAppConvexClient: @unchecked Sendable {
         var args: [String: ConvexEncodable?] = ["profileId": profileId, "chatId": chatId]
         if let assignedTo { args["assignedTo"] = assignedTo }
         try await realtime.mutation("mobileChat:asignarChat", with: args)
+    }
+
+    func assignAgents(profileId: String, chatId: String, assignedToIds: [String]) async throws {
+        try await realtime.mutation(
+            "mobileChat:asignarAgentes",
+            with: ["profileId": profileId, "chatId": chatId, "assignedToIds": assignedToIds]
+        )
     }
 
     func setState(profileId: String, chatId: String, state: WhatsAppChatState) async throws {

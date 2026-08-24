@@ -99,6 +99,18 @@ nonisolated struct WhatsAppCompany: Decodable, Identifiable, Equatable, Sendable
     }
 }
 
+nonisolated struct WhatsAppParticipant: Decodable, Identifiable, Equatable, Sendable {
+    var waId: String
+    var telefono: String?
+    var esAdmin: Bool
+    var nombre: String
+    var avatarUrl: String?
+    var aliases: [String]?
+
+    var id: String { waId }
+    var avatarURL: URL? { avatarUrl.flatMap(URL.init(string:)) }
+}
+
 nonisolated struct WhatsAppChat: Decodable, Identifiable, Equatable, Sendable {
     var id: String
     var chatId: String
@@ -113,6 +125,8 @@ nonisolated struct WhatsAppChat: Decodable, Identifiable, Equatable, Sendable {
     var estado: WhatsAppChatState
     var silenciado: Bool?
     var agente: WhatsAppAgent?
+    var assignedToIds: [String]
+    var assignedAgents: [WhatsAppAgent]
     var empresaNombre: String?
     var unidadNegocio: String?
     var clienteNombre: String?
@@ -132,6 +146,8 @@ nonisolated struct WhatsAppChat: Decodable, Identifiable, Equatable, Sendable {
         case estado
         case silenciado
         case agente
+        case assignedToIds
+        case assignedAgents
         case empresaNombre
         case unidadNegocio
         case clienteNombre
@@ -154,6 +170,12 @@ nonisolated struct WhatsAppChat: Decodable, Identifiable, Equatable, Sendable {
         estado = try container.decodeIfPresent(WhatsAppChatState.self, forKey: .estado) ?? .abierto
         silenciado = try container.decodeIfPresent(Bool.self, forKey: .silenciado)
         agente = try container.decodeIfPresent(WhatsAppAgent.self, forKey: .agente)
+        assignedToIds = try container.decodeIfPresent([String].self, forKey: .assignedToIds)
+            ?? agente.map { [$0.id] }
+            ?? []
+        assignedAgents = try container.decodeIfPresent([WhatsAppAgent].self, forKey: .assignedAgents)
+            ?? agente.map { [$0] }
+            ?? []
         empresaNombre = try container.decodeIfPresent(String.self, forKey: .empresaNombre)
         unidadNegocio = try container.decodeIfPresent(String.self, forKey: .unidadNegocio)
         clienteNombre = try container.decodeIfPresent(String.self, forKey: .clienteNombre)
@@ -168,6 +190,12 @@ nonisolated struct WhatsAppChat: Decodable, Identifiable, Equatable, Sendable {
         let parts = [unidadNegocio, empresaNombre ?? clienteNombre].compactMap { $0 }.filter { !$0.isEmpty }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
+}
+
+nonisolated struct WhatsAppQuotedMessage: Decodable, Equatable, Sendable {
+    var id: String?
+    var body: String
+    var author: String?
 }
 
 nonisolated struct WhatsAppMedia: Decodable, Equatable, Sendable {
@@ -199,6 +227,8 @@ nonisolated struct WhatsAppMessage: Decodable, Identifiable, Equatable, Sendable
     var error: String?
     var waMessageId: String?
     var quotedMessageId: String?
+    var quotedMessage: WhatsAppQuotedMessage?
+    var authorWaId: String?
     var authorName: String?
     var autorNombre: String?
     var autorAvatarUrl: String?
@@ -219,6 +249,8 @@ nonisolated struct WhatsAppMessage: Decodable, Identifiable, Equatable, Sendable
         case error
         case waMessageId
         case quotedMessageId
+        case quotedMessage
+        case authorWaId
         case authorName
         case autorNombre
         case autorAvatarUrl
@@ -241,6 +273,8 @@ nonisolated struct WhatsAppMessage: Decodable, Identifiable, Equatable, Sendable
         error = try container.decodeIfPresent(String.self, forKey: .error)
         waMessageId = try container.decodeIfPresent(String.self, forKey: .waMessageId)
         quotedMessageId = try container.decodeIfPresent(String.self, forKey: .quotedMessageId)
+        quotedMessage = try container.decodeIfPresent(WhatsAppQuotedMessage.self, forKey: .quotedMessage)
+        authorWaId = try container.decodeIfPresent(String.self, forKey: .authorWaId)
         authorName = try container.decodeIfPresent(String.self, forKey: .authorName)
         autorNombre = try container.decodeIfPresent(String.self, forKey: .autorNombre)
         autorAvatarUrl = try container.decodeIfPresent(String.self, forKey: .autorAvatarUrl)
@@ -261,6 +295,10 @@ nonisolated struct WhatsAppMessage: Decodable, Identifiable, Equatable, Sendable
 
     var displayAuthor: String {
         autorNombre ?? agenteNombre ?? authorName ?? "Contacto"
+    }
+
+    var authorKey: String {
+        authorWaId ?? autorNombre ?? authorName ?? agenteNombre ?? (fromMe ? "__mine__" : id)
     }
 
     /// Texto para la cita y el preview: cuerpo o nombre del adjunto.

@@ -731,7 +731,9 @@ private struct ChannelListView: View {
         let userId = store.configuration.userId
         let channelItems = store.channels.map(channelItem)
         let directItems = store.directMessages.map(directItem)
-        let chatItems = (channelItems + directItems).sorted(by: ChannelListItem.activityOrder)
+        // Igual que en web: primero canales y después mensajes directos.
+        let chatItems = channelItems.sorted(by: ChannelListItem.activityOrder)
+            + directItems.sorted(by: ChannelListItem.activityOrder)
         let favoriteIds = store.favoriteChannelIds
 
         let threadItems = store.textChannels
@@ -1162,19 +1164,6 @@ private struct DirectMessageRow: View {
         dm.unreadCount > 0 || dm.mentionCount > 0
     }
 
-    private var previewText: Text {
-        if let draft, !draft.isEmpty {
-            return Text("Borrador: ").fontWeight(.semibold).foregroundStyle(.red) + Text(draft)
-        }
-        guard let content = dm.lastMessageContent, !content.isEmpty else {
-            return Text("Inicia la conversación")
-        }
-        let firstName = dm.peer.displayName.split(whereSeparator: \.isWhitespace).first.map(String.init)
-            ?? dm.peer.displayName
-        let prefix = dm.lastMessageUserId == currentUserId ? "Tú: " : "\(firstName): "
-        return Text(prefix + content)
-    }
-
     var body: some View {
         HStack(spacing: 11) {
             AvatarView(name: dm.peer.displayName, avatarURL: dm.peer.avatarURL, size: 40)
@@ -1192,20 +1181,11 @@ private struct DirectMessageRow: View {
                             .accessibilityLabel("Silenciado")
                     }
                 }
-                previewText
-                    .font(.subheadline)
-                    .foregroundStyle(isUnread ? .primary : .secondary)
-                    .lineLimit(1)
             }
 
             Spacer(minLength: 4)
 
             VStack(alignment: .trailing, spacing: 4) {
-                if let lastAt = dm.lastMessageAt {
-                    Text(CoreFormat.conversationTime(lastAt))
-                        .font(.caption2)
-                        .foregroundStyle(dm.unreadCount > 0 ? ZenitBrand.accent : .secondary)
-                }
                 HStack(spacing: 6) {
                     if isFavorite {
                         Image(systemName: "pin.fill")

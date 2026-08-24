@@ -23,6 +23,7 @@ final class WhatsAppStore: ObservableObject {
     private static let chatsPageSize = 40
     private static let messagesPageSize = 80
     private static let messagesMax = 300
+    static let expectedWhatsAppPhone = "14745292805"
 
     @Published private(set) var availability: Availability = .unknown
     @Published private(set) var profile: WhatsAppProfile?
@@ -49,6 +50,7 @@ final class WhatsAppStore: ObservableObject {
     @Published private(set) var threadError: String?
     @Published private(set) var agents: [WhatsAppAgent] = []
     @Published private(set) var companies: [WhatsAppCompany] = []
+    @Published private(set) var participants: [WhatsAppParticipant] = []
     @Published private(set) var isSending = false
 
     private var client: WhatsAppConvexClient?
@@ -67,6 +69,7 @@ final class WhatsAppStore: ObservableObject {
     private var messagesSubscription: AnyCancellable?
     private var agentsSubscription: AnyCancellable?
     private var companiesSubscription: AnyCancellable?
+    private var participantsSubscription: AnyCancellable?
 
     /// Solo en simulador de desarrollo: `ZIA_WHATSAPP_EMAIL` (variable del
     /// esquema) fuerza el correo con el que se busca el perfil del portal.
@@ -82,6 +85,11 @@ final class WhatsAppStore: ObservableObject {
 
     var isAvailable: Bool { availability == .available }
     var profileId: String? { profile?.id }
+    var isExpectedWhatsAppAccount: Bool {
+        guard let meId = session?.meId else { return true }
+        let digits = meId.filter(\.isNumber)
+        return digits.hasPrefix(Self.expectedWhatsAppPhone) || digits.hasSuffix(Self.expectedWhatsAppPhone)
+    }
 
     // MARK: - Ciclo de vida
 
@@ -121,6 +129,7 @@ final class WhatsAppStore: ObservableObject {
         chatsSubscription = nil
         agentsSubscription = nil
         companiesSubscription = nil
+        participantsSubscription = nil
         closeChat()
         client = nil
         configuredEmail = nil
@@ -180,7 +189,12 @@ final class WhatsAppStore: ObservableObject {
         sessionSubscription = client.subscribeSession(profileId: profileId)
             .receive(on: DispatchQueue.main)
             .sink { _ in } receiveValue: { [weak self] status in
-                self?.session = status
+                guard let self else { return }
+                self.session = status
+                if !self.isExpectedWhatsAppAccount {
+                    self.chats = []
+                    self.chatsError = "La sesión WAHA conectada no corresponde a +1 (474) 529-2805."
+                }
             }
         unreadSubscription = client.subscribeUnreadCount(profileId: profileId)
             .receive(on: DispatchQueue.main)
@@ -224,7 +238,15 @@ final class WhatsAppStore: ObservableObject {
             self.hasLoadedChats = true
         } receiveValue: { [weak self] page in
             guard let self else { return }
-            self.chats = page.page
+            guard self.isExpectedWhatsAppAccount else {
+                self.chats = []
+                self.chatsError = "La sesión WAHA conectada no corresponde a +1 (474) 529-2805."
+                self.hasLoadedChats = true
+                return
+            }
+            // Esta integración corresponde a la sesión IOBOT solicitada y su
+            // bandeja muestra únicamente grupos de WAHA.
+            self.chats = page.page.filter(\.isGroup)
             self.chatsIsDone = page.isDone
             self.hasLoadedChats = true
         }
@@ -270,6 +292,9 @@ final class WhatsAppStore: ObservableObject {
                 .receive(on: DispatchQueue.main)
                 .sink { _ in } receiveValue: { [weak self] companies in self?.companies = companies }
         }
+        participantsSubscription = client.subscribeParticipants(profileId: profileId, chatId: chatId)
+            .receive(on: DispatchQueue.main)
+            .sink { _ in } receiveValue: { [weak self] participants in self?.participants = participants }
 
         Task { await markRead(chatId: chatId) }
     }
@@ -309,10 +334,12 @@ final class WhatsAppStore: ObservableObject {
         messagesSubscription = nil
         agentsSubscription = nil
         companiesSubscription = nil
+        participantsSubscription = nil
         activeChatId = nil
         activeChat = nil
         hasLoadedActiveChat = false
         messages = []
+        participants = []
         hasLoadedMessages = false
         threadError = nil
         messagesLimit = Self.messagesPageSize
@@ -348,7 +375,7 @@ final class WhatsAppStore: ObservableObject {
         }
     }
 
-    func sendAttachments(_ attachments: [CorePendingAttachment], caption: String) async throws {
+    func sendAttachments(_ attachments: [CorePendingAttachment], caption: String, quoting quoted: WhatsAppMessage? = nil) async throws {
         guard let client, let profileId, let chatId = activeChatId, !attachments.isEmpty else { return }
         isSending = true
         defer { isSending = false }
@@ -362,7 +389,8 @@ final class WhatsAppStore: ObservableObject {
                 filename: attachment.fileName,
                 mimetype: attachment.mimeType,
                 // El texto del compositor acompaña solo al primer archivo.
-                caption: index == 0 ? trimmedCaption : nil
+                caption: index == 0 ? trimmedCaption : nil,
+                quotedMessageId: index == 0 ? quoted?.waMessageId : nil
             )
         }
     }
@@ -375,6 +403,11 @@ final class WhatsAppStore: ObservableObject {
     func assign(to agentId: String?) async throws {
         guard let client, let profileId, let chatId = activeChatId else { return }
         try await client.assign(profileId: profileId, chatId: chatId, assignedTo: agentId)
+    }
+
+    func assign(to agentIds: [String]) async throws {
+        guard let client, let profileId, let chatId = activeChatId else { return }
+        try await client.assignAgents(profileId: profileId, chatId: chatId, assignedToIds: agentIds)
     }
 
     func setState(_ state: WhatsAppChatState) async throws {
