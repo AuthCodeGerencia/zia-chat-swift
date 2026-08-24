@@ -93,6 +93,19 @@ struct CoreAppConfiguration: Codable, Equatable {
     }
 
     private var accessTokenExpirationDate: Date? {
+        guard let expiration = accessTokenClaims?["exp"] as? NSNumber else { return nil }
+        return Date(timeIntervalSince1970: expiration.doubleValue)
+    }
+
+    /// Correo de la sesión de Supabase (claim `email` del JWT). Sirve para
+    /// vincular al usuario con su perfil del portal de AuthCode (WhatsApp).
+    nonisolated var sessionEmail: String? {
+        guard let email = accessTokenClaims?["email"] as? String else { return nil }
+        let trimmed = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    nonisolated private var accessTokenClaims: [String: Any]? {
         let parts = accessToken.split(separator: ".")
         guard parts.count > 1 else { return nil }
 
@@ -102,11 +115,10 @@ struct CoreAppConfiguration: Codable, Equatable {
         payload.append(String(repeating: "=", count: (4 - payload.count % 4) % 4))
 
         guard let data = Data(base64Encoded: payload),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let expiration = object["exp"] as? NSNumber else {
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-        return Date(timeIntervalSince1970: expiration.doubleValue)
+        return object
     }
 }
 

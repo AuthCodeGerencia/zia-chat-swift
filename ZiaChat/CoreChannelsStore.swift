@@ -3,96 +3,97 @@ import Combine
 import OSLog
 import UIKit
 
+@Observable
 @MainActor
-final class CoreChannelsStore: ObservableObject {
+final class CoreChannelsStore {
     private static let realtimeLogger = Logger(subsystem: "authcode.ZiaChat", category: "ConvexRealtime")
 
-    @Published var configuration: CoreAppConfiguration
-    @Published var channels: [CoreChannel] = []
-    @Published var directMessages: [CoreDirectMessage] = []
-    @Published var messages: [String: [CoreMessage]] = [:]
-    @Published var messagePins: [String: [CoreMessagePin]] = [:]
-    @Published var channelPreviews: [String: CoreMessage] = [:]
-    @Published var polls: [String: CorePoll] = [:]
-    @Published var mentionableUsers: [CoreUserLite] = []
-    @Published var internalCompanies: [CoreInternalCompany] = []
-    @Published var mutedChannelIds: Set<CoreChannel.ID> = Set(
+    var configuration: CoreAppConfiguration
+    var channels: [CoreChannel] = []
+    var directMessages: [CoreDirectMessage] = []
+    var messages: [String: [CoreMessage]] = [:]
+    var messagePins: [String: [CoreMessagePin]] = [:]
+    var channelPreviews: [String: CoreMessage] = [:]
+    var polls: [String: CorePoll] = [:]
+    var mentionableUsers: [CoreUserLite] = []
+    var internalCompanies: [CoreInternalCompany] = []
+    var mutedChannelIds: Set<CoreChannel.ID> = Set(
         UserDefaults.standard.stringArray(forKey: CoreChannelsStore.mutedChannelsDefaultsKey) ?? []
     )
-    @Published var channelMembers: [String: [CoreUserLite]] = [:]
-    @Published var selectedChannelId: CoreChannel.ID?
-    @Published var favoriteChannelIds: Set<CoreChannel.ID> = []
-    @Published var isLoading = false
-    @Published var isSending = false
-    @Published var isCreatingChannel = false
-    @Published var isLoggingIn = false
-    @Published var isLoadingMessages: [String: Bool] = [:]
-    @Published var isLoadingOlderMessages: [String: Bool] = [:]
-    @Published var hasOlderMessages: [String: Bool] = [:]
-    @Published var threadReplies: [String: [CoreMessage]] = [:]
-    @Published var isLoadingThread: [String: Bool] = [:]
-    @Published var channelThreads: [String: [CoreThreadSummary]] = [:]
-    @Published var isLoadingChannelThreads: [String: Bool] = [:]
-    @Published var isLoadingAllThreads = false
+    var channelMembers: [String: [CoreUserLite]] = [:]
+    var selectedChannelId: CoreChannel.ID?
+    var favoriteChannelIds: Set<CoreChannel.ID> = []
+    var isLoading = false
+    var isSending = false
+    var isCreatingChannel = false
+    var isLoggingIn = false
+    var isLoadingMessages: [String: Bool] = [:]
+    var isLoadingOlderMessages: [String: Bool] = [:]
+    var hasOlderMessages: [String: Bool] = [:]
+    var threadReplies: [String: [CoreMessage]] = [:]
+    var isLoadingThread: [String: Bool] = [:]
+    var channelThreads: [String: [CoreThreadSummary]] = [:]
+    var isLoadingChannelThreads: [String: Bool] = [:]
+    var isLoadingAllThreads = false
     /// conversationId → (userId → lastReadAt). Recibos de lectura por conversación.
-    @Published var conversationReads: [String: [String: Date]] = [:]
-    @Published var channelSearchQuery = ""
-    @Published var channelSearchResults: [CoreChannelSearchHit] = []
-    @Published var isSearchingChannels = false
-    @Published var lastError: String?
+    var conversationReads: [String: [String: Date]] = [:]
+    var channelSearchQuery = ""
+    var channelSearchResults: [CoreChannelSearchHit] = []
+    var isSearchingChannels = false
+    var lastError: String?
 
-    private var realtimeResyncTask: Task<Void, Never>?
-    private var companyResyncTask: Task<Void, Never>?
-    private var convexRealtimeClient: ConvexRealtimeClient?
-    private var convexRealtimeKey: String?
-    private var convexClientTask: Task<ConvexRealtimeClient, Error>?
-    private var convexClientTaskKey: String?
-    private var isConnectingCompanyRealtime = false
-    private var realtimeMessagesSubscription: AnyCancellable?
-    private var companyChannelsSubscription: AnyCancellable?
-    private var companyDirectMessagesSubscription: AnyCancellable?
+    @ObservationIgnored private var realtimeResyncTask: Task<Void, Never>?
+    @ObservationIgnored private var companyResyncTask: Task<Void, Never>?
+    @ObservationIgnored private var convexRealtimeClient: ConvexRealtimeClient?
+    @ObservationIgnored private var convexRealtimeKey: String?
+    @ObservationIgnored private var convexClientTask: Task<ConvexRealtimeClient, Error>?
+    @ObservationIgnored private var convexClientTaskKey: String?
+    @ObservationIgnored private var isConnectingCompanyRealtime = false
+    @ObservationIgnored private var realtimeMessagesSubscription: AnyCancellable?
+    @ObservationIgnored private var companyChannelsSubscription: AnyCancellable?
+    @ObservationIgnored private var companyDirectMessagesSubscription: AnyCancellable?
     /// Identifica el arranque vigente de las suscripciones de empresa para
     /// que un fallo tardío de una suscripción reemplazada no tire la nueva.
-    private var companyRealtimeGeneration = 0
-    private var convexWebSocketSubscription: AnyCancellable?
-    private var channelSearchTask: Task<Void, Never>?
-    private var realtimeConversationId: String?
-    private var refreshTask: Task<Void, Never>?
-    private var lastRefreshAt: Date?
+    @ObservationIgnored private var companyRealtimeGeneration = 0
+    @ObservationIgnored private var convexWebSocketSubscription: AnyCancellable?
+    @ObservationIgnored private var channelSearchTask: Task<Void, Never>?
+    @ObservationIgnored private var realtimeConversationId: String?
+    @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    @ObservationIgnored private var lastRefreshAt: Date?
     /// Primer refresh terminado (con o sin éxito): hasta entonces la lista
     /// vacía muestra el cargador y no el estado "sin chats".
-    @Published private(set) var hasLoadedChatList = false
+    private(set) var hasLoadedChatList = false
     var hasCompletedRefresh: Bool { lastRefreshAt != nil }
     /// Conversaciones cuya lista de hilos ya se pidió al servidor (o cuya
     /// página local cubre todo el historial).
-    private var syncedThreadConversationIds: Set<String> = []
-    private var sessionRefreshTask: Task<CoreAppConfiguration, Error>?
-    private var sessionMaintenanceTask: Task<Void, Never>?
-    private var realtimeRetryTask: Task<Void, Never>?
-    private var pendingRealtimeConversationId: String?
-    private var realtimeRetryDelay: TimeInterval = 2
-    private var sceneIsActive = true
+    @ObservationIgnored private var syncedThreadConversationIds: Set<String> = []
+    @ObservationIgnored private var sessionRefreshTask: Task<CoreAppConfiguration, Error>?
+    @ObservationIgnored private var sessionMaintenanceTask: Task<Void, Never>?
+    @ObservationIgnored private var realtimeRetryTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingRealtimeConversationId: String?
+    @ObservationIgnored private var realtimeRetryDelay: TimeInterval = 2
+    @ObservationIgnored private var sceneIsActive = true
     static let optimisticMessageIdPrefix = "local-pending-"
-    private let optimisticMessagePrefix = CoreChannelsStore.optimisticMessageIdPrefix
+    @ObservationIgnored private let optimisticMessagePrefix = CoreChannelsStore.optimisticMessageIdPrefix
     /// Conversación cuyo ChatDetailView está en pantalla. Solo ella marca leído.
     private(set) var visibleConversationId: String?
-    private var lastMarkedReadMessageId: [String: String] = [:]
-    private var pendingSends: [String: PendingSend] = [:]
-    private var cacheWriteTask: Task<Void, Never>?
-    private var messagesCacheWriteTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var lastMarkedReadMessageId: [String: String] = [:]
+    @ObservationIgnored private var pendingSends: [String: PendingSend] = [:]
+    @ObservationIgnored private var cacheWriteTask: Task<Void, Never>?
+    @ObservationIgnored private var messagesCacheWriteTasks: [String: Task<Void, Never>] = [:]
     /// No leídos que tenía cada conversación al abrirla (antes de ponerlos en
     /// cero); se resuelve a un id cuando llega la primera página del servidor,
     /// porque la lista en memoria o de caché puede estar desactualizada.
-    private var pendingNewMessagesUnread: [String: Int] = [:]
+    @ObservationIgnored private var pendingNewMessagesUnread: [String: Int] = [:]
     /// Mensaje sobre el que el chat pinta el separador "Nuevos mensajes".
-    @Published private(set) var newMessagesDividerId: [String: String] = [:]
+    private(set) var newMessagesDividerId: [String: String] = [:]
     /// Borradores por conversación (o por hilo, con el id de la raíz).
-    @Published private(set) var drafts: [String: ComposerDraft] = CoreChannelsStore.loadDrafts()
+    private(set) var drafts: [String: ComposerDraft] = CoreChannelsStore.loadDrafts()
     static let draftsDefaultsKey = "zia.composerDrafts"
-    private var draftsWriteTask: Task<Void, Never>?
+    @ObservationIgnored private var draftsWriteTask: Task<Void, Never>?
     /// Conversaciones puestas en cero localmente; se respeta el cero unos
     /// segundos mientras el servidor procesa el markRead.
-    private var locallyClearedAt: [String: Date] = [:]
+    @ObservationIgnored private var locallyClearedAt: [String: Date] = [:]
     private static let locallyClearedGrace: TimeInterval = 10
 
     init(configuration: CoreAppConfiguration) {
@@ -270,7 +271,7 @@ final class CoreChannelsStore: ObservableObject {
     }
 
     /// Páginas antiguas ya sintetizadas por conversación en modo demo.
-    private var demoOlderPagesLoaded: [String: Int] = [:]
+    @ObservationIgnored private var demoOlderPagesLoaded: [String: Int] = [:]
 #endif
 
     func setVisibleConversation(_ conversationId: String?) {
@@ -1094,7 +1095,9 @@ final class CoreChannelsStore: ObservableObject {
         }
     }
 
-    func loadOlderMessages(in channel: CoreChannel) async {
+    /// `beforeApplying` se espera con la página ya descargada y antes de
+    /// insertarla, para que la vista la aplique cuando el scroll esté quieto.
+    func loadOlderMessages(in channel: CoreChannel, beforeApplying: (@MainActor () async -> Void)? = nil) async {
         guard configuration.isUsable,
               let conversationId = channel.conversationId,
               hasOlderMessages[conversationId] != false,
@@ -1113,6 +1116,7 @@ final class CoreChannelsStore: ObservableObject {
             let loadedPages = demoOlderPagesLoaded[conversationId, default: 0]
             demoOlderPagesLoaded[conversationId] = loadedPages + 1
             hasOlderMessages[conversationId] = loadedPages + 1 < 2
+            await beforeApplying?()
             mergeMessagePage(CorePreviewData.olderPage(before: oldestMessage), conversationId: conversationId, isLatestPage: false)
             return
         }
@@ -1126,6 +1130,7 @@ final class CoreChannelsStore: ObservableObject {
             )
 
             hasOlderMessages[conversationId] = page.count == 21
+            await beforeApplying?()
             mergeMessagePage(page, conversationId: conversationId, isLatestPage: false)
         } catch {
             lastError = error.localizedDescription

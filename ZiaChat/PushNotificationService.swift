@@ -1,4 +1,4 @@
-import Combine
+import Observation
 import UIKit
 import UserNotifications
 
@@ -6,9 +6,11 @@ struct PushNotificationDestination: Equatable, Sendable {
     var channelId: String?
     var conversationId: String?
     var messageId: String?
+    /// Chat de WhatsApp (push del portal de AuthCode vía el puente de Zia).
+    var whatsAppChatId: String?
 
     nonisolated var isValid: Bool {
-        channelId != nil || conversationId != nil
+        channelId != nil || conversationId != nil || whatsAppChatId != nil
     }
 }
 
@@ -17,21 +19,22 @@ struct ForegroundPushNotificationEvent: Equatable, Sendable {
     var destination: PushNotificationDestination
 }
 
+@Observable
 @MainActor
-final class PushNotificationService: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
+final class PushNotificationService: NSObject, UNUserNotificationCenterDelegate {
     static let shared = PushNotificationService()
 
-    @Published private(set) var deviceToken: String?
-    @Published private(set) var pendingDestination: PushNotificationDestination?
-    @Published private(set) var foregroundEvent: ForegroundPushNotificationEvent?
-    @Published private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
-    @Published var lastError: String?
+    private(set) var deviceToken: String?
+    private(set) var pendingDestination: PushNotificationDestination?
+    private(set) var foregroundEvent: ForegroundPushNotificationEvent?
+    private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
+    var lastError: String?
     /// La app se lanzó al tocar una notificación: el NavigationStack aún se
     /// está restaurando cuando llega el tap, así que ese caso espera un poco.
-    var launchedFromNotification = false
+    @ObservationIgnored var launchedFromNotification = false
     /// En apps con escenas el tap que arranca la app suele llegar sin
     /// launchOptions; la antigüedad del proceso cubre ese caso.
-    private let launchDate = Date()
+    @ObservationIgnored private let launchDate = Date()
 
     private override init() {
         super.init()
@@ -160,7 +163,8 @@ final class PushNotificationService: NSObject, ObservableObject, UNUserNotificat
         PushNotificationDestination(
             channelId: stringValue(userInfo["channelId"] ?? userInfo["channel_id"]),
             conversationId: stringValue(userInfo["conversationId"] ?? userInfo["conversation_id"]),
-            messageId: stringValue(userInfo["messageId"] ?? userInfo["message_id"])
+            messageId: stringValue(userInfo["messageId"] ?? userInfo["message_id"]),
+            whatsAppChatId: stringValue(userInfo["chatId"] ?? userInfo["chat_id"])
         )
     }
 

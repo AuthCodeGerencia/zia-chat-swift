@@ -46,8 +46,8 @@ struct ComposerDraftPersistence: ViewModifier {
 
     @State private var pendingReplyId: String?
     @State private var isPersistingAttachments = false
-    /// El texto se guarda tras una pausa: tocar el store en cada tecla
-    /// redibujaría el chat completo.
+    /// El texto se guarda tras una pausa: tocar `store.drafts` en cada tecla
+    /// redibujaría la lista de canales y escribiría en disco.
     @State private var textSaveTask: Task<Void, Never>?
 
     func body(content: Content) -> some View {

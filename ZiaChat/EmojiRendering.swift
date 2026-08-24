@@ -10,6 +10,7 @@ enum TwemojiLoader {
     private static let cache = NSCache<NSString, UIImage>()
 
     static func image(for emoji: String, pointSize: CGFloat) async -> UIImage? {
+        guard !ZiaDemoMode.isEnabled else { return nil }
         let key = "\(emoji)|\(Int(pointSize))" as NSString
         if let cached = cache.object(forKey: key) {
             return cached
@@ -82,14 +83,22 @@ struct EmojiGlyph: View {
 
     var body: some View {
         #if targetEnvironment(simulator)
-        TwemojiImage(emoji: value, size: size)
+        if ZiaDemoMode.isEnabled {
+            nativeGlyph
+        } else {
+            TwemojiImage(emoji: value, size: size)
+        }
         #else
+        nativeGlyph
+        #endif
+    }
+
+    private var nativeGlyph: some View {
         Text(verbatim: value)
             .lineLimit(1)
             .minimumScaleFactor(0.5)
             .scaleEffect(size / 20)
             .frame(width: size, height: size)
-        #endif
     }
 }
 

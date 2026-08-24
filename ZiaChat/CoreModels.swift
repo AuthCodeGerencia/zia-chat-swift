@@ -304,8 +304,8 @@ struct CoreChannel: Identifiable, Codable, Hashable {
 
     var tint: Color {
         // Paleta Grupo Zenit: teal corporativo, oliva y khaki.
-        if isVoice { return ZenitBrand.khaki }
-        return visibility == .private ? ZenitBrand.olive : ZenitBrand.teal
+        if isVoice { return ZenitBrand.khakiFill }
+        return visibility == .private ? ZenitBrand.oliveFill : ZenitBrand.teal
     }
 }
 

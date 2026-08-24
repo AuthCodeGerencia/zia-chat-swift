@@ -1,19 +1,20 @@
-import Combine
 import Foundation
+import Observation
 
 /// Indicador de escritura respaldado por Convex (`typing:set`).
 /// No se consulta `typing:list` en loop; sin canal reactivo, la app solo publica
 /// el estado local para no abrir polling.
+@Observable
 @MainActor
-final class CoreTypingService: ObservableObject {
-    @Published private(set) var typingNames: [String] = []
+final class CoreTypingService {
+    private(set) var typingNames: [String] = []
 
-    private var connectedConversationId: String?
-    private var lastTypingSentAt: Date = .distantPast
-    private var isTypingSent = false
-    private var idleTask: Task<Void, Never>?
-    private let typingPulseInterval: TimeInterval = 5
-    private let typingIdleStopDelay: Duration = .milliseconds(3500)
+    @ObservationIgnored private var connectedConversationId: String?
+    @ObservationIgnored private var lastTypingSentAt: Date = .distantPast
+    @ObservationIgnored private var isTypingSent = false
+    @ObservationIgnored private var idleTask: Task<Void, Never>?
+    @ObservationIgnored private let typingPulseInterval: TimeInterval = 5
+    @ObservationIgnored private let typingIdleStopDelay: Duration = .milliseconds(3500)
 
     var typingLabel: String? {
         guard !typingNames.isEmpty else { return nil }

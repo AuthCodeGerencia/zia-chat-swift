@@ -63,7 +63,7 @@ actor ConvexCoreClient {
         self.encoder = encoder
     }
 
-    nonisolated private static func makeDecoder() -> JSONDecoder {
+    nonisolated static func makeDecoder() -> JSONDecoder {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .custom(decodeDate)
         return decoder
@@ -621,7 +621,7 @@ actor ConvexCoreClient {
 
     private static let convexIntegerMarker = Data("\"$integer\"".utf8)
 
-    nonisolated private static func containsConvexEncodedInteger(_ data: Data) -> Bool {
+    nonisolated static func containsConvexEncodedInteger(_ data: Data) -> Bool {
         data.range(of: convexIntegerMarker) != nil
     }
 
@@ -643,7 +643,7 @@ actor ConvexCoreClient {
         return String(result.trimmingCharacters(in: CharacterSet(charactersIn: "-")).prefix(64))
     }
 
-    nonisolated private static func jsonReady(_ value: Any?) -> Any {
+    nonisolated static func jsonReady(_ value: Any?) -> Any {
         guard let value else { return NSNull() }
         if let value = value as? NSNull { return value }
         if let value = value as? [String: Any] {
@@ -655,7 +655,7 @@ actor ConvexCoreClient {
         return value
     }
 
-    nonisolated private static func jsonFromConvex(_ value: Any) -> Any {
+    nonisolated static func jsonFromConvex(_ value: Any) -> Any {
         if let object = value as? [String: Any] {
             if object.count == 1, let encodedInteger = object["$integer"] as? String {
                 return Int(encodedInteger) ?? encodedInteger
@@ -668,7 +668,7 @@ actor ConvexCoreClient {
         return value
     }
 
-    nonisolated private static func dataFromJSONValue(_ value: Any) throws -> Data {
+    nonisolated static func dataFromJSONValue(_ value: Any) throws -> Data {
         if JSONSerialization.isValidJSONObject(value) {
             return try JSONSerialization.data(withJSONObject: value)
         }
@@ -690,7 +690,7 @@ actor ConvexCoreClient {
         throw ConvexCoreError.server("Convex returned an unsupported response type.")
     }
 
-    nonisolated private static func decodeDate(_ decoder: Decoder) throws -> Date {
+    nonisolated static func decodeDate(_ decoder: Decoder) throws -> Date {
         let container = try decoder.singleValueContainer()
         if let milliseconds = try? container.decode(Double.self) {
             return Date(timeIntervalSince1970: milliseconds / 1_000)
@@ -705,7 +705,7 @@ actor ConvexCoreClient {
     }
 }
 
-private nonisolated struct ConvexEnvelope<Value: Decodable>: Decodable {
+nonisolated struct ConvexEnvelope<Value: Decodable>: Decodable {
     var status: String
     var value: Value?
     var errorMessage: String?
@@ -724,7 +724,7 @@ private nonisolated struct ConvexEnvelope<Value: Decodable>: Decodable {
     }
 }
 
-private nonisolated struct CoreJSONAny: Decodable {
+nonisolated struct CoreJSONAny: Decodable {
     let value: Any
 
     init(from decoder: Decoder) throws {

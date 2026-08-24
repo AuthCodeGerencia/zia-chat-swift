@@ -5,9 +5,10 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
-    @StateObject private var store = ContentView.makeStore()
-    @StateObject private var voiceStore = CoreVoiceRoomStore()
-    @StateObject private var pushService = PushNotificationService.shared
+    @State private var store = ContentView.makeStore()
+    @State private var voiceStore = CoreVoiceRoomStore()
+    @StateObject private var whatsAppStore = WhatsAppStore()
+    private let pushService = PushNotificationService.shared
     @State private var showingSettings = false
     @State private var showingNewChannel = false
     @State private var navigationPath: [CoreChannel.ID] = []
@@ -21,13 +22,19 @@ struct ContentView: View {
                     ChannelListView(
                         store: store,
                         voiceStore: voiceStore,
-                        connectedVoiceChannel: voiceStore.connectedChannel,
+                        whatsAppStore: whatsAppStore,
                         showingSettings: $showingSettings,
                         showingNewChannel: $showingNewChannel,
                         navigationPath: $navigationPath
                     )
                     .navigationDestination(for: CoreChannel.ID.self) { channelId in
-                        if let channel = store.channel(with: channelId) {
+                        if let chatId = WhatsAppRoute.chatId(from: channelId) {
+                            WhatsAppThreadView(
+                                store: whatsAppStore,
+                                chatId: chatId,
+                                navigationPath: $navigationPath
+                            )
+                        } else if let channel = store.channel(with: channelId) {
                             if channel.isVoice {
                                 VoiceChannelView(
                                     store: store,
@@ -39,8 +46,6 @@ struct ContentView: View {
                                     store: store,
                                     voiceStore: voiceStore,
                                     channel: channel,
-                                    connectedVoiceChannelId: voiceStore.connectedChannel?.id,
-                                    isVoiceConnected: voiceStore.isConnected,
                                     navigationPath: $navigationPath
                                 )
                             }
@@ -65,6 +70,7 @@ struct ContentView: View {
             ChannelSettingsView(store: store)
         }
         .onChange(of: store.configuration.isUsable) { _, isUsable in
+            whatsAppStore.configure(with: store.configuration)
             if !isUsable {
                 navigationPath.removeAll()
                 Task {
@@ -106,7 +112,14 @@ struct ContentView: View {
         }
         .onChange(of: store.configuration.accessToken) { _, _ in
             guard !CoreChannelsStore.isDemo else { return }
+            whatsAppStore.configure(with: store.configuration)
             Task { await pushService.registerCurrentToken(configuration: store.configuration) }
+        }
+        .onChange(of: whatsAppStore.unreadCount) { _, _ in
+            Task { await syncAppBadge() }
+        }
+        .onChange(of: whatsAppStore.availability) { _, _ in
+            schedulePendingPushNavigation()
         }
         .onChange(of: scenePhase) { _, phase in
             handleScenePhaseChange(phase)
@@ -120,6 +133,7 @@ struct ContentView: View {
                 openDemoChannelIfRequested()
                 return
             }
+            whatsAppStore.configure(with: store.configuration)
             _ = try? await store.ensureFreshSession()
             await store.refresh()
             await pushService.requestAuthorizationAndRegister()
@@ -127,7 +141,6 @@ struct ContentView: View {
             await syncAppBadge()
             schedulePendingPushNavigation()
         }
-        .preferredColorScheme(.light)
     }
 
     private func handleScenePhaseChange(_ phase: ScenePhase) {
@@ -168,9 +181,10 @@ struct ContentView: View {
 
     /// `-zia-demo-open`: abre el primer canal de texto sin tocar la lista.
     private func openDemoChannelIfRequested() {
-        guard ZiaDemoMode.opensFirstChannel,
-              navigationPath.isEmpty,
-              let channel = store.textChannels.first else { return }
+        if ZiaDemoMode.opensNewChannelSheet { showingNewChannel = true }
+        guard ZiaDemoMode.opensFirstChannel, navigationPath.isEmpty else { return }
+        let requested = ZiaDemoMode.openChannelSlug.flatMap { slug in store.textChannels.first { $0.slug == slug } }
+        guard let channel = requested ?? store.textChannels.first else { return }
         store.selectedChannelId = channel.id
         navigationPath = [channel.id]
     }
@@ -179,6 +193,7 @@ struct ContentView: View {
         guard !CoreChannelsStore.isDemo else { return }
         let unreadCount = store.textChannels.reduce(0) { $0 + $1.unreadCount }
             + store.directMessages.reduce(0) { $0 + $1.unreadCount }
+            + whatsAppStore.unreadCount
         await pushService.updateBadgeCount(unreadCount)
     }
 
@@ -203,6 +218,27 @@ struct ContentView: View {
         guard let destination = pushService.pendingDestination,
               store.configuration.isUsable else {
             return
+        }
+
+        if let chatId = destination.whatsAppChatId {
+            // El push de WhatsApp llega del portal de AuthCode; el hilo se abre
+            // en cuanto el perfil del portal está resuelto.
+            switch whatsAppStore.availability {
+            case .unknown:
+                return
+            case .unavailable:
+                pushService.consume(destination)
+                pushService.lastError = "Tu usuario no tiene acceso a la bandeja de WhatsApp."
+                return
+            case .available:
+                let route = WhatsAppRoute.navigationId(for: chatId)
+                if navigationPath.last != route {
+                    navigationPath = [route]
+                }
+                pushService.consume(destination)
+                pushService.lastError = nil
+                return
+            }
         }
 
         var latestError: Error?
@@ -245,7 +281,7 @@ struct ContentView: View {
 }
 
 private struct LoginView: View {
-    @ObservedObject var store: CoreChannelsStore
+    let store: CoreChannelsStore
     @Binding var showingSettings: Bool
     @State private var email = ""
     @State private var password = ""
@@ -348,7 +384,7 @@ private struct LoginView: View {
                             }
                             .buttonStyle(.plain)
                             .foregroundStyle(.white)
-                            .background(canLogin ? ZenitBrand.accent : Color.gray.opacity(0.45))
+                            .background(canLogin ? ZenitBrand.accentFill : Color.gray.opacity(0.45))
                             .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
                             .disabled(!canLogin)
 
@@ -365,7 +401,7 @@ private struct LoginView: View {
                                 .frame(maxWidth: .infinity, alignment: .center)
                         }
                         .padding(24)
-                        .background(Color.white.opacity(0.97))
+                        .background(ZenitBrand.surface.opacity(0.97))
                         .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
                         .shadow(color: Color.black.opacity(0.18), radius: 24, y: 14)
                     }
@@ -416,10 +452,10 @@ private struct LoginView: View {
             }
             .padding(.horizontal, 14)
             .frame(height: 52)
-            .background(Color(zenitHex: 0xF2F6F6))
+            .background(ZenitBrand.surfaceMuted)
             .overlay {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color.black.opacity(0.07), lineWidth: 1)
+                    .stroke(ZenitBrand.hairline, lineWidth: 1)
             }
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
@@ -480,6 +516,8 @@ enum ChannelListFilter: CaseIterable {
     case favoritos
     case noLeidos
     case voz
+    /// Bandeja de WhatsApp del portal de AuthCode; visible solo para agentes.
+    case whatsapp
 
     var title: String {
         switch self {
@@ -489,6 +527,7 @@ enum ChannelListFilter: CaseIterable {
         case .favoritos: return "Favoritos"
         case .noLeidos: return "No leídos"
         case .voz: return "Voz"
+        case .whatsapp: return "WhatsApp"
         }
     }
 
@@ -500,6 +539,7 @@ enum ChannelListFilter: CaseIterable {
         case .favoritos: return "star.fill"
         case .noLeidos: return "circle.badge.fill"
         case .voz: return "speaker.wave.2.fill"
+        case .whatsapp: return "phone.bubble.fill"
         }
     }
 }
@@ -548,9 +588,9 @@ struct ChannelThreadItem: Identifiable {
 }
 
 private struct ChannelListView: View {
-    @ObservedObject var store: CoreChannelsStore
+    let store: CoreChannelsStore
     let voiceStore: CoreVoiceRoomStore
-    let connectedVoiceChannel: CoreChannel?
+    @ObservedObject var whatsAppStore: WhatsAppStore
     @Binding var showingSettings: Bool
     @Binding var showingNewChannel: Bool
     @Binding var navigationPath: [CoreChannel.ID]
@@ -559,7 +599,7 @@ private struct ChannelListView: View {
     @State private var channelFilter: ChannelListFilter = .todos
     @State private var showNewDM = false
     @State private var selectedThreadItem: ChannelThreadItem?
-    @ObservedObject private var threadReads = ThreadReadTracker.shared
+    private let threadReads = ThreadReadTracker.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var isSearching: Bool {
@@ -585,11 +625,13 @@ private struct ChannelListView: View {
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
-        .background(Color.white)
+        .background(ZenitBrand.surface)
         .contentMargins(.horizontal, 0, for: .scrollContent)
         .listSectionSpacing(0)
         .overlay {
-            if store.channels.isEmpty && store.directMessages.isEmpty
+            if channelFilter == .whatsapp {
+                EmptyView()
+            } else if store.channels.isEmpty && store.directMessages.isEmpty
                 && (store.isLoading || !store.hasLoadedChatList || !store.configuration.isUsable) {
                 ProgressView("Cargando chats")
             } else if store.channels.isEmpty && store.directMessages.isEmpty && store.configuration.isUsable {
@@ -626,6 +668,11 @@ private struct ChannelListView: View {
         .onChange(of: searchText) { _, newValue in
             store.updateChannelSearch(newValue)
         }
+        .onChange(of: whatsAppStore.isAvailable) { _, available in
+            if !available, channelFilter == .whatsapp {
+                channelFilter = .todos
+            }
+        }
         .sheet(item: $channelToEdit) { channel in
             ChannelSettingsView(store: store, editing: channel)
         }
@@ -638,7 +685,7 @@ private struct ChannelListView: View {
         }
         .navigationTitle("ZiaChat")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(Color.white, for: .navigationBar)
+        .toolbarBackground(ZenitBrand.surface, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -653,7 +700,7 @@ private struct ChannelListView: View {
         }
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 0) {
-                if let channel = connectedVoiceChannel {
+                if let channel = voiceStore.connectedChannel {
                     ConnectedVoiceBar(
                         voiceStore: voiceStore,
                         channel: channel,
@@ -746,7 +793,7 @@ private struct ChannelListView: View {
     private func filterChipsRow(_ snapshot: ChannelListSnapshot) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                ForEach(ChannelListFilter.allCases, id: \.self) { filter in
+                ForEach(visibleFilters, id: \.self) { filter in
                     filterChip(filter, snapshot: snapshot)
                 }
             }
@@ -755,16 +802,23 @@ private struct ChannelListView: View {
         }
         .listRowInsets(EdgeInsets())
         .listRowSeparator(.hidden)
-        .listRowBackground(Color.white)
+        .listRowBackground(ZenitBrand.surface)
+    }
+
+    /// El chip de WhatsApp solo existe para usuarios con perfil de agente en
+    /// el portal de AuthCode; para el resto la lista no cambia.
+    private var visibleFilters: [ChannelListFilter] {
+        ChannelListFilter.allCases.filter { $0 != .whatsapp || whatsAppStore.isAvailable }
     }
 
     private func filterChip(_ filter: ChannelListFilter, snapshot: ChannelListSnapshot) -> some View {
         let isSelected = channelFilter == filter
-        let chipBackground: Color = isSelected ? ZenitBrand.accent : Color(.systemGray6)
+        let chipBackground: Color = isSelected ? ZenitBrand.accentFill : ZenitBrand.surfaceMuted
         let chipForeground: Color = isSelected ? .white : .primary
         let badgeCount: Int = switch filter {
         case .noLeidos: snapshot.totalUnreadCount
         case .hilos: snapshot.unreadThreadItems.count
+        case .whatsapp: whatsAppStore.unreadCount
         default: 0
         }
         return Button {
@@ -783,10 +837,10 @@ private struct ChannelListView: View {
                 if badgeCount > 0 {
                     Text(CoreFormat.badgeCount(badgeCount))
                         .font(.caption2.weight(.bold))
-                        .foregroundStyle(isSelected ? ZenitBrand.accent : Color.white)
+                        .foregroundStyle(isSelected ? ZenitBrand.accentFill : Color.white)
                         .padding(.horizontal, 5)
                         .padding(.vertical, 1)
-                        .background(isSelected ? Color.white : ZenitBrand.accent)
+                        .background(isSelected ? Color.white : ZenitBrand.accentFill)
                         .clipShape(Capsule())
                 }
             }
@@ -816,6 +870,10 @@ private struct ChannelListView: View {
             unreadContent(snapshot)
         case .voz:
             voiceContent
+        case .whatsapp:
+            WhatsAppInboxContent(store: whatsAppStore) { chat in
+                navigationPath.append(WhatsAppRoute.navigationId(for: chat.chatId))
+            }
         }
     }
 
@@ -831,7 +889,7 @@ private struct ChannelListView: View {
             }
             .padding(.top, 32)
             .listRowSeparator(.hidden)
-            .listRowBackground(Color.white)
+            .listRowBackground(ZenitBrand.surface)
         } else if snapshot.threadItems.isEmpty {
             ContentUnavailableView(
                 "Sin hilos",
@@ -869,7 +927,7 @@ private struct ChannelListView: View {
             .contentShape(Rectangle())
             .onTapGesture { selectedThreadItem = item }
             .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
-            .listRowBackground(Color.white)
+            .listRowBackground(ZenitBrand.surface)
     }
 
     @ViewBuilder
@@ -882,7 +940,7 @@ private struct ChannelListView: View {
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(ZenitBrand.accent)
             }
-            .listRowBackground(Color.white)
+            .listRowBackground(ZenitBrand.surface)
         }
 
         if snapshot.directMessages.isEmpty {
@@ -994,7 +1052,7 @@ private struct ChannelListView: View {
     }
 
     /// La fila recibe valores planos: solo se re-evalúa cuando cambia su propio
-    /// canal, no con cada publicación del store.
+    /// canal, no con cada cambio del store.
     private func channelRow(_ channel: CoreChannel) -> some View {
         ChannelNavigationRow(
             channel: channel,
@@ -1086,7 +1144,7 @@ private struct ChannelBottomBar: View {
         }
         .frame(height: 49)
         .padding(.horizontal, 28)
-        .background(Color.white)
+        .background(ZenitBrand.surface)
         .overlay(alignment: .top) {
             Divider()
         }
@@ -1158,7 +1216,7 @@ private struct DirectMessageRow: View {
                     if dm.unreadCount > 0 {
                         CountBadge(
                             text: CoreFormat.badgeCount(dm.unreadCount),
-                            color: dm.mentionCount > 0 ? .red : ZenitBrand.accent
+                            color: dm.mentionCount > 0 ? .red : ZenitBrand.accentFill
                         )
                     }
                 }
@@ -1198,7 +1256,7 @@ private struct DirectMessageNavigationRow: View {
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
         .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
-        .listRowBackground(Color.white)
+        .listRowBackground(ZenitBrand.surface)
         .contextMenu {
             Button(action: onToggleFavorite) {
                 Label(
@@ -1240,14 +1298,14 @@ private struct DirectMessageNavigationRow: View {
                     systemImage: isMuted ? "bell" : "bell.slash"
                 )
             }
-            .tint(ZenitBrand.olive)
+            .tint(ZenitBrand.oliveFill)
         }
     }
 }
 
 private struct NewDirectMessageView: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject var store: CoreChannelsStore
+    let store: CoreChannelsStore
     let onOpen: (CoreChannel) -> Void
 
     @State private var search = ""
@@ -1354,7 +1412,7 @@ private struct ChannelSearchResultRow: View {
                     .foregroundStyle(.white)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 5)
-                    .background(Color.accentColor)
+                    .background(ZenitBrand.accentFill)
                     .clipShape(Capsule())
             }
             .padding(.vertical, 4)
@@ -1393,7 +1451,7 @@ private struct ChannelNavigationRow: View {
         .onTapGesture(perform: onSelect)
         .accessibilityAddTraits(.isButton)
         .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
-        .listRowBackground(Color.white)
+        .listRowBackground(ZenitBrand.surface)
         .contextMenu {
             Button(action: onSettings) {
                 Label("Configurar canal", systemImage: "gearshape")
@@ -1435,7 +1493,7 @@ private struct ChannelNavigationRow: View {
             Button(action: onSettings) {
                 Label("Configurar", systemImage: "gearshape.fill")
             }
-            .tint(ZenitBrand.olive)
+            .tint(ZenitBrand.oliveFill)
         }
     }
 }
@@ -1605,15 +1663,13 @@ private struct MessageListContext {
 
 private struct ChatDetailView: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject var store: CoreChannelsStore
+    let store: CoreChannelsStore
     let voiceStore: CoreVoiceRoomStore
     let channel: CoreChannel
-    let connectedVoiceChannelId: CoreChannel.ID?
-    let isVoiceConnected: Bool
     @Binding var navigationPath: [CoreChannel.ID]
     @State private var showVoicePanel = false
     @State private var composerState = ComposerState()
-    @StateObject private var typingService = CoreTypingService()
+    @State private var typingService = CoreTypingService()
     @State private var showChannelSearch = false
     @State private var channelSearchText = ""
     @State private var channelSearchHits: [CoreMessage] = []
@@ -1629,12 +1685,15 @@ private struct ChatDetailView: View {
     @State private var showChannelDetails = false
     @State private var errorBanner: String?
     @State private var errorBannerTask: Task<Void, Never>?
-    @ObservedObject private var threadReads = ThreadReadTracker.shared
+    private let threadReads = ThreadReadTracker.shared
     @FocusState private var isComposerFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    /// La lista está invertida: offset ~0 es el final de la conversación.
     @State private var isNearBottom = true
     @State private var unseenCount = 0
+    /// Fila alineada con el borde superior; el scroll view la mantiene en su
+    /// sitio cuando se antepone una página anterior.
+    @State private var anchoredMessageId: String?
+    @State private var scrollPhase: ScrollPhase = .idle
     private let bottomID = "chat-bottom-anchor"
 
     var messages: [CoreMessage] {
@@ -1843,7 +1902,7 @@ private struct ChatDetailView: View {
     }
 
     private var isConnectedToChannelVoice: Bool {
-        connectedVoiceChannelId == channel.id && isVoiceConnected
+        voiceStore.connectedChannel?.id == channel.id && voiceStore.isConnected
     }
 
     // MARK: - Secciones del body (separadas para ayudar al type-checker)
@@ -1899,7 +1958,7 @@ private struct ChatDetailView: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
-            .background(Color.white)
+            .background(ZenitBrand.surface)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1932,7 +1991,7 @@ private struct ChatDetailView: View {
                 Image(systemName: "bubble.left.and.bubble.right.fill")
                     .foregroundStyle(.white)
                     .frame(width: 30, height: 30)
-                    .background(ZenitBrand.accent)
+                    .background(ZenitBrand.accentFill)
                     .clipShape(Circle())
 
                 VStack(alignment: .leading, spacing: 2) {
@@ -1954,7 +2013,7 @@ private struct ChatDetailView: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
-            .background(Color.white)
+            .background(ZenitBrand.surface)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1964,13 +2023,26 @@ private struct ChatDetailView: View {
     private var messagesArea: some View {
         ScrollViewReader { proxy in
             messagesScroll
-                .onScrollGeometryChange(for: Bool.self) { geometry in
-                    geometry.contentOffset.y < 80
-                } action: { _, nearBottom in
+                .onScrollGeometryChange(for: ChatScrollMetrics.self) { geometry in
+                    ChatScrollMetrics(geometry)
+                } action: { previous, metrics in
+                    // Teclado o panel: el área visible se encoge; si estaba al
+                    // final, sigue al final.
+                    if previous.isNearBottom, metrics.visibleHeight < previous.visibleHeight - 1 {
+                        scrollToBottom(proxy: proxy, animated: true)
+                    }
+                    let nearBottom = metrics.isNearBottom
                     guard nearBottom != isNearBottom else { return }
                     isNearBottom = nearBottom
                     if nearBottom {
                         unseenCount = 0
+                    }
+                }
+                .onChange(of: messages.first?.id) { _, _ in
+                    // Si la conversación cabía en pantalla (o el usuario
+                    // estaba al final), lo que se conserva es el final.
+                    if isNearBottom {
+                        scrollToBottom(proxy: proxy, animated: false)
                     }
                 }
                 .overlay(alignment: .bottomTrailing) {
@@ -1990,6 +2062,7 @@ private struct ChatDetailView: View {
                 }
                 .task(id: channel.id) {
                     unseenCount = 0
+                    anchoredMessageId = nil
                     await store.open(channel)
                     async let pinsLoad: Void = store.loadMessagePins(for: channel)
                     async let pollsLoad: Void = store.loadPolls(for: channel)
@@ -2027,38 +2100,44 @@ private struct ChatDetailView: View {
         )
         return ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
-                Color.clear
-                    .frame(height: 1)
-                    .id(bottomID)
+                ForEach(rows) { row in
+                    messageRow(row, context: context)
+                }
 
                 if store.isLoadingMessages[conversationId] == true {
                     ProgressView()
                         .frame(maxWidth: .infinity)
                         .padding()
-                        .scaleEffect(y: -1)
                 }
 
-                ForEach(rows.reversed()) { row in
-                    messageRow(row, context: context)
-                }
-
-                if store.isLoadingOlderMessages[channel.conversationId ?? ""] == true {
-                    ProgressView()
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .scaleEffect(y: -1)
-                }
+                Color.clear
+                    .frame(height: 1)
+                    .id(bottomID)
             }
+            .scrollTargetLayout()
             .padding(.horizontal)
             .padding(.vertical, 14)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(minHeight: 260)
         }
-        .scaleEffect(y: -1)
+        .defaultScrollAnchor(.bottom)
+        .scrollPosition(id: $anchoredMessageId, anchor: .top)
+        .onScrollPhaseChange { _, phase in
+            scrollPhase = phase
+        }
         .scrollDismissesKeyboard(.interactively)
         .contentShape(Rectangle())
         .onTapGesture {
             isComposerFocused = false
+        }
+        // Fuera del flujo para que aparecer/desaparecer no mueva las filas.
+        .overlay(alignment: .top) {
+            let isLoadingOlder = store.isLoadingOlderMessages[conversationId] == true
+            ProgressView()
+                .padding(8)
+                .background(.thinMaterial, in: Capsule())
+                .padding(.top, 8)
+                .opacity(isLoadingOlder ? 1 : 0)
+                .animation(.easeInOut(duration: 0.2), value: isLoadingOlder)
         }
         .overlay {
             if list.isEmpty && store.isLoadingMessages[conversationId] != true {
@@ -2076,6 +2155,7 @@ private struct ChatDetailView: View {
         let isMine = message.userId == context.currentUserId
         let rowBackground: Color = message.id == highlightedMessageId ? ZenitBrand.tealSoft : Color.clear
 
+        let isOldest = message.id == context.oldestMessageId
         return VStack(alignment: .leading, spacing: 0) {
             if row.showsDayBoundary {
                 DaySeparator(date: message.createdAt)
@@ -2090,10 +2170,31 @@ private struct ChatDetailView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 12))
         }
         .id(message.id)
-        .scaleEffect(y: -1)
         .onAppear {
-            guard message.id == context.oldestMessageId else { return }
-            Task { await store.loadOlderMessages(in: channel) }
+            guard isOldest else { return }
+            requestOlderPage()
+        }
+    }
+
+    /// Pide la página anterior; `scrollPosition(id:)` conserva la fila
+    /// superior visible cuando las filas nuevas se insertan por encima, pero
+    /// solo con el scroll quieto (un arrastre en curso impone su propio
+    /// desplazamiento), así que la página se aplica al soltar.
+    private func requestOlderPage() {
+        guard let conversationId = channel.conversationId,
+              store.hasOlderMessages[conversationId] != false,
+              store.isLoadingOlderMessages[conversationId] != true else { return }
+        Task {
+            await store.loadOlderMessages(in: channel) {
+                await waitForScrollIdle()
+            }
+        }
+    }
+
+    private func waitForScrollIdle() async {
+        let deadline = ContinuousClock.now + .seconds(4)
+        while scrollPhase != .idle, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
         }
     }
 
@@ -2172,9 +2273,9 @@ private struct ChatDetailView: View {
             .foregroundStyle(.white)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .background(ZenitBrand.accent)
+            .background(ZenitBrand.accentFill)
             .clipShape(Capsule())
-            .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+            .shadow(color: ZenitBrand.shadow(0.18), radius: 6, y: 2)
         }
         .buttonStyle(.plain)
         .padding(.trailing, 14)
@@ -2222,7 +2323,7 @@ private struct ChatDetailView: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 4)
-            .background(Color.white)
+            .background(ZenitBrand.surface)
             .transition(.opacity)
         }
     }
@@ -2338,7 +2439,7 @@ private struct ChatDetailView: View {
                     .padding(.bottom, 8)
             }
         }
-        .background(Color.white)
+        .background(ZenitBrand.surface)
         .overlay(alignment: .bottom) { Divider() }
         .transition(.move(edge: .top).combined(with: .opacity))
     }
@@ -2417,10 +2518,10 @@ private struct ChatDetailView: View {
         guard !messages.isEmpty else { return }
         if animated {
             withAnimation(.snappy) {
-                proxy.scrollTo(bottomID, anchor: .top)
+                proxy.scrollTo(bottomID, anchor: .bottom)
             }
         } else {
-            proxy.scrollTo(bottomID, anchor: .top)
+            proxy.scrollTo(bottomID, anchor: .bottom)
         }
     }
 }
@@ -2429,7 +2530,7 @@ private struct ChatDetailView: View {
 // Todo canal de texto tiene una sala de voz siempre disponible; el room lo deriva
 // el backend con la misma fórmula que la web (core-voice-{empresaId}-{channelId}).
 private struct ChannelVoiceCard: View {
-    @ObservedObject var voiceStore: CoreVoiceRoomStore
+    let voiceStore: CoreVoiceRoomStore
     let channel: CoreChannel
     let onJoin: () -> Void
 
@@ -2450,7 +2551,7 @@ private struct ChannelVoiceCard: View {
                     .font(.subheadline)
                     .foregroundStyle(Self.coreGreen)
                     .frame(width: 36, height: 36)
-                    .background(Color.white)
+                    .background(ZenitBrand.surface)
                     .clipShape(Circle())
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Voz de #\(channel.displayName)")
@@ -2491,7 +2592,7 @@ private struct ChannelVoiceCard: View {
                 }
                 .padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.white.opacity(0.7))
+                .background(ZenitBrand.surface.opacity(0.7))
                 .clipShape(RoundedRectangle(cornerRadius: 8))
 
                 HStack(spacing: 8) {
@@ -2554,7 +2655,7 @@ private struct ChannelVoiceCard: View {
                     .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(Self.coreGreen)
+                .tint(ZenitBrand.accentFill)
                 .disabled(isJoining)
             }
 
@@ -2565,11 +2666,11 @@ private struct ChannelVoiceCard: View {
             }
         }
         .padding(12)
-        .background(isConnectedHere ? ZenitBrand.tealSoft : Color(.systemGray6))
+        .background(isConnectedHere ? ZenitBrand.tealSoft : ZenitBrand.surfaceMuted)
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay {
             RoundedRectangle(cornerRadius: 12)
-                .stroke(isConnectedHere ? Self.coreGreen.opacity(0.4) : Color(.systemGray4), lineWidth: 1)
+                .stroke(isConnectedHere ? Self.coreGreen.opacity(0.4) : ZenitBrand.hairline, lineWidth: 1)
         }
         .padding(.horizontal, 10)
         .padding(.top, 8)
@@ -2579,7 +2680,7 @@ private struct ChannelVoiceCard: View {
 
 /// Reactiva el gesto interactivo de "deslizar desde el borde para regresar"
 /// cuando la barra de navegación está oculta (UIKit lo desactiva por defecto).
-private struct InteractivePopGestureEnabler: UIViewControllerRepresentable {
+struct InteractivePopGestureEnabler: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> UIViewController {
         Controller()
     }
@@ -2674,7 +2775,7 @@ private struct ChatTopBar: View {
                                     .foregroundStyle(.white)
                                     .padding(.horizontal, 5)
                                     .padding(.vertical, 1)
-                                    .background(ZenitBrand.accent)
+                                    .background(ZenitBrand.accentFill)
                                     .clipShape(Capsule())
                                     .offset(x: -2, y: 6)
                             }
@@ -2728,7 +2829,7 @@ private struct ChatTopBar: View {
         }
         .padding(.horizontal, 4)
         .padding(.vertical, 2)
-        .background(Color.white)
+        .background(ZenitBrand.surface)
         .overlay(alignment: .bottom) {
             Divider()
         }
@@ -2736,8 +2837,8 @@ private struct ChatTopBar: View {
 }
 
 private struct VoiceChannelView: View {
-    @ObservedObject var store: CoreChannelsStore
-    @ObservedObject var voiceStore: CoreVoiceRoomStore
+    let store: CoreChannelsStore
+    let voiceStore: CoreVoiceRoomStore
     let channel: CoreChannel
 
     var body: some View {
@@ -2774,6 +2875,7 @@ private struct VoiceChannelView: View {
                             Task { await joinVoiceChannel() }
                         }
                         .buttonStyle(.borderedProminent)
+                        .tint(ZenitBrand.accentFill)
                     }
                 }
             }
@@ -2820,7 +2922,7 @@ private struct VoiceChannelView: View {
 // Réplica del dock de pantalla compartida de la web ("Pantalla de {nombre}"):
 // visible solo cuando alguien comparte; tocar abre la vista completa.
 private struct VoiceScreenShareDock: View {
-    @ObservedObject var voiceStore: CoreVoiceRoomStore
+    let voiceStore: CoreVoiceRoomStore
     @State private var showFullScreen = false
 
     var body: some View {
@@ -2858,7 +2960,7 @@ private struct VoiceScreenShareDock: View {
 
 private struct VoiceScreenShareFullScreenView: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject var voiceStore: CoreVoiceRoomStore
+    let voiceStore: CoreVoiceRoomStore
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -2908,7 +3010,7 @@ private struct VoiceChannelHeader: View {
         }
         .padding(.horizontal)
         .padding(.vertical, 10)
-        .background(Color.white)
+        .background(ZenitBrand.surface)
     }
 }
 
@@ -2964,7 +3066,7 @@ private struct VoiceParticipantRow: View {
 }
 
 private struct VoiceControls: View {
-    @ObservedObject var voiceStore: CoreVoiceRoomStore
+    let voiceStore: CoreVoiceRoomStore
 
     var body: some View {
         HStack(spacing: 24) {
@@ -3003,7 +3105,7 @@ private struct VoiceControls: View {
 private struct VoiceControlButton: View {
     let title: String
     let systemImage: String
-    var color: Color = .accentColor
+    var color: Color = ZenitBrand.accentFill
     var isActive = false
     let action: () -> Void
 
@@ -3027,7 +3129,7 @@ private struct VoiceControlButton: View {
 }
 
 private struct ConnectedVoiceBar: View {
-    @ObservedObject var voiceStore: CoreVoiceRoomStore
+    let voiceStore: CoreVoiceRoomStore
     let channel: CoreChannel
     let onOpen: () -> Void
 
@@ -3255,7 +3357,7 @@ private struct MessageBubble: View {
                     }
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
-                    .background(Color.white.opacity(0.75))
+                    .background(ZenitBrand.surface.opacity(0.75))
                     .overlay(alignment: .leading) {
                         Rectangle()
                             .fill(ZenitBrand.accent)
@@ -3285,15 +3387,15 @@ private struct MessageBubble: View {
                     )
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
-                    .background(isMine ? ZenitBrand.bubbleMine : Color.white)
+                    .background(isMine ? ZenitBrand.bubbleMine : ZenitBrand.surface)
                     .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                     .overlay {
                         if !isMine {
                             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                .stroke(Color.black.opacity(0.06), lineWidth: 1)
+                                .stroke(ZenitBrand.hairline, lineWidth: 1)
                         }
                     }
-                    .shadow(color: .black.opacity(isMine ? 0.03 : 0.06), radius: 1, y: 1)
+                    .shadow(color: ZenitBrand.shadow(isMine ? 0.03 : 0.06), radius: 1, y: 1)
                 }
 
                 if !stickers.isEmpty {
@@ -3454,11 +3556,11 @@ private struct MessageBubble: View {
 
     private var authorColor: Color {
         let colors: [Color] = [
-            Color(red: 0.07, green: 0.45, blue: 0.73),
-            Color(red: 0.63, green: 0.20, blue: 0.58),
-            Color(red: 0.84, green: 0.32, blue: 0.18),
-            Color(red: 0.10, green: 0.55, blue: 0.38),
-            Color(red: 0.72, green: 0.42, blue: 0.05)
+            Color(zenitLight: 0x1273BA, dark: 0x5FA8E8),
+            Color(zenitLight: 0xA13394, dark: 0xC678C0),
+            Color(zenitLight: 0xD6522E, dark: 0xF08A66),
+            Color(zenitLight: 0x1A8C61, dark: 0x4FC38F),
+            Color(zenitLight: 0xB86B0D, dark: 0xE5A04A)
         ]
         let value = message.userId.unicodeScalars.reduce(0) { $0 + Int($1.value) }
         return colors[value % colors.count]
@@ -3531,7 +3633,7 @@ private struct CommandCardView: View {
         }
         .padding(14)
         .frame(maxWidth: 320, alignment: .leading)
-        .background(isError ? Color.red.opacity(0.08) : Color.white)
+        .background(isError ? Color.red.opacity(0.08) : ZenitBrand.surface)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
@@ -3613,7 +3715,7 @@ private struct CommandCardView: View {
 /// quiénes ya lo leyeron (✓✓ azul) y a quiénes les falta (✓✓ gris).
 private struct MessageReadsView: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject var store: CoreChannelsStore
+    let store: CoreChannelsStore
     let channel: CoreChannel
     let message: CoreMessage
 
@@ -3895,7 +3997,7 @@ private struct MessageContextPreview: View {
                 )
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
-                .background(isMine ? Color(red: 0.85, green: 0.97, blue: 0.82) : Color.white)
+                .background(isMine ? ZenitBrand.bubbleMine : ZenitBrand.surface)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             }
 
@@ -3919,7 +4021,7 @@ private struct MessageContextPreview: View {
 
 private struct ForwardMessageView: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject var store: CoreChannelsStore
+    let store: CoreChannelsStore
     let message: CoreMessage
 
     var body: some View {
@@ -4026,7 +4128,7 @@ struct ChannelLogoView: View {
 
 private struct ThreadView: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject var store: CoreChannelsStore
+    let store: CoreChannelsStore
     let channel: CoreChannel
     let root: CoreMessage
 
@@ -4214,8 +4316,8 @@ extension ThreadMessageRow: Equatable {
 
 private struct ChannelThreadsView: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject var store: CoreChannelsStore
-    @ObservedObject private var threadReads = ThreadReadTracker.shared
+    let store: CoreChannelsStore
+    private let threadReads = ThreadReadTracker.shared
     let channel: CoreChannel
 
     @State private var selectedThread: CoreMessage?
@@ -4423,6 +4525,22 @@ private enum ComposerPanel: Equatable {
     case emoji
 }
 
+#if DEBUG
+extension ComposerPanel {
+    init?(demoName: String) {
+        switch demoName {
+        case "menu": self = .menu
+        case "command": self = .command
+        case "poll": self = .poll
+        case "gif": self = .gif
+        case "sticker": self = .sticker
+        case "emoji": self = .emoji
+        default: return nil
+        }
+    }
+}
+#endif
+
 private struct ComposerView: View {
     let store: CoreChannelsStore
     let channel: CoreChannel
@@ -4434,7 +4552,7 @@ private struct ComposerView: View {
     /// (texto, adjuntos, mensaje citado, mensaje en edición)
     let onSend: (String, [CorePendingAttachment], CoreMessage?, CoreMessage?) -> Void
     @State private var activePanel: ComposerPanel = .none
-    @ObservedObject private var keyboard = KeyboardObserver.shared
+    private let keyboard = KeyboardObserver.shared
     @State private var mentionSuggestions: [CoreUserLite] = []
     @State private var showFileImporter = false
     @State private var showPhotoPicker = false
@@ -4577,7 +4695,7 @@ private struct ComposerView: View {
                         }
                     }
                 }
-                .background(Color.white)
+                .background(ZenitBrand.surface)
                 .overlay(alignment: .top) { Divider() }
             }
 
@@ -4610,7 +4728,7 @@ private struct ComposerView: View {
                         }
                 }
                 .padding(.horizontal, 4)
-                .background(Color(red: 0.95, green: 0.96, blue: 0.96))
+                .background(ZenitBrand.surfaceMuted)
                 .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
 
                 Button(action: send) {
@@ -4628,10 +4746,11 @@ private struct ComposerView: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 7)
-            .background(Color.white)
+            .background(ZenitBrand.surface)
 
             composerPanels
         }
+        .onAppear { openDemoPanelIfRequested() }
         .onChange(of: state.draft, initial: true) { _, newValue in
             mentionSuggestions = Self.mentionSuggestions(for: newValue, in: mentionableUsers)
         }
@@ -4695,6 +4814,14 @@ private struct ComposerView: View {
         }
     }
 
+    private func openDemoPanelIfRequested() {
+        #if DEBUG
+        guard ZiaDemoMode.isEnabled, let name = ZiaDemoMode.composerPanel,
+              let panel = ComposerPanel(demoName: name) else { return }
+        activePanel = panel
+        #endif
+    }
+
     @ViewBuilder
     private var composerPanels: some View {
         if voiceRecorder.isRecording {
@@ -4712,7 +4839,7 @@ private struct ComposerView: View {
                 ) { handleToolSelection($0) }
                     .frame(maxWidth: .infinity)
                     .frame(height: panelHeight, alignment: .top)
-                    .background(Color.white)
+                    .background(ZenitBrand.surfaceElevated)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             case .command:
                 CommandPalettePanel { insertCommand($0) }
@@ -5235,7 +5362,7 @@ private nonisolated enum ChannelImageProcessor {
 
 struct ChannelSettingsView: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject var store: CoreChannelsStore
+    let store: CoreChannelsStore
     /// nil = crear canal; con valor = configurar canal existente (paridad web).
     let editingChannel: CoreChannel?
 
@@ -5473,7 +5600,7 @@ struct ChannelSettingsView: View {
                     }
                 }
                 .frame(width: 56, height: 56)
-                .background(Color(.systemGray6))
+                .background(ZenitBrand.surfaceMuted)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
 
                 PhotosPicker(selection: $iconPickerItem, matching: .images) {
@@ -5586,7 +5713,7 @@ struct ChannelSettingsView: View {
             .padding(.vertical, 8)
             .background(Color(hexString: theme.bubbleOther))
             .clipShape(RoundedRectangle(cornerRadius: 14))
-            .shadow(color: .black.opacity(0.06), radius: 2, y: 1)
+            .shadow(color: ZenitBrand.shadow(0.06), radius: 2, y: 1)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("Tu mensaje")
@@ -5599,7 +5726,7 @@ struct ChannelSettingsView: View {
             .padding(.vertical, 8)
             .background(Color(hexString: theme.bubbleMine))
             .clipShape(RoundedRectangle(cornerRadius: 14))
-            .shadow(color: .black.opacity(0.06), radius: 2, y: 1)
+            .shadow(color: ZenitBrand.shadow(0.06), radius: 2, y: 1)
             .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .padding(14)
@@ -5620,6 +5747,9 @@ struct ChannelSettingsView: View {
             RoundedRectangle(cornerRadius: 12)
                 .stroke(Color(hexString: theme.accent).opacity(0.4), lineWidth: 1)
         }
+        // Los hex del tema son papel claro fijo (igual que en web): .primary/.secondary
+        // deben resolverse en claro aunque la app esté en oscuro.
+        .environment(\.colorScheme, .light)
     }
 
     private var membersSection: some View {
@@ -5969,7 +6099,7 @@ struct ChannelSettingsView: View {
 
 private struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject var store: CoreChannelsStore
+    let store: CoreChannelsStore
     @State private var config: CoreAppConfiguration
     @State private var isTestingPush = false
     @State private var pushTestMessage: String?
@@ -6202,7 +6332,7 @@ struct AvatarView: View {
             image.resizable().scaledToFill()
         } placeholder: {
             Circle()
-                .fill(Color.accentColor.gradient)
+                .fill(ZenitBrand.accentFill.gradient)
                 .overlay {
                     Text(CoreFormat.initials(name))
                         .font(.caption2.weight(.bold))
@@ -6214,7 +6344,7 @@ struct AvatarView: View {
     }
 }
 
-private struct CountBadge: View {
+struct CountBadge: View {
     let text: String
     let color: Color
 
@@ -6257,7 +6387,7 @@ private struct MissingChannelView: View {
         ChannelListView(
             store: .preview(),
             voiceStore: CoreVoiceRoomStore(),
-            connectedVoiceChannel: nil,
+            whatsAppStore: WhatsAppStore(),
             showingSettings: .constant(false),
             showingNewChannel: .constant(false),
             navigationPath: .constant([])

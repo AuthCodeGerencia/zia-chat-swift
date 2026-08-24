@@ -92,7 +92,7 @@ struct ShareComposerView: View {
                 message: saveAsStickers
                     ? "Los stickers ya están en tu colección de Zia."
                     : "Tu contenido se envió al canal.",
-                tint: ZenitBrand.teal
+                tint: ZenitBrand.accent
             )
 
         case .ready, .sending:
@@ -125,7 +125,7 @@ struct ShareComposerView: View {
                     ForEach(attachments) { attachment in
                         HStack(spacing: 10) {
                             Image(systemName: symbolName(for: attachment))
-                                .foregroundStyle(ZenitBrand.teal)
+                                .foregroundStyle(ZenitBrand.accent)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(attachment.fileName)
                                     .lineLimit(1)
@@ -174,7 +174,7 @@ struct ShareComposerView: View {
                                 Spacer()
                                 if selectedChannelId == channel.id {
                                     Image(systemName: "checkmark.circle.fill")
-                                        .foregroundStyle(ZenitBrand.teal)
+                                        .foregroundStyle(ZenitBrand.accent)
                                 }
                             }
                         }

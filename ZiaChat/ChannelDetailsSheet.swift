@@ -4,7 +4,7 @@ import SwiftUI
 /// configuración), como la cabecera de Slack.
 struct ChannelDetailsSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject var store: CoreChannelsStore
+    let store: CoreChannelsStore
     let channel: CoreChannel
     let onJumpToMessage: (String) -> Void
 

@@ -10,10 +10,10 @@ struct DaySeparator: View {
             .foregroundStyle(.secondary)
             .padding(.horizontal, 10)
             .padding(.vertical, 4)
-            .background(Color.white.opacity(0.9))
+            .background(ZenitBrand.surface.opacity(0.9))
             .clipShape(Capsule())
             .overlay {
-                Capsule().stroke(Color.black.opacity(0.06), lineWidth: 1)
+                Capsule().stroke(ZenitBrand.hairline, lineWidth: 1)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 10)

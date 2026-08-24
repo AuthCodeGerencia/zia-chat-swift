@@ -192,11 +192,11 @@ struct LinkPreviewCard: View {
                 .padding(.vertical, 8)
                 .frame(width: width, alignment: .leading)
             }
-            .background(Color(red: 0.95, green: 0.96, blue: 0.96))
+            .background(ZenitBrand.surfaceMuted)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(Color.black.opacity(0.06), lineWidth: 1)
+                    .stroke(ZenitBrand.hairline, lineWidth: 1)
             }
         }
         .buttonStyle(.plain)

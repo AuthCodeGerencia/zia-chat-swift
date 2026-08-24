@@ -247,7 +247,7 @@ extension CoreChannelsStore {
     var giphyAPIKey: String { CoreEnvironment.shared.giphyAPIKey }
 
     func loadStickers() async -> [CoreSticker] {
-        guard configuration.isUsable else { return [] }
+        guard configuration.isUsable, !Self.isDemo else { return [] }
         do {
             let config = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: config)
@@ -258,7 +258,7 @@ extension CoreChannelsStore {
     }
 
     func uploadSticker(name: String, data: Data, fileName: String, mimeType: String) async -> CoreSticker? {
-        guard configuration.isUsable else { return nil }
+        guard configuration.isUsable, !Self.isDemo else { return nil }
         do {
             let config = try await ensureFreshSession()
             let client = try ConvexCoreClient(configuration: config)
@@ -420,7 +420,7 @@ struct ComposerToolsTray: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 14)
-        .background(Color.white)
+        .background(ZenitBrand.surfaceElevated)
         .overlay(alignment: .top) { Divider() }
     }
 }
@@ -461,7 +461,7 @@ struct CommandPalettePanel: View {
             }
         }
         .frame(maxHeight: 240)
-        .background(Color.white)
+        .background(ZenitBrand.surfaceElevated)
         .overlay(alignment: .top) { Divider() }
     }
 }
@@ -490,14 +490,14 @@ struct PollComposerPanel: View {
                 .font(.subheadline.weight(.semibold))
 
             TextField("¿Qué opción prefiere el equipo?", text: $question)
-                .textFieldStyle(.roundedBorder)
+                .pollFieldStyle()
 
             Text("Opciones, una por línea")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             TextField("Opciones", text: $optionsText, axis: .vertical)
                 .lineLimit(3...6)
-                .textFieldStyle(.roundedBorder)
+                .pollFieldStyle()
 
             HStack {
                 Spacer()
@@ -517,7 +517,7 @@ struct PollComposerPanel: View {
             }
         }
         .padding(14)
-        .background(Color.white)
+        .background(ZenitBrand.surfaceElevated)
         .overlay(alignment: .top) { Divider() }
     }
 }
@@ -552,7 +552,7 @@ struct GifPickerPanel: View {
                 }
             }
             .padding(8)
-            .background(Color(red: 0.95, green: 0.96, blue: 0.96))
+            .background(ZenitBrand.surfaceMuted)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
             if let errorText {
@@ -589,7 +589,7 @@ struct GifPickerPanel: View {
             .frame(maxHeight: .infinity)
         }
         .padding(12)
-        .background(Color.white)
+        .background(ZenitBrand.surfaceElevated)
         .overlay(alignment: .top) { Divider() }
         .task {
             guard !didLoad else { return }
@@ -683,7 +683,7 @@ struct StickerPickerPanel: View {
                 .disabled(isUploading)
             }
             .padding(8)
-            .background(Color(red: 0.95, green: 0.96, blue: 0.96))
+            .background(ZenitBrand.surfaceMuted)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
             if let importHint {
@@ -733,7 +733,7 @@ struct StickerPickerPanel: View {
             .frame(maxHeight: .infinity)
         }
         .padding(12)
-        .background(Color.white)
+        .background(ZenitBrand.surfaceElevated)
         .overlay(alignment: .top) { Divider() }
         .task {
             guard !didLoad else { return }
@@ -866,7 +866,7 @@ struct VoiceNoteBar: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(Color.white)
+        .background(ZenitBrand.surfaceElevated)
         .overlay(alignment: .top) { Divider() }
     }
 }
@@ -1067,7 +1067,7 @@ struct AudioMessageView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(Color(red: 0.95, green: 0.96, blue: 0.96))
+        .background(ZenitBrand.surfaceMuted)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .onDisappear { player.stop() }
     }
@@ -1126,11 +1126,26 @@ struct PollVotingView: View {
         }
         .padding(12)
         .frame(width: 260, alignment: .leading)
-        .background(Color.white)
+        .background(ZenitBrand.surface)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color.black.opacity(0.06), lineWidth: 1)
+                .stroke(ZenitBrand.hairline, lineWidth: 1)
         }
+    }
+}
+
+private extension View {
+    func pollFieldStyle() -> some View {
+        self
+            .textFieldStyle(.plain)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(ZenitBrand.surfaceMuted)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(ZenitBrand.hairline, lineWidth: 1)
+            }
     }
 }

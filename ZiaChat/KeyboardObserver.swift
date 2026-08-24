@@ -1,16 +1,16 @@
-import Combine
 import SwiftUI
 import UIKit
 
 /// Última altura conocida del teclado (sin el inset inferior seguro) para que
 /// los paneles del compositor midan lo mismo que el teclado y el intercambio
 /// teclado ↔ panel no mueva la lista dos veces.
+@Observable
 @MainActor
-final class KeyboardObserver: ObservableObject {
+final class KeyboardObserver {
     static let shared = KeyboardObserver()
 
-    @Published private(set) var lastHeight: CGFloat?
-    private var observation: Task<Void, Never>?
+    private(set) var lastHeight: CGFloat?
+    @ObservationIgnored private var observation: Task<Void, Never>?
 
     private init() {
         observation = Task { [weak self] in

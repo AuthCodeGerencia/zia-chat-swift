@@ -1,5 +1,5 @@
 import Foundation
-import Combine
+import Observation
 
 // CoreThreadSummary vive en CoreModels.swift para que la Share Extension
 // pueda compilar ConvexCoreClient sin este archivo.
@@ -7,11 +7,12 @@ import Combine
 /// Tracks, per thread, when the current user last viewed its replies.
 /// Persisted locally so unread indicators survive app restarts.
 /// Only accessed from the main thread (SwiftUI views).
-final class ThreadReadTracker: ObservableObject {
+@Observable
+final class ThreadReadTracker {
     static let shared = ThreadReadTracker()
 
     private static let defaultsKey = "zia.threads.lastRead"
-    @Published private(set) var lastRead: [String: Date]
+    private(set) var lastRead: [String: Date]
 
     private init() {
         let stored = UserDefaults.standard.dictionary(forKey: Self.defaultsKey) as? [String: Double] ?? [:]

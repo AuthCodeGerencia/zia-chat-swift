@@ -1,5 +1,4 @@
 import AVFoundation
-import Combine
 import Foundation
 import LiveKit
 import SwiftUI
@@ -60,33 +59,35 @@ private struct CoreVoiceTokenErrorResponse: Decodable {
     var error: String?
 }
 
+@Observable
 @MainActor
-final class CoreVoiceRoomStore: NSObject, ObservableObject, RoomDelegate, @unchecked Sendable {
-    @Published private(set) var connectionState: CoreVoiceConnectionState = .disconnected {
+final class CoreVoiceRoomStore: NSObject, RoomDelegate, @unchecked Sendable {
+    private(set) var connectionState: CoreVoiceConnectionState = .disconnected {
         didSet {
             // Sin esto la pantalla se bloquea a los segundos y la sala se corta.
             UIApplication.shared.isIdleTimerDisabled = isConnected
         }
     }
-    @Published private(set) var participants: [CoreVoiceParticipant] = []
-    @Published private(set) var connectedChannel: CoreChannel?
-    @Published private(set) var isMuted = false
-    @Published private(set) var isSpeakerEnabled = true
-    @Published private(set) var screenShareTrack: VideoTrack?
-    @Published private(set) var screenShareOwnerName: String?
-    @Published var lastError: String?
+    private(set) var participants: [CoreVoiceParticipant] = []
+    private(set) var connectedChannel: CoreChannel?
+    private(set) var isMuted = false
+    private(set) var isSpeakerEnabled = true
+    private(set) var screenShareTrack: VideoTrack?
+    private(set) var screenShareOwnerName: String?
+    var lastError: String?
 
     var isScreenSharing: Bool {
         screenShareTrack != nil
     }
 
-    private var room: Room?
+    @ObservationIgnored private var room: Room?
 
     var isConnected: Bool {
         connectionState == .connected || connectionState == .reconnecting
     }
 
     func join(channel: CoreChannel, configuration: CoreAppConfiguration) async {
+        guard !ZiaDemoMode.isEnabled else { return }
         // Igual que la web: cualquier canal (texto o voz) tiene una sala de voz.
         // El room se deriva en el servidor: core-voice-{empresaId}-{channelId}.
         if connectedChannel?.id == channel.id, isConnected { return }
@@ -366,7 +367,7 @@ private extension String {
 /// Renderiza el track de pantalla compartida activo de la sala de voz.
 /// Vive aquí (y no en ContentView) para que solo este archivo importe LiveKit.
 struct VoiceScreenShareView: View {
-    @ObservedObject var voiceStore: CoreVoiceRoomStore
+    let voiceStore: CoreVoiceRoomStore
     var layoutMode: VideoView.LayoutMode = .fit
 
     var body: some View {

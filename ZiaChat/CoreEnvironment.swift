@@ -6,12 +6,16 @@ nonisolated struct CoreEnvironment: Sendable {
     var convexURL: String = ""
     var appURL: String = ""
     var giphyAPIKey: String = ""
+    /// Convex del portal de AuthCode (repo authcode-tickets): bandeja de WhatsApp.
+    var authcodeConvexURL: String = ""
 
     private static let projectSupabaseURL = "https://supabase.authcode.biz"
     private static let projectSupabaseAnonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imlua2Ntb2J0eXB5aml3Y2Vwb3VyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzUwNjg1NTUsImV4cCI6MjA1MDY0NDU1NX0.xVJhcEWKizMRP4ZOYXUww2FUG9N2517yv0XggOjaOKM"
     private static let projectConvexURL = "https://spotted-cassowary-104.convex.cloud"
     private static let projectAppURL = "https://portal.agenciadevio.com"
     private static let projectGiphyAPIKey = "LwWVGWkTKc9oLNkkZmhyZlL1v0PlXmI0"
+    /// Mismo deployment de producción que usa authcode-app.
+    private static let projectAuthcodeConvexURL = "https://unique-parakeet-602.convex.cloud"
 
     /// Instancia única: `load()` copia el entorno del proceso y puede leer un
     /// dotenv, así que no debe ejecutarse en rutas de render (avatares, etc.).
@@ -24,14 +28,16 @@ nonisolated struct CoreEnvironment: Sendable {
             supabaseAnonKey: process["NEXT_PUBLIC_SUPABASE_ANON_KEY"] ?? "",
             convexURL: process["NEXT_PUBLIC_CONVEX_URL"] ?? process["CONVEX_URL"] ?? "",
             appURL: process["NEXT_PUBLIC_APP_URL"] ?? "",
-            giphyAPIKey: process["NEXT_PUBLIC_GIPHY_API_KEY"] ?? ""
+            giphyAPIKey: process["NEXT_PUBLIC_GIPHY_API_KEY"] ?? "",
+            authcodeConvexURL: process["AUTHCODE_CONVEX_URL"] ?? ""
         )
 
         guard environment.supabaseURL.isEmpty
             || environment.supabaseAnonKey.isEmpty
             || environment.convexURL.isEmpty
             || environment.appURL.isEmpty
-            || environment.giphyAPIKey.isEmpty else {
+            || environment.giphyAPIKey.isEmpty
+            || environment.authcodeConvexURL.isEmpty else {
             return environment
         }
 
@@ -51,6 +57,9 @@ nonisolated struct CoreEnvironment: Sendable {
         if environment.giphyAPIKey.isEmpty {
             environment.giphyAPIKey = envValues["NEXT_PUBLIC_GIPHY_API_KEY"] ?? ""
         }
+        if environment.authcodeConvexURL.isEmpty {
+            environment.authcodeConvexURL = envValues["AUTHCODE_CONVEX_URL"] ?? ""
+        }
         if environment.supabaseURL.isEmpty {
             environment.supabaseURL = projectSupabaseURL
         }
@@ -65,6 +74,9 @@ nonisolated struct CoreEnvironment: Sendable {
         }
         if environment.giphyAPIKey.isEmpty {
             environment.giphyAPIKey = projectGiphyAPIKey
+        }
+        if environment.authcodeConvexURL.isEmpty {
+            environment.authcodeConvexURL = projectAuthcodeConvexURL
         }
         return environment
     }
