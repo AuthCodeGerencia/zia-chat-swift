@@ -144,9 +144,10 @@ final class WhatsAppConvexClient: @unchecked Sendable {
     }
 
     func assignAgents(profileId: String, chatId: String, assignedToIds: [String]) async throws {
+        let encodedIds: [ConvexEncodable?] = assignedToIds.map { $0 as ConvexEncodable? }
         try await realtime.mutation(
             "mobileChat:asignarAgentes",
-            with: ["profileId": profileId, "chatId": chatId, "assignedToIds": assignedToIds]
+            with: ["profileId": profileId, "chatId": chatId, "assignedToIds": encodedIds]
         )
     }
 

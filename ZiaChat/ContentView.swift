@@ -511,13 +511,13 @@ private struct LoginLogoTail: Shape {
 /// Filtros del index de canales (chips estilo WhatsApp).
 enum ChannelListFilter: CaseIterable {
     case todos
+    /// Bandeja de WhatsApp del portal de AuthCode; visible solo para agentes.
+    case whatsapp
     case directos
     case hilos
     case favoritos
     case noLeidos
     case voz
-    /// Bandeja de WhatsApp del portal de AuthCode; visible solo para agentes.
-    case whatsapp
 
     var title: String {
         switch self {
@@ -671,6 +671,13 @@ private struct ChannelListView: View {
         .onChange(of: whatsAppStore.isAvailable) { _, available in
             if !available, channelFilter == .whatsapp {
                 channelFilter = .todos
+            }
+        }
+        .onChange(of: channelFilter) { _, filter in
+            // "Todos" siempre incorpora la bandeja completa de WhatsApp,
+            // aunque el usuario haya usado otro filtro dentro de ese tab.
+            if filter == .todos, whatsAppStore.filter != .todos {
+                whatsAppStore.filter = .todos
             }
         }
         .sheet(item: $channelToEdit) { channel in
@@ -971,6 +978,38 @@ private struct ChannelListView: View {
         Section {
             ForEach(snapshot.chatItems) { item in
                 chatRow(item)
+            }
+        }
+
+        if whatsAppStore.isAvailable, !whatsAppStore.chats.isEmpty {
+            Section {
+                ForEach(whatsAppStore.chats) { chat in
+                    Button {
+                        navigationPath.append(WhatsAppRoute.navigationId(for: chat.chatId))
+                    } label: {
+                        WhatsAppChatRow(chat: chat)
+                    }
+                    .buttonStyle(.plain)
+                    .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                    .listRowBackground(ZenitBrand.surface)
+                    .onAppear {
+                        if chat.id == whatsAppStore.chats.last?.id {
+                            whatsAppStore.loadMoreChats()
+                        }
+                    }
+                }
+
+                if !whatsAppStore.chatsIsDone {
+                    HStack {
+                        Spacer()
+                        ProgressView()
+                        Spacer()
+                    }
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(ZenitBrand.surface)
+                }
+            } header: {
+                Label("Soporte WhatsApp", systemImage: "phone.bubble.fill")
             }
         }
     }

@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import Foundation
 
 @MainActor
@@ -13,7 +14,7 @@ final class WhatsAppAudioRecorder: NSObject, ObservableObject, AVAudioRecorderDe
     func start() async throws {
         guard !isRecording else { return }
         let granted = await withCheckedContinuation { continuation in
-            AVAudioSession.sharedInstance().requestRecordPermission { allowed in
+            AVAudioApplication.requestRecordPermission { allowed in
                 continuation.resume(returning: allowed)
             }
         }
@@ -40,9 +41,15 @@ final class WhatsAppAudioRecorder: NSObject, ObservableObject, AVAudioRecorderDe
         outputURL = url
         duration = 0
         isRecording = true
-        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.duration = self?.recorder?.currentTime ?? 0 }
-        }
+        let timer = Timer(
+            timeInterval: 0.25,
+            target: self,
+            selector: #selector(updateDuration),
+            userInfo: nil,
+            repeats: true
+        )
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
     }
 
     func stop() throws -> URL {
@@ -66,6 +73,10 @@ final class WhatsAppAudioRecorder: NSObject, ObservableObject, AVAudioRecorderDe
         isRecording = false
         duration = 0
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    @objc private func updateDuration() {
+        duration = recorder?.currentTime ?? 0
     }
 }
 

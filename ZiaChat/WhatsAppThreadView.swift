@@ -564,7 +564,7 @@ struct WhatsAppThreadView: View {
         }
     }
 
-    nonisolated static func describe(_ error: Error) -> String {
+    static func describe(_ error: Error) -> String {
         if let clientError = error as? ClientError { return clientError.whatsAppMessage }
         return error.localizedDescription
     }
