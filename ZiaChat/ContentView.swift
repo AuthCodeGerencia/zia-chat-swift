@@ -550,6 +550,7 @@ private struct ChannelListItem: Identifiable {
     enum Kind {
         case channel(CoreChannel)
         case direct(CoreDirectMessage)
+        case whatsapp(WhatsAppChat)
     }
 
     let kind: Kind
@@ -738,9 +739,13 @@ private struct ChannelListView: View {
         let userId = store.configuration.userId
         let channelItems = store.channels.map(channelItem)
         let directItems = store.directMessages.map(directItem)
-        // Igual que en web: primero canales y después mensajes directos.
-        let chatItems = channelItems.sorted(by: ChannelListItem.activityOrder)
-            + directItems.sorted(by: ChannelListItem.activityOrder)
+        // La bandeja de WhatsApp se mezcla con canales y directos en "Todos",
+        // todo ordenado por actividad (bandeja unificada).
+        let whatsappItems = whatsAppStore.isAvailable
+            ? whatsAppStore.chats.map(whatsAppItem)
+            : []
+        let chatItems = (channelItems + directItems + whatsappItems)
+            .sorted(by: ChannelListItem.activityOrder)
         let favoriteIds = store.favoriteChannelIds
 
         let threadItems = store.textChannels
@@ -796,6 +801,17 @@ private struct ChannelListView: View {
             sortDate: dm.lastMessageAt ?? .distantPast,
             sortName: dm.peer.displayName,
             isUnread: dm.unreadCount > 0 || dm.mentionCount > 0
+        )
+    }
+
+    private func whatsAppItem(_ chat: WhatsAppChat) -> ChannelListItem {
+        ChannelListItem(
+            kind: .whatsapp(chat),
+            // El mismo id que usa el NavigationStack para el hilo de WhatsApp.
+            id: WhatsAppRoute.navigationId(for: chat.chatId),
+            sortDate: chat.lastMessageDate,
+            sortName: chat.nombreVisible,
+            isUnread: chat.unreadCount > 0 && !chat.isMuted
         )
     }
 
@@ -981,36 +997,14 @@ private struct ChannelListView: View {
             }
         }
 
-        if whatsAppStore.isAvailable, !whatsAppStore.chats.isEmpty {
-            Section {
-                ForEach(whatsAppStore.chats) { chat in
-                    Button {
-                        navigationPath.append(WhatsAppRoute.navigationId(for: chat.chatId))
-                    } label: {
-                        WhatsAppChatRow(chat: chat)
-                    }
-                    .buttonStyle(.plain)
-                    .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
-                    .listRowBackground(ZenitBrand.surface)
-                    .onAppear {
-                        if chat.id == whatsAppStore.chats.last?.id {
-                            whatsAppStore.loadMoreChats()
-                        }
-                    }
-                }
-
-                if !whatsAppStore.chatsIsDone {
-                    HStack {
-                        Spacer()
-                        ProgressView()
-                        Spacer()
-                    }
-                    .listRowSeparator(.hidden)
-                    .listRowBackground(ZenitBrand.surface)
-                }
-            } header: {
-                Label("Soporte WhatsApp", systemImage: "phone.bubble.fill")
+        if whatsAppStore.isAvailable, !whatsAppStore.chatsIsDone {
+            HStack {
+                Spacer()
+                ProgressView()
+                Spacer()
             }
+            .listRowSeparator(.hidden)
+            .listRowBackground(ZenitBrand.surface)
         }
     }
 
@@ -1075,6 +1069,24 @@ private struct ChannelListView: View {
             channelRow(channel)
         case let .direct(message):
             directMessageRow(message)
+        case let .whatsapp(chat):
+            whatsAppRow(chat)
+        }
+    }
+
+    private func whatsAppRow(_ chat: WhatsAppChat) -> some View {
+        Button {
+            navigationPath.append(WhatsAppRoute.navigationId(for: chat.chatId))
+        } label: {
+            WhatsAppChatRow(chat: chat)
+        }
+        .buttonStyle(.plain)
+        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+        .listRowBackground(ZenitBrand.surface)
+        .onAppear {
+            if chat.id == whatsAppStore.chats.last?.id {
+                whatsAppStore.loadMoreChats()
+            }
         }
     }
 

@@ -23,7 +23,13 @@ final class WhatsAppStore: ObservableObject {
     private static let chatsPageSize = 40
     private static let messagesPageSize = 80
     private static let messagesMax = 300
-    static let expectedWhatsAppPhone = "14745292805"
+    /// Número de la sesión WAHA `iobot` (Ana María - Soporte iOBOT).
+    /// Si el portal re-vincula la sesión a otro número hay que actualizarlo.
+    static let expectedWhatsAppPhone = "50498556975"
+    static let expectedWhatsAppPhoneDisplay = "+504 9855-6975"
+    static var wrongAccountMessage: String {
+        "La sesión WAHA conectada no corresponde a \(expectedWhatsAppPhoneDisplay)."
+    }
 
     @Published private(set) var availability: Availability = .unknown
     @Published private(set) var profile: WhatsAppProfile?
@@ -193,7 +199,7 @@ final class WhatsAppStore: ObservableObject {
                 self.session = status
                 if !self.isExpectedWhatsAppAccount {
                     self.chats = []
-                    self.chatsError = "La sesión WAHA conectada no corresponde a +1 (474) 529-2805."
+                    self.chatsError = Self.wrongAccountMessage
                 }
             }
         unreadSubscription = client.subscribeUnreadCount(profileId: profileId)
@@ -240,13 +246,13 @@ final class WhatsAppStore: ObservableObject {
             guard let self else { return }
             guard self.isExpectedWhatsAppAccount else {
                 self.chats = []
-                self.chatsError = "La sesión WAHA conectada no corresponde a +1 (474) 529-2805."
+                self.chatsError = Self.wrongAccountMessage
                 self.hasLoadedChats = true
                 return
             }
-            // Esta integración corresponde a la sesión IOBOT solicitada y su
-            // bandeja muestra únicamente grupos de WAHA.
-            self.chats = page.page.filter(\.isGroup)
+            // La sesión iobot ahora es la línea de soporte directa: la bandeja
+            // muestra grupos y chats privados, igual que el portal.
+            self.chats = page.page
             self.chatsIsDone = page.isDone
             self.hasLoadedChats = true
         }
