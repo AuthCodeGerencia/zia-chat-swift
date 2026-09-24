@@ -15,7 +15,15 @@ final class CoreChannelsStore {
     var messagePins: [String: [CoreMessagePin]] = [:]
     var channelPreviews: [String: CoreMessage] = [:]
     var polls: [String: CorePoll] = [:]
-    var mentionableUsers: [CoreUserLite] = []
+    var mentionableUsers: [CoreUserLite] = [] {
+        didSet {
+            // El backend puede devolver el mismo usuario más de una vez; las
+            // listas de SwiftUI necesitan IDs únicos.
+            var seen = Set<CoreUserLite.ID>()
+            let unique = mentionableUsers.filter { seen.insert($0.id).inserted }
+            if unique.count != mentionableUsers.count { mentionableUsers = unique }
+        }
+    }
     var internalCompanies: [CoreInternalCompany] = []
     var mutedChannelIds: Set<CoreChannel.ID> = Set(
         UserDefaults.standard.stringArray(forKey: CoreChannelsStore.mutedChannelsDefaultsKey) ?? []
@@ -2644,7 +2652,11 @@ final class CoreChannelsStore {
 
     private func incrementReplyCount(for messageId: String, conversationId: String, by delta: Int = 1) {
         guard let index = messages[conversationId]?.firstIndex(where: { $0.id == messageId }) else { return }
-        messages[conversationId]?[index].replyCount = max(0, (messages[conversationId]?[index].replyCount ?? 0) + delta)
+        // Leer antes de escribir: con encadenamiento opcional el acceso de
+        // escritura empieza antes del lado derecho y leer `messages` ahí
+        // viola la exclusividad de Swift (crash al responder en un hilo).
+        let current = messages[conversationId]?[index].replyCount ?? 0
+        messages[conversationId]?[index].replyCount = max(0, current + delta)
     }
 
     /// Sustituye la respuesta optimista por la confirmada por el servidor.

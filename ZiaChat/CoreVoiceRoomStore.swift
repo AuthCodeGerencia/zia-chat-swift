@@ -212,8 +212,7 @@ final class CoreVoiceRoomStore: NSObject, RoomDelegate, @unchecked Sendable {
     nonisolated func room(
         _ room: Room,
         participant: RemoteParticipant,
-        trackPublication: RemoteTrackPublication,
-        didSubscribe track: Track
+        didSubscribeTrack publication: RemoteTrackPublication
     ) {
         Task { @MainActor [weak self] in
             self?.refreshParticipants(room)
@@ -223,8 +222,7 @@ final class CoreVoiceRoomStore: NSObject, RoomDelegate, @unchecked Sendable {
     nonisolated func room(
         _ room: Room,
         participant: RemoteParticipant,
-        trackPublication: RemoteTrackPublication,
-        didUnsubscribe track: Track
+        didUnsubscribeTrack publication: RemoteTrackPublication
     ) {
         Task { @MainActor [weak self] in
             self?.refreshParticipants(room)

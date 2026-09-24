@@ -1124,7 +1124,10 @@ enum CoreFormat {
     }()
 
     static func relativeTime(_ date: Date) -> String {
-        relativeTimeFormatter.localizedString(for: date, relativeTo: Date())
+        // El reloj del servidor puede ir unos segundos adelantado: sin el
+        // min() un mensaje recién enviado se mostraría "dentro de 0 s".
+        let now = Date()
+        return relativeTimeFormatter.localizedString(for: min(date, now), relativeTo: now)
     }
 
     static func conversationTime(_ date: Date) -> String {

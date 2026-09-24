@@ -537,7 +537,7 @@ enum ChannelListFilter: CaseIterable {
         case .directos: return "person.2.fill"
         case .hilos: return "bubble.left.and.bubble.right.fill"
         case .favoritos: return "star.fill"
-        case .noLeidos: return "circle.badge.fill"
+        case .noLeidos: return "circlebadge.fill"
         case .voz: return "speaker.wave.2.fill"
         case .whatsapp: return "phone.bubble.fill"
         }
@@ -929,7 +929,7 @@ private struct ChannelListView: View {
                         indexThreadRow(item, isUnread: true)
                     }
                 } header: {
-                    Label("Nuevos mensajes", systemImage: "circle.badge.fill")
+                    Label("Nuevos mensajes", systemImage: "circlebadge.fill")
                 }
             }
 
