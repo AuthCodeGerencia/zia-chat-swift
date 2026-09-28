@@ -201,6 +201,14 @@ actor ConvexCoreClient {
         )
     }
 
+    /// `nil` = todas las categorías.
+    func setPushNotificationCategories(token: String, categories: [String]?) async throws {
+        let _: Bool = try await mutation(
+            "push:setNotificationCategories",
+            ["token": token, "categories": categories as Any]
+        )
+    }
+
     func unregisterPushTokens() async throws {
         let _: Int = try await mutation("push:unregisterCurrentUser", [:])
     }

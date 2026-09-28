@@ -14,6 +14,67 @@ struct PushNotificationDestination: Equatable, Sendable {
     }
 }
 
+/// Tipos de mensaje que se pueden notificar. El backend guarda la selección
+/// en el token push de cada dispositivo y solo manda los tipos elegidos, así
+/// el filtro funciona también con la app cerrada.
+nonisolated enum PushNotificationCategory: String, CaseIterable, Identifiable, Sendable {
+    case channel
+    case direct
+    case whatsapp
+    case thread
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .channel: "Canales"
+        case .direct: "Directos"
+        case .whatsapp: "WhatsApp"
+        case .thread: "Hilos"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .channel: "number"
+        case .direct: "person.2.fill"
+        case .whatsapp: "phone.bubble.fill"
+        case .thread: "bubble.left.and.bubble.right.fill"
+        }
+    }
+
+    /// Mismo criterio que `push.ts`: las respuestas en hilo cuentan como
+    /// "Hilos" aunque sean de un canal o un directo.
+    static func of(userInfo: [AnyHashable: Any]) -> PushNotificationCategory? {
+        switch userInfo["kind"] as? String {
+        case "whatsapp_message": return .whatsapp
+        case "thread_message": return .thread
+        case "channel_message":
+            let channelId = (userInfo["channelId"] ?? userInfo["channel_id"]) as? String
+            return channelId?.isEmpty == false ? .channel : .direct
+        default: return nil
+        }
+    }
+
+    private static let defaultsKey = "zia.notificationCategories"
+
+    /// Sin valor guardado = todas (incluidas las que se agreguen después).
+    static func stored() -> Set<PushNotificationCategory> {
+        guard let raw = UserDefaults.standard.stringArray(forKey: defaultsKey) else {
+            return Set(allCases)
+        }
+        return Set(raw.compactMap(PushNotificationCategory.init(rawValue:)))
+    }
+
+    static func store(_ categories: Set<PushNotificationCategory>) {
+        if categories.count == allCases.count {
+            UserDefaults.standard.removeObject(forKey: defaultsKey)
+        } else {
+            UserDefaults.standard.set(categories.map(\.rawValue).sorted(), forKey: defaultsKey)
+        }
+    }
+}
+
 struct ForegroundPushNotificationEvent: Equatable, Sendable {
     let id = UUID()
     var destination: PushNotificationDestination
@@ -28,6 +89,7 @@ final class PushNotificationService: NSObject, UNUserNotificationCenterDelegate 
     private(set) var pendingDestination: PushNotificationDestination?
     private(set) var foregroundEvent: ForegroundPushNotificationEvent?
     private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
+    private(set) var notificationCategories = PushNotificationCategory.stored()
     var lastError: String?
     /// La app se lanzó al tocar una notificación: el NavigationStack aún se
     /// está restaurando cuando llega el tap, así que ese caso espera un poco.
@@ -42,11 +104,13 @@ final class PushNotificationService: NSObject, UNUserNotificationCenterDelegate 
 
     func configure() {
         UNUserNotificationCenter.current().delegate = self
-        Task {
-            authorizationStatus = await UNUserNotificationCenter.current()
-                .notificationSettings()
-                .authorizationStatus
-        }
+        Task { await refreshAuthorizationStatus() }
+    }
+
+    func refreshAuthorizationStatus() async {
+        authorizationStatus = await UNUserNotificationCenter.current()
+            .notificationSettings()
+            .authorizationStatus
     }
 
     func requestAuthorizationAndRegister() async {
@@ -104,7 +168,27 @@ final class PushNotificationService: NSObject, UNUserNotificationCenterDelegate 
             lastError = nil
         } catch {
             lastError = error.localizedDescription
+            return
         }
+        await syncNotificationCategories(configuration: configuration)
+    }
+
+    /// Guarda la selección en el dispositivo; `syncNotificationCategories`
+    /// la sube al token push para que el backend deje de mandar esos tipos.
+    func setNotificationCategories(_ categories: Set<PushNotificationCategory>) {
+        notificationCategories = categories
+        PushNotificationCategory.store(categories)
+    }
+
+    func syncNotificationCategories(configuration: CoreAppConfiguration) async {
+        guard let deviceToken, configuration.isUsable, !ZiaDemoMode.isEnabled,
+              let client = try? ConvexCoreClient(configuration: configuration) else { return }
+        let categories = notificationCategories.count == PushNotificationCategory.allCases.count
+            ? nil
+            : notificationCategories.map(\.rawValue).sorted()
+        // Si el backend aún no tiene la función, el token sigue registrado y
+        // el filtro en primer plano de `willPresent` cubre la app abierta.
+        try? await client.setPushNotificationCategories(token: deviceToken, categories: categories)
     }
 
     func unregisterCurrentUser(configuration: CoreAppConfiguration) async {
@@ -127,9 +211,14 @@ final class PushNotificationService: NSObject, UNUserNotificationCenterDelegate 
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
         // Canales silenciados por el usuario: sin banner ni sonido.
-        let destination = Self.destination(from: notification.request.content.userInfo)
+        let userInfo = notification.request.content.userInfo
+        let destination = Self.destination(from: userInfo)
         if destination.isValid {
             Task { await PushNotificationService.shared.receiveForeground(destination: destination) }
+        }
+        if let category = PushNotificationCategory.of(userInfo: userInfo),
+           !PushNotificationCategory.stored().contains(category) {
+            return []
         }
         let muted = Set(UserDefaults.standard.stringArray(forKey: "zia.mutedChannelIds") ?? [])
         if let channelId = destination.channelId, muted.contains(channelId) {

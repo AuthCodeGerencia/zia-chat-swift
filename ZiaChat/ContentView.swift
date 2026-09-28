@@ -508,9 +508,12 @@ private struct LoginLogoTail: Shape {
     }
 }
 
-/// Filtros del index de canales (chips estilo WhatsApp).
-enum ChannelListFilter: CaseIterable {
+/// Filtros del index de canales (chips estilo WhatsApp). El orden de los
+/// casos es el orden de los chips.
+enum ChannelListFilter: String, CaseIterable {
     case todos
+    /// Solo canales de texto, sin directos ni WhatsApp.
+    case canales
     /// Bandeja de WhatsApp del portal de AuthCode; visible solo para agentes.
     case whatsapp
     case directos
@@ -522,6 +525,7 @@ enum ChannelListFilter: CaseIterable {
     var title: String {
         switch self {
         case .todos: return "Todos"
+        case .canales: return "Canales"
         case .directos: return "Directos"
         case .hilos: return "Hilos"
         case .favoritos: return "Favoritos"
@@ -534,6 +538,7 @@ enum ChannelListFilter: CaseIterable {
     var systemImage: String? {
         switch self {
         case .todos: return nil
+        case .canales: return "number"
         case .directos: return "person.2.fill"
         case .hilos: return "bubble.left.and.bubble.right.fill"
         case .favoritos: return "star.fill"
@@ -541,6 +546,20 @@ enum ChannelListFilter: CaseIterable {
         case .voz: return "speaker.wave.2.fill"
         case .whatsapp: return "phone.bubble.fill"
         }
+    }
+
+    /// Último chip abierto, por usuario, para reabrir el index donde se dejó.
+    private static func defaultsKey(userId: String) -> String {
+        "zia.channelList.lastFilter.\(userId)"
+    }
+
+    static func lastUsed(userId: String) -> ChannelListFilter {
+        UserDefaults.standard.string(forKey: defaultsKey(userId: userId))
+            .flatMap(ChannelListFilter.init(rawValue:)) ?? .todos
+    }
+
+    func remember(userId: String) {
+        UserDefaults.standard.set(rawValue, forKey: Self.defaultsKey(userId: userId))
     }
 }
 
@@ -571,6 +590,7 @@ private struct ChannelListItem: Identifiable {
 /// body de `ChannelListView` en vez de en cada chip, sección y badge.
 private struct ChannelListSnapshot {
     let chatItems: [ChannelListItem]
+    let textChannelItems: [ChannelListItem]
     let unreadItems: [ChannelListItem]
     let favoriteItems: [ChannelListItem]
     let directMessages: [CoreDirectMessage]
@@ -578,6 +598,7 @@ private struct ChannelListSnapshot {
     let unreadThreadItems: [ChannelThreadItem]
     let readThreadItems: [ChannelThreadItem]
     let totalUnreadCount: Int
+    let channelsUnreadCount: Int
 }
 
 /// Un thread mostrado en el filtro "Hilos" del index, junto con su canal.
@@ -597,14 +618,39 @@ private struct ChannelListView: View {
     @Binding var navigationPath: [CoreChannel.ID]
     @State private var searchText = ""
     @State private var channelToEdit: CoreChannel?
-    @State private var channelFilter: ChannelListFilter = .todos
+    @State private var channelFilter: ChannelListFilter
     @State private var showNewDM = false
+    @State private var showingNotificationSettings = false
     @State private var selectedThreadItem: ChannelThreadItem?
     private let threadReads = ThreadReadTracker.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    init(
+        store: CoreChannelsStore,
+        voiceStore: CoreVoiceRoomStore,
+        whatsAppStore: WhatsAppStore,
+        showingSettings: Binding<Bool>,
+        showingNewChannel: Binding<Bool>,
+        navigationPath: Binding<[CoreChannel.ID]>
+    ) {
+        self.store = store
+        self.voiceStore = voiceStore
+        self.whatsAppStore = whatsAppStore
+        _showingSettings = showingSettings
+        _showingNewChannel = showingNewChannel
+        _navigationPath = navigationPath
+        _channelFilter = State(initialValue: ChannelListFilter.lastUsed(userId: store.configuration.userId))
+    }
+
     private var isSearching: Bool {
         !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// El chip guardado puede ser WhatsApp antes de que se resuelva el perfil
+    /// del portal (o en una cuenta sin acceso): mientras tanto se muestra
+    /// "Todos", sin perder la preferencia guardada.
+    private var activeFilter: ChannelListFilter {
+        channelFilter == .whatsapp && !whatsAppStore.isAvailable ? .todos : channelFilter
     }
 
     var body: some View {
@@ -630,7 +676,7 @@ private struct ChannelListView: View {
         .contentMargins(.horizontal, 0, for: .scrollContent)
         .listSectionSpacing(0)
         .overlay {
-            if channelFilter == .whatsapp {
+            if activeFilter == .whatsapp {
                 EmptyView()
             } else if store.channels.isEmpty && store.directMessages.isEmpty
                 && (store.isLoading || !store.hasLoadedChatList || !store.configuration.isUsable) {
@@ -645,7 +691,7 @@ private struct ChannelListView: View {
         }
         .refreshable {
             await store.refresh(force: true)
-            if channelFilter == .hilos {
+            if activeFilter == .hilos {
                 await store.loadAllChannelThreads(force: true)
             }
         }
@@ -669,12 +715,8 @@ private struct ChannelListView: View {
         .onChange(of: searchText) { _, newValue in
             store.updateChannelSearch(newValue)
         }
-        .onChange(of: whatsAppStore.isAvailable) { _, available in
-            if !available, channelFilter == .whatsapp {
-                channelFilter = .todos
-            }
-        }
         .onChange(of: channelFilter) { _, filter in
+            filter.remember(userId: store.configuration.userId)
             // "Todos" siempre incorpora la bandeja completa de WhatsApp,
             // aunque el usuario haya usado otro filtro dentro de ese tab.
             if filter == .todos, whatsAppStore.filter != .todos {
@@ -683,6 +725,9 @@ private struct ChannelListView: View {
         }
         .sheet(item: $channelToEdit) { channel in
             ChannelSettingsView(store: store, editing: channel)
+        }
+        .sheet(isPresented: $showingNotificationSettings) {
+            NotificationSettingsView(store: store, showsWhatsApp: whatsAppStore.isAvailable)
         }
         .sheet(isPresented: $showNewDM) {
             NewDirectMessageView(store: store) { channel in
@@ -720,6 +765,7 @@ private struct ChannelListView: View {
                 }
 
                 ChannelBottomBar(
+                    onNotifications: { showingNotificationSettings = true },
                     onSettings: { showingSettings = true },
                     onSignOut: {
                         let configuration = store.configuration
@@ -747,8 +793,9 @@ private struct ChannelListView: View {
         let chatItems = (channelItems + directItems + whatsappItems)
             .sorted(by: ChannelListItem.activityOrder)
         let favoriteIds = store.favoriteChannelIds
+        let textChannels = store.textChannels
 
-        let threadItems = store.textChannels
+        let threadItems = textChannels
             .flatMap { channel -> [ChannelThreadItem] in
                 guard let conversationId = channel.conversationId else { return [] }
                 return (store.channelThreads[conversationId] ?? []).map {
@@ -766,8 +813,10 @@ private struct ChannelListView: View {
             }
         }
 
+        let channelsUnreadCount = textChannels.reduce(0) { $0 + $1.unreadCount }
         return ChannelListSnapshot(
             chatItems: chatItems,
+            textChannelItems: textChannels.map(channelItem).sorted(by: ChannelListItem.activityOrder),
             unreadItems: chatItems.filter(\.isUnread),
             favoriteItems: chatItems.filter { favoriteIds.contains($0.id) },
             directMessages: directItems.sorted(by: ChannelListItem.activityOrder).compactMap { item in
@@ -776,8 +825,9 @@ private struct ChannelListView: View {
             threadItems: threadItems,
             unreadThreadItems: unreadThreadItems,
             readThreadItems: readThreadItems,
-            totalUnreadCount: store.textChannels.reduce(0) { $0 + $1.unreadCount }
-                + store.directMessages.reduce(0) { $0 + $1.unreadCount }
+            totalUnreadCount: channelsUnreadCount
+                + store.directMessages.reduce(0) { $0 + $1.unreadCount },
+            channelsUnreadCount: channelsUnreadCount
         )
     }
 
@@ -837,11 +887,12 @@ private struct ChannelListView: View {
     }
 
     private func filterChip(_ filter: ChannelListFilter, snapshot: ChannelListSnapshot) -> some View {
-        let isSelected = channelFilter == filter
+        let isSelected = activeFilter == filter
         let chipBackground: Color = isSelected ? ZenitBrand.accentFill : ZenitBrand.surfaceMuted
         let chipForeground: Color = isSelected ? .white : .primary
         let badgeCount: Int = switch filter {
         case .noLeidos: snapshot.totalUnreadCount
+        case .canales: snapshot.channelsUnreadCount
         case .hilos: snapshot.unreadThreadItems.count
         case .whatsapp: whatsAppStore.unreadCount
         default: 0
@@ -882,9 +933,11 @@ private struct ChannelListView: View {
 
     @ViewBuilder
     private func defaultChannelContent(_ snapshot: ChannelListSnapshot) -> some View {
-        switch channelFilter {
+        switch activeFilter {
         case .todos:
             allChannelsContent(snapshot)
+        case .canales:
+            textChannelsContent(snapshot)
         case .directos:
             directMessagesContent(snapshot)
         case .hilos:
@@ -1005,6 +1058,26 @@ private struct ChannelListView: View {
             }
             .listRowSeparator(.hidden)
             .listRowBackground(ZenitBrand.surface)
+        }
+    }
+
+    @ViewBuilder
+    private func textChannelsContent(_ snapshot: ChannelListSnapshot) -> some View {
+        if snapshot.textChannelItems.isEmpty {
+            if store.hasLoadedChatList && !(store.channels.isEmpty && store.directMessages.isEmpty) {
+                ContentUnavailableView(
+                    "Sin canales",
+                    systemImage: "number",
+                    description: Text("Crea un canal desde el botón de nuevo canal.")
+                )
+                .listRowSeparator(.hidden)
+            }
+        } else {
+            Section {
+                ForEach(snapshot.textChannelItems) { item in
+                    chatRow(item)
+                }
+            }
         }
     }
 
@@ -1163,6 +1236,7 @@ private struct ChannelListView: View {
 }
 
 private struct ChannelBottomBar: View {
+    let onNotifications: () -> Void
     let onSettings: () -> Void
     let onSignOut: () -> Void
 
@@ -1178,6 +1252,9 @@ private struct ChannelBottomBar: View {
             .frame(maxWidth: .infinity)
 
             Menu {
+                Button(action: onNotifications) {
+                    Label("Notificaciones", systemImage: "bell")
+                }
                 Button(action: onSettings) {
                     Label("Settings", systemImage: "gearshape")
                 }
@@ -6233,6 +6310,120 @@ private struct SettingsView: View {
                     isTestingPush = false
                 }
             }
+        }
+    }
+}
+
+/// Qué mensajes notifican en este dispositivo: todos, o solo algunos tipos.
+private struct NotificationSettingsView: View {
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.openURL) private var openURL
+    let store: CoreChannelsStore
+    let showsWhatsApp: Bool
+    private let pushService = PushNotificationService.shared
+    @State private var categories: Set<PushNotificationCategory>
+    @State private var syncTask: Task<Void, Never>?
+
+    init(store: CoreChannelsStore, showsWhatsApp: Bool) {
+        self.store = store
+        self.showsWhatsApp = showsWhatsApp
+        _categories = State(initialValue: PushNotificationService.shared.notificationCategories)
+    }
+
+    private var visibleCategories: [PushNotificationCategory] {
+        PushNotificationCategory.allCases.filter { $0 != .whatsapp || showsWhatsApp }
+    }
+
+    private var receivesAll: Bool {
+        categories.isSuperset(of: PushNotificationCategory.allCases)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if pushService.authorizationStatus == .denied {
+                    Section {
+                        Label("Las notificaciones de ZiaChat están desactivadas en iOS.", systemImage: "bell.slash")
+                        Button("Abrir Ajustes de iOS") {
+                            if let url = URL(string: UIApplication.openNotificationSettingsURLString) {
+                                openURL(url)
+                            }
+                        }
+                    }
+                }
+
+                Section {
+                    Button {
+                        apply(Set(PushNotificationCategory.allCases))
+                    } label: {
+                        HStack {
+                            Label("Todas", systemImage: "bell.fill")
+                            Spacer()
+                            if receivesAll {
+                                Image(systemName: "checkmark")
+                                    .font(.body.weight(.semibold))
+                                    .foregroundStyle(ZenitBrand.accent)
+                            }
+                        }
+                    }
+                    .foregroundStyle(.primary)
+                    .accessibilityAddTraits(receivesAll ? [.isSelected] : [])
+                } footer: {
+                    Text("Recibe una notificación por cada mensaje nuevo.")
+                }
+
+                Section {
+                    ForEach(visibleCategories) { category in
+                        Toggle(isOn: isOn(category)) {
+                            Label(category.title, systemImage: category.systemImage)
+                        }
+                        .tint(ZenitBrand.accentFill)
+                    }
+                } header: {
+                    Text("Solo de")
+                } footer: {
+                    Text(categories.isDisjoint(with: visibleCategories)
+                        ? "No recibirás notificaciones de mensajes en este dispositivo."
+                        : "Hilos son las respuestas dentro de un hilo. Los canales silenciados no notifican aunque estén activados aquí.")
+                }
+            }
+            .navigationTitle("Notificaciones")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Listo") { dismiss() }
+                }
+            }
+            .task { await pushService.refreshAuthorizationStatus() }
+        }
+    }
+
+    private func isOn(_ category: PushNotificationCategory) -> Binding<Bool> {
+        Binding(
+            get: { categories.contains(category) },
+            set: { enabled in
+                var updated = categories
+                if enabled {
+                    updated.insert(category)
+                } else {
+                    updated.remove(category)
+                }
+                apply(updated)
+            }
+        )
+    }
+
+    /// Aplica al instante en el dispositivo y sube la selección al backend
+    /// cuando el usuario deja de tocar los switches.
+    private func apply(_ updated: Set<PushNotificationCategory>) {
+        categories = updated
+        pushService.setNotificationCategories(updated)
+        syncTask?.cancel()
+        syncTask = Task {
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled else { return }
+            let configuration = (try? await store.ensureFreshSession()) ?? store.configuration
+            await pushService.syncNotificationCategories(configuration: configuration)
         }
     }
 }
