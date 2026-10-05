@@ -571,6 +571,13 @@ final class CoreChannelsStore {
             return refreshedConfiguration
         } catch {
             sessionRefreshTask = nil
+            // Sesión muerta en Supabase: sin esto la app seguía mostrando la
+            // caché vieja y fallando cada envío sin pedir login.
+            if case CoreAuthError.sessionExpired = error,
+               configuration.userId == originalConfiguration.userId {
+                signOut()
+                lastError = error.localizedDescription
+            }
             throw error
         }
     }
@@ -2299,9 +2306,8 @@ final class CoreChannelsStore {
             return
         }
 
-        // Descarta el cliente websocket cacheado: si la suscripción falló por
-        // un socket en mal estado (p. ej. auth rechazada), reutilizarlo dejaría
-        // el realtime muerto de forma permanente.
+        // El websocket nativo es compartido y se reconecta solo; aquí basta con
+        // volver a pasarle el token vigente y rehacer las suscripciones.
         stopConvexRealtimeClient()
         startCompanyRealtime(force: true)
         guard let conversationId,
@@ -2338,8 +2344,8 @@ final class CoreChannelsStore {
         } else {
             Self.realtimeLogger.info("Creating Convex realtime client")
             task = Task.detached(priority: .utility) {
-                let service = try ConvexRealtimeClient(configuration: activeConfiguration)
-                await service.authenticate()
+                let service = try ConvexRealtimeClient.shared(for: activeConfiguration)
+                await service.authenticate(token: activeConfiguration.accessToken)
                 return service
             }
             convexClientTask = task

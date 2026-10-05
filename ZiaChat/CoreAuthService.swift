@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Supabase
 
 enum CoreAuthError: LocalizedError {
@@ -6,6 +7,7 @@ enum CoreAuthError: LocalizedError {
     case invalidSupabaseURL
     case missingProfile
     case missingRefreshToken
+    case sessionExpired
 
     var errorDescription: String? {
         switch self {
@@ -17,6 +19,8 @@ enum CoreAuthError: LocalizedError {
             return "This user does not have an Azank profile."
         case .missingRefreshToken:
             return "The saved session cannot be refreshed. Please sign in again."
+        case .sessionExpired:
+            return "Tu sesión expiró. Vuelve a iniciar sesión."
         }
     }
 }
@@ -58,17 +62,36 @@ final class CoreAuthService {
         }
 
         self.configuration = configuration
+        client = Self.sharedClient(url: url, anonKey: configuration.anonKey)
+    }
 
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .custom(Self.decodeDate)
+    /// supabase-swift nunca libera un `SupabaseClient` (su tarea de eventos de
+    /// auth lo retiene) y cada uno arranca su propio bucle de auto-refresco al
+    /// volver la app a primer plano. Uno nuevo por refresco acumulaba bucles
+    /// que rotaban el refresh token a espaldas de la app y agotaban el límite
+    /// de peticiones de Supabase. Se comparte uno por proyecto y sin
+    /// auto-refresco: la app ya refresca la sesión (`ensureFreshSession`).
+    nonisolated private static let clients = OSAllocatedUnfairLock<[String: SupabaseClient]>(initialState: [:])
 
-        client = SupabaseClient(
-            supabaseURL: url,
-            supabaseKey: configuration.anonKey,
-            options: SupabaseClientOptions(
-                db: .init(schema: "public", decoder: decoder)
+    nonisolated private static func sharedClient(url: URL, anonKey: String) -> SupabaseClient {
+        clients.withLock { clients in
+            let key = "\(url.absoluteString)|\(anonKey)"
+            if let existing = clients[key] {
+                return existing
+            }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .custom(decodeDate)
+            let created = SupabaseClient(
+                supabaseURL: url,
+                supabaseKey: anonKey,
+                options: SupabaseClientOptions(
+                    db: .init(schema: "public", decoder: decoder),
+                    auth: .init(autoRefreshToken: false)
+                )
             )
-        )
+            clients[key] = created
+            return created
+        }
     }
 
     func login(email: String, password: String) async throws -> CoreLoginResult {
@@ -101,7 +124,14 @@ final class CoreAuthService {
             throw CoreAuthError.missingRefreshToken
         }
 
-        let session = try await client.auth.refreshSession(refreshToken: refreshToken)
+        let session: Session
+        do {
+            session = try await client.auth.refreshSession(refreshToken: refreshToken)
+        } catch AuthError.sessionMissing {
+            // Supabase rechazó el refresh token (ya usado, revocado o la sesión
+            // cerrada): reintentar no sirve, hay que volver a iniciar sesión.
+            throw CoreAuthError.sessionExpired
+        }
         var next = configuration
         next.accessToken = session.accessToken
         next.refreshToken = session.refreshToken

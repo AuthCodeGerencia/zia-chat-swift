@@ -1,26 +1,36 @@
 import Combine
 @preconcurrency import ConvexMobile
 import Foundation
+import os
 
-final class CoreConvexStaticAuthProvider: AuthProvider, @unchecked Sendable {
+/// Entrega a ConvexMobile el access token vigente de Supabase. El núcleo en
+/// Rust lo vuelve a pedir (`loginFromCache`) en cada reconexión del websocket,
+/// así que tras un refresco de sesión las reconexiones ya usan el token nuevo.
+final class CoreConvexTokenAuthProvider: AuthProvider, @unchecked Sendable {
     typealias T = String
 
-    private let token: String
+    nonisolated private let token: OSAllocatedUnfairLock<String>
 
     nonisolated init(token: String) {
-        self.token = token
+        self.token = OSAllocatedUnfairLock(initialState: token)
+    }
+
+    nonisolated var currentToken: String {
+        token.withLock { $0 }
+    }
+
+    nonisolated func setToken(_ newToken: String) {
+        token.withLock { $0 = newToken }
     }
 
     nonisolated func login(onIdToken: @Sendable @escaping (String?) -> Void) async throws -> String {
-        onIdToken(token)
-        return token
+        currentToken
     }
 
     nonisolated func logout() async throws {}
 
     nonisolated func loginFromCache(onIdToken: @Sendable @escaping (String?) -> Void) async throws -> String {
-        onIdToken(token)
-        return token
+        currentToken
     }
 
     nonisolated func extractIdToken(from authResult: String) -> String {
@@ -29,9 +39,19 @@ final class CoreConvexStaticAuthProvider: AuthProvider, @unchecked Sendable {
 }
 
 final class ConvexRealtimeClient: @unchecked Sendable {
-    nonisolated(unsafe) private let client: ConvexClientWithAuth<String>
+    /// Un cliente por deployment para toda la vida del proceso. ConvexMobile
+    /// 0.8.1 nunca libera un `ConvexClientWithAuth` autenticado: el callback de
+    /// auth que guarda el núcleo en Rust retiene al propio cliente nativo. Crear
+    /// uno nuevo en cada refresco de token o vuelta a primer plano dejaba vivo
+    /// el anterior (runtime de tokio con sus hilos y un websocket reconectando
+    /// con un token vencido) hasta agotar recursos y cerrar la app.
+    nonisolated private static let clients = OSAllocatedUnfairLock<[String: ConvexRealtimeClient]>(initialState: [:])
 
-    nonisolated init(configuration: CoreAppConfiguration) throws {
+    nonisolated(unsafe) private let client: ConvexClientWithAuth<String>
+    nonisolated private let authProvider: CoreConvexTokenAuthProvider
+    nonisolated private let authenticatedToken = OSAllocatedUnfairLock<String?>(initialState: nil)
+
+    nonisolated static func shared(for configuration: CoreAppConfiguration) throws -> ConvexRealtimeClient {
         guard !configuration.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !configuration.userId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               configuration.empresaId != nil else {
@@ -39,14 +59,30 @@ final class ConvexRealtimeClient: @unchecked Sendable {
         }
         let rawURL = configuration.convexURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard !rawURL.isEmpty, URL(string: rawURL) != nil else { throw ConvexCoreError.invalidURL }
-        client = ConvexClientWithAuth(
-            deploymentUrl: rawURL,
-            authProvider: CoreConvexStaticAuthProvider(token: configuration.accessToken)
-        )
+        let token = configuration.accessToken
+        return clients.withLock { clients in
+            if let existing = clients[rawURL] {
+                return existing
+            }
+            let created = ConvexRealtimeClient(deploymentURL: rawURL, token: token)
+            clients[rawURL] = created
+            return created
+        }
     }
 
-    nonisolated func authenticate() async {
-        _ = await client.loginFromCache()
+    nonisolated private init(deploymentURL: String, token: String) {
+        authProvider = CoreConvexTokenAuthProvider(token: token)
+        client = ConvexClientWithAuth(deploymentUrl: deploymentURL, authProvider: authProvider)
+    }
+
+    /// Autentica el websocket con `token`. Con el mismo token ya aceptado no
+    /// hace nada; con uno nuevo re-autentica la conexión existente.
+    nonisolated func authenticate(token: String) async {
+        guard authenticatedToken.withLock({ $0 }) != token else { return }
+        authProvider.setToken(token)
+        guard case .success = await client.loginFromCache(),
+              authProvider.currentToken == token else { return }
+        authenticatedToken.withLock { $0 = token }
     }
 
     func watchWebSocketState() -> AnyPublisher<WebSocketState, Never> {
