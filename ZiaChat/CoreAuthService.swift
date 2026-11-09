@@ -128,8 +128,12 @@ final class CoreAuthService {
         do {
             session = try await client.auth.refreshSession(refreshToken: refreshToken)
         } catch AuthError.sessionMissing {
+            throw CoreAuthError.sessionExpired
+        } catch let error as AuthError where Self.sessionEndingCodes.contains(error.errorCode) {
             // Supabase rechazó el refresh token (ya usado, revocado o la sesión
             // cerrada): reintentar no sirve, hay que volver a iniciar sesión.
+            // Ese rechazo llega como error de API con código, no como
+            // `sessionMissing`; sin este caso la app reintentaba para siempre.
             throw CoreAuthError.sessionExpired
         }
         var next = configuration
@@ -137,6 +141,13 @@ final class CoreAuthService {
         next.refreshToken = session.refreshToken
         return next
     }
+
+    nonisolated private static let sessionEndingCodes: [ErrorCode] = [
+        .sessionNotFound,
+        .sessionExpired,
+        .refreshTokenNotFound,
+        .refreshTokenAlreadyUsed,
+    ]
 
     nonisolated private static func decodeDate(_ decoder: Decoder) throws -> Date {
         let container = try decoder.singleValueContainer()

@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Zia Chat usa el micrófono para enviar notas de voz por WhatsApp.</string>
+	<string>Zia Chat usa el micrófono para enviar notas de voz y hablar en los canales de voz.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

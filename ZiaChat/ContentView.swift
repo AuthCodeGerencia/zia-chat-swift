@@ -5,9 +5,15 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
-    @State private var store = ContentView.makeStore()
-    @State private var voiceStore = CoreVoiceRoomStore()
-    @StateObject private var whatsAppStore = WhatsAppStore()
+    // `@State` evalúa su valor inicial en CADA `ContentView.init()`, no solo
+    // en el primero. Con `makeStore()` aquí, cada reevaluación de la escena
+    // creaba un `CoreChannelsStore` desechable que leía la caché de disco en
+    // el hilo principal y lanzaba su propio refresco de sesión; además sus
+    // cambios invalidaban la escena otra vez (bucle de decenas de peticiones
+    // por segundo hasta que el sistema cerraba la app). Los stores viven una
+    // sola vez por proceso.
+    @State private var store = ContentView.sharedStore
+    @State private var voiceStore = ContentView.sharedVoiceStore
     private let pushService = PushNotificationService.shared
     @State private var showingSettings = false
     @State private var showingNewChannel = false
@@ -22,19 +28,12 @@ struct ContentView: View {
                     ChannelListView(
                         store: store,
                         voiceStore: voiceStore,
-                        whatsAppStore: whatsAppStore,
                         showingSettings: $showingSettings,
                         showingNewChannel: $showingNewChannel,
                         navigationPath: $navigationPath
                     )
                     .navigationDestination(for: CoreChannel.ID.self) { channelId in
-                        if let chatId = WhatsAppRoute.chatId(from: channelId) {
-                            WhatsAppThreadView(
-                                store: whatsAppStore,
-                                chatId: chatId,
-                                navigationPath: $navigationPath
-                            )
-                        } else if let channel = store.channel(with: channelId) {
+                        if let channel = store.channel(with: channelId) {
                             if channel.isVoice {
                                 VoiceChannelView(
                                     store: store,
@@ -70,7 +69,6 @@ struct ContentView: View {
             ChannelSettingsView(store: store)
         }
         .onChange(of: store.configuration.isUsable) { _, isUsable in
-            whatsAppStore.configure(with: store.configuration)
             if !isUsable {
                 navigationPath.removeAll()
                 Task {
@@ -112,14 +110,8 @@ struct ContentView: View {
         }
         .onChange(of: store.configuration.accessToken) { _, _ in
             guard !CoreChannelsStore.isDemo else { return }
-            whatsAppStore.configure(with: store.configuration)
+            DiagnosticsReporter.shared.flush(configuration: store.configuration)
             Task { await pushService.registerCurrentToken(configuration: store.configuration) }
-        }
-        .onChange(of: whatsAppStore.unreadCount) { _, _ in
-            Task { await syncAppBadge() }
-        }
-        .onChange(of: whatsAppStore.availability) { _, _ in
-            schedulePendingPushNavigation()
         }
         .onChange(of: scenePhase) { _, phase in
             handleScenePhaseChange(phase)
@@ -133,8 +125,8 @@ struct ContentView: View {
                 openDemoChannelIfRequested()
                 return
             }
-            whatsAppStore.configure(with: store.configuration)
             _ = try? await store.ensureFreshSession()
+            DiagnosticsReporter.shared.flush(configuration: store.configuration)
             await store.refresh()
             await pushService.requestAuthorizationAndRegister()
             await pushService.registerCurrentToken(configuration: store.configuration)
@@ -159,6 +151,7 @@ struct ContentView: View {
             }
             if resumedFromBackground {
                 _ = try? await store.ensureFreshSession()
+                DiagnosticsReporter.shared.flush(configuration: store.configuration)
             }
             // Un refresh de arranque cancelado por un paso a inactive se retoma aquí.
             if resumedFromBackground || !store.hasCompletedRefresh {
@@ -169,6 +162,9 @@ struct ContentView: View {
             schedulePendingPushNavigation()
         }
     }
+
+    static let sharedStore = makeStore()
+    static let sharedVoiceStore = CoreVoiceRoomStore()
 
     private static func makeStore() -> CoreChannelsStore {
         #if DEBUG
@@ -193,7 +189,6 @@ struct ContentView: View {
         guard !CoreChannelsStore.isDemo else { return }
         let unreadCount = store.textChannels.reduce(0) { $0 + $1.unreadCount }
             + store.directMessages.reduce(0) { $0 + $1.unreadCount }
-            + whatsAppStore.unreadCount
         await pushService.updateBadgeCount(unreadCount)
     }
 
@@ -218,27 +213,6 @@ struct ContentView: View {
         guard let destination = pushService.pendingDestination,
               store.configuration.isUsable else {
             return
-        }
-
-        if let chatId = destination.whatsAppChatId {
-            // El push de WhatsApp llega del portal de AuthCode; el hilo se abre
-            // en cuanto el perfil del portal está resuelto.
-            switch whatsAppStore.availability {
-            case .unknown:
-                return
-            case .unavailable:
-                pushService.consume(destination)
-                pushService.lastError = "Tu usuario no tiene acceso a la bandeja de WhatsApp."
-                return
-            case .available:
-                let route = WhatsAppRoute.navigationId(for: chatId)
-                if navigationPath.last != route {
-                    navigationPath = [route]
-                }
-                pushService.consume(destination)
-                pushService.lastError = nil
-                return
-            }
         }
 
         var latestError: Error?
@@ -512,10 +486,8 @@ private struct LoginLogoTail: Shape {
 /// casos es el orden de los chips.
 enum ChannelListFilter: String, CaseIterable {
     case todos
-    /// Solo canales de texto, sin directos ni WhatsApp.
+    /// Solo canales de texto, sin directos.
     case canales
-    /// Bandeja de WhatsApp del portal de AuthCode; visible solo para agentes.
-    case whatsapp
     case directos
     case hilos
     case favoritos
@@ -531,7 +503,6 @@ enum ChannelListFilter: String, CaseIterable {
         case .favoritos: return "Favoritos"
         case .noLeidos: return "No leídos"
         case .voz: return "Voz"
-        case .whatsapp: return "WhatsApp"
         }
     }
 
@@ -544,7 +515,6 @@ enum ChannelListFilter: String, CaseIterable {
         case .favoritos: return "star.fill"
         case .noLeidos: return "circlebadge.fill"
         case .voz: return "speaker.wave.2.fill"
-        case .whatsapp: return "phone.bubble.fill"
         }
     }
 
@@ -569,7 +539,6 @@ private struct ChannelListItem: Identifiable {
     enum Kind {
         case channel(CoreChannel)
         case direct(CoreDirectMessage)
-        case whatsapp(WhatsAppChat)
     }
 
     let kind: Kind
@@ -612,7 +581,6 @@ struct ChannelThreadItem: Identifiable {
 private struct ChannelListView: View {
     let store: CoreChannelsStore
     let voiceStore: CoreVoiceRoomStore
-    @ObservedObject var whatsAppStore: WhatsAppStore
     @Binding var showingSettings: Bool
     @Binding var showingNewChannel: Bool
     @Binding var navigationPath: [CoreChannel.ID]
@@ -628,14 +596,12 @@ private struct ChannelListView: View {
     init(
         store: CoreChannelsStore,
         voiceStore: CoreVoiceRoomStore,
-        whatsAppStore: WhatsAppStore,
         showingSettings: Binding<Bool>,
         showingNewChannel: Binding<Bool>,
         navigationPath: Binding<[CoreChannel.ID]>
     ) {
         self.store = store
         self.voiceStore = voiceStore
-        self.whatsAppStore = whatsAppStore
         _showingSettings = showingSettings
         _showingNewChannel = showingNewChannel
         _navigationPath = navigationPath
@@ -646,12 +612,7 @@ private struct ChannelListView: View {
         !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    /// El chip guardado puede ser WhatsApp antes de que se resuelva el perfil
-    /// del portal (o en una cuenta sin acceso): mientras tanto se muestra
-    /// "Todos", sin perder la preferencia guardada.
-    private var activeFilter: ChannelListFilter {
-        channelFilter == .whatsapp && !whatsAppStore.isAvailable ? .todos : channelFilter
-    }
+    private var activeFilter: ChannelListFilter { channelFilter }
 
     var body: some View {
         let snapshot = makeSnapshot()
@@ -676,9 +637,7 @@ private struct ChannelListView: View {
         .contentMargins(.horizontal, 0, for: .scrollContent)
         .listSectionSpacing(0)
         .overlay {
-            if activeFilter == .whatsapp {
-                EmptyView()
-            } else if store.channels.isEmpty && store.directMessages.isEmpty
+            if store.channels.isEmpty && store.directMessages.isEmpty
                 && (store.isLoading || !store.hasLoadedChatList || !store.configuration.isUsable) {
                 ProgressView("Cargando chats")
             } else if store.channels.isEmpty && store.directMessages.isEmpty && store.configuration.isUsable {
@@ -717,17 +676,12 @@ private struct ChannelListView: View {
         }
         .onChange(of: channelFilter) { _, filter in
             filter.remember(userId: store.configuration.userId)
-            // "Todos" siempre incorpora la bandeja completa de WhatsApp,
-            // aunque el usuario haya usado otro filtro dentro de ese tab.
-            if filter == .todos, whatsAppStore.filter != .todos {
-                whatsAppStore.filter = .todos
-            }
         }
         .sheet(item: $channelToEdit) { channel in
             ChannelSettingsView(store: store, editing: channel)
         }
         .sheet(isPresented: $showingNotificationSettings) {
-            NotificationSettingsView(store: store, showsWhatsApp: whatsAppStore.isAvailable)
+            NotificationSettingsView(store: store)
         }
         .sheet(isPresented: $showNewDM) {
             NewDirectMessageView(store: store) { channel in
@@ -785,12 +739,7 @@ private struct ChannelListView: View {
         let userId = store.configuration.userId
         let channelItems = store.channels.map(channelItem)
         let directItems = store.directMessages.map(directItem)
-        // La bandeja de WhatsApp se mezcla con canales y directos en "Todos",
-        // todo ordenado por actividad (bandeja unificada).
-        let whatsappItems = whatsAppStore.isAvailable
-            ? whatsAppStore.chats.map(whatsAppItem)
-            : []
-        let chatItems = (channelItems + directItems + whatsappItems)
+        let chatItems = (channelItems + directItems)
             .sorted(by: ChannelListItem.activityOrder)
         let favoriteIds = store.favoriteChannelIds
         let textChannels = store.textChannels
@@ -854,21 +803,10 @@ private struct ChannelListView: View {
         )
     }
 
-    private func whatsAppItem(_ chat: WhatsAppChat) -> ChannelListItem {
-        ChannelListItem(
-            kind: .whatsapp(chat),
-            // El mismo id que usa el NavigationStack para el hilo de WhatsApp.
-            id: WhatsAppRoute.navigationId(for: chat.chatId),
-            sortDate: chat.lastMessageDate,
-            sortName: chat.nombreVisible,
-            isUnread: chat.unreadCount > 0 && !chat.isMuted
-        )
-    }
-
     private func filterChipsRow(_ snapshot: ChannelListSnapshot) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                ForEach(visibleFilters, id: \.self) { filter in
+                ForEach(ChannelListFilter.allCases, id: \.self) { filter in
                     filterChip(filter, snapshot: snapshot)
                 }
             }
@@ -880,12 +818,6 @@ private struct ChannelListView: View {
         .listRowBackground(ZenitBrand.surface)
     }
 
-    /// El chip de WhatsApp solo existe para usuarios con perfil de agente en
-    /// el portal de AuthCode; para el resto la lista no cambia.
-    private var visibleFilters: [ChannelListFilter] {
-        ChannelListFilter.allCases.filter { $0 != .whatsapp || whatsAppStore.isAvailable }
-    }
-
     private func filterChip(_ filter: ChannelListFilter, snapshot: ChannelListSnapshot) -> some View {
         let isSelected = activeFilter == filter
         let chipBackground: Color = isSelected ? ZenitBrand.accentFill : ZenitBrand.surfaceMuted
@@ -894,7 +826,6 @@ private struct ChannelListView: View {
         case .noLeidos: snapshot.totalUnreadCount
         case .canales: snapshot.channelsUnreadCount
         case .hilos: snapshot.unreadThreadItems.count
-        case .whatsapp: whatsAppStore.unreadCount
         default: 0
         }
         return Button {
@@ -948,10 +879,6 @@ private struct ChannelListView: View {
             unreadContent(snapshot)
         case .voz:
             voiceContent
-        case .whatsapp:
-            WhatsAppInboxContent(store: whatsAppStore) { chat in
-                navigationPath.append(WhatsAppRoute.navigationId(for: chat.chatId))
-            }
         }
     }
 
@@ -1049,16 +976,6 @@ private struct ChannelListView: View {
                 chatRow(item)
             }
         }
-
-        if whatsAppStore.isAvailable, !whatsAppStore.chatsIsDone {
-            HStack {
-                Spacer()
-                ProgressView()
-                Spacer()
-            }
-            .listRowSeparator(.hidden)
-            .listRowBackground(ZenitBrand.surface)
-        }
     }
 
     @ViewBuilder
@@ -1142,24 +1059,6 @@ private struct ChannelListView: View {
             channelRow(channel)
         case let .direct(message):
             directMessageRow(message)
-        case let .whatsapp(chat):
-            whatsAppRow(chat)
-        }
-    }
-
-    private func whatsAppRow(_ chat: WhatsAppChat) -> some View {
-        Button {
-            navigationPath.append(WhatsAppRoute.navigationId(for: chat.chatId))
-        } label: {
-            WhatsAppChatRow(chat: chat)
-        }
-        .buttonStyle(.plain)
-        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
-        .listRowBackground(ZenitBrand.surface)
-        .onAppear {
-            if chat.id == whatsAppStore.chats.last?.id {
-                whatsAppStore.loadMoreChats()
-            }
         }
     }
 
@@ -6319,20 +6218,16 @@ private struct NotificationSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
     let store: CoreChannelsStore
-    let showsWhatsApp: Bool
     private let pushService = PushNotificationService.shared
     @State private var categories: Set<PushNotificationCategory>
     @State private var syncTask: Task<Void, Never>?
 
-    init(store: CoreChannelsStore, showsWhatsApp: Bool) {
+    init(store: CoreChannelsStore) {
         self.store = store
-        self.showsWhatsApp = showsWhatsApp
         _categories = State(initialValue: PushNotificationService.shared.notificationCategories)
     }
 
-    private var visibleCategories: [PushNotificationCategory] {
-        PushNotificationCategory.allCases.filter { $0 != .whatsapp || showsWhatsApp }
-    }
+    private var visibleCategories: [PushNotificationCategory] { PushNotificationCategory.allCases }
 
     private var receivesAll: Bool {
         categories.isSuperset(of: PushNotificationCategory.allCases)
@@ -6609,7 +6504,6 @@ private struct MissingChannelView: View {
         ChannelListView(
             store: .preview(),
             voiceStore: CoreVoiceRoomStore(),
-            whatsAppStore: WhatsAppStore(),
             showingSettings: .constant(false),
             showingNewChannel: .constant(false),
             navigationPath: .constant([])

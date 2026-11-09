@@ -209,6 +209,34 @@ actor ConvexCoreClient {
         )
     }
 
+    /// Cierre inesperado o diagnóstico de la app (ver `DiagnosticsReporter`).
+    func reportDiagnostic(
+        reportId: String,
+        app: String,
+        kind: String,
+        summary: String,
+        payload: String,
+        appVersion: String,
+        osVersion: String,
+        deviceModel: String,
+        occurredAt: Date
+    ) async throws {
+        let _: String = try await mutation(
+            "appDiagnostics:report",
+            [
+                "reportId": reportId,
+                "app": app,
+                "kind": kind,
+                "summary": summary,
+                "payload": payload,
+                "appVersion": appVersion,
+                "osVersion": osVersion,
+                "deviceModel": deviceModel,
+                "occurredAt": (occurredAt.timeIntervalSince1970 * 1000).rounded(),
+            ]
+        )
+    }
+
     func unregisterPushTokens() async throws {
         let _: Int = try await mutation("push:unregisterCurrentUser", [:])
     }

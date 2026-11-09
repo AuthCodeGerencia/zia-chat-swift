@@ -6,11 +6,9 @@ struct PushNotificationDestination: Equatable, Sendable {
     var channelId: String?
     var conversationId: String?
     var messageId: String?
-    /// Chat de WhatsApp (push del portal de AuthCode vía el puente de Zia).
-    var whatsAppChatId: String?
 
     nonisolated var isValid: Bool {
-        channelId != nil || conversationId != nil || whatsAppChatId != nil
+        channelId != nil || conversationId != nil
     }
 }
 
@@ -20,7 +18,6 @@ struct PushNotificationDestination: Equatable, Sendable {
 nonisolated enum PushNotificationCategory: String, CaseIterable, Identifiable, Sendable {
     case channel
     case direct
-    case whatsapp
     case thread
 
     var id: String { rawValue }
@@ -29,7 +26,6 @@ nonisolated enum PushNotificationCategory: String, CaseIterable, Identifiable, S
         switch self {
         case .channel: "Canales"
         case .direct: "Directos"
-        case .whatsapp: "WhatsApp"
         case .thread: "Hilos"
         }
     }
@@ -38,7 +34,6 @@ nonisolated enum PushNotificationCategory: String, CaseIterable, Identifiable, S
         switch self {
         case .channel: "number"
         case .direct: "person.2.fill"
-        case .whatsapp: "phone.bubble.fill"
         case .thread: "bubble.left.and.bubble.right.fill"
         }
     }
@@ -47,7 +42,6 @@ nonisolated enum PushNotificationCategory: String, CaseIterable, Identifiable, S
     /// "Hilos" aunque sean de un canal o un directo.
     static func of(userInfo: [AnyHashable: Any]) -> PushNotificationCategory? {
         switch userInfo["kind"] as? String {
-        case "whatsapp_message": return .whatsapp
         case "thread_message": return .thread
         case "channel_message":
             let channelId = (userInfo["channelId"] ?? userInfo["channel_id"]) as? String
@@ -183,9 +177,9 @@ final class PushNotificationService: NSObject, UNUserNotificationCenterDelegate 
     func syncNotificationCategories(configuration: CoreAppConfiguration) async {
         guard let deviceToken, configuration.isUsable, !ZiaDemoMode.isEnabled,
               let client = try? ConvexCoreClient(configuration: configuration) else { return }
-        let categories = notificationCategories.count == PushNotificationCategory.allCases.count
-            ? nil
-            : notificationCategories.map(\.rawValue).sorted()
+        // Siempre la lista explícita: `nil` significa "todas" para el backend,
+        // y eso incluye los avisos de WhatsApp, que esta app ya no muestra.
+        let categories = notificationCategories.map(\.rawValue).sorted()
         // Si el backend aún no tiene la función, el token sigue registrado y
         // el filtro en primer plano de `willPresent` cubre la app abierta.
         try? await client.setPushNotificationCategories(token: deviceToken, categories: categories)
@@ -212,6 +206,9 @@ final class PushNotificationService: NSObject, UNUserNotificationCenterDelegate 
     ) async -> UNNotificationPresentationOptions {
         // Canales silenciados por el usuario: sin banner ni sonido.
         let userInfo = notification.request.content.userInfo
+        // La bandeja de WhatsApp ya no existe en la app: un aviso suyo que
+        // aún llegue (token sin sincronizar) no se muestra.
+        if Self.isWhatsAppPush(userInfo) { return [] }
         let destination = Self.destination(from: userInfo)
         if destination.isValid {
             Task { await PushNotificationService.shared.receiveForeground(destination: destination) }
@@ -235,8 +232,10 @@ final class PushNotificationService: NSObject, UNUserNotificationCenterDelegate 
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        let destination = Self.destination(from: response.notification.request.content.userInfo)
+        let userInfo = response.notification.request.content.userInfo
+        let destination = Self.destination(from: userInfo)
         completionHandler()
+        guard !Self.isWhatsAppPush(userInfo) else { return }
 
         Task { @MainActor in
             let service = PushNotificationService.shared
@@ -252,9 +251,12 @@ final class PushNotificationService: NSObject, UNUserNotificationCenterDelegate 
         PushNotificationDestination(
             channelId: stringValue(userInfo["channelId"] ?? userInfo["channel_id"]),
             conversationId: stringValue(userInfo["conversationId"] ?? userInfo["conversation_id"]),
-            messageId: stringValue(userInfo["messageId"] ?? userInfo["message_id"]),
-            whatsAppChatId: stringValue(userInfo["chatId"] ?? userInfo["chat_id"])
+            messageId: stringValue(userInfo["messageId"] ?? userInfo["message_id"])
         )
+    }
+
+    nonisolated private static func isWhatsAppPush(_ userInfo: [AnyHashable: Any]) -> Bool {
+        (userInfo["kind"] as? String) == "whatsapp_message"
     }
 
     nonisolated private static func stringValue(_ value: Any?) -> String? {
@@ -275,6 +277,7 @@ final class ZiaChatAppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        DiagnosticsReporter.shared.start()
         PushNotificationService.shared.configure()
         PushNotificationService.shared.launchedFromNotification =
             launchOptions?[.remoteNotification] != nil

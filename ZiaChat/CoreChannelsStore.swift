@@ -135,7 +135,7 @@ final class CoreChannelsStore {
                 CoreStoreDiskCache.restoringInlineImages(cached)
             }.value
             guard let self else { return }
-            let restoredById = Dictionary(uniqueKeysWithValues: restored.map { ($0.id, $0) })
+            let restoredById = Dictionary(restored.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             var next = self.channels
             var changed = false
             for index in next.indices {
@@ -283,6 +283,9 @@ final class CoreChannelsStore {
 #endif
 
     func setVisibleConversation(_ conversationId: String?) {
+        if visibleConversationId != conversationId {
+            DiagnosticsReporter.shared.breadcrumb(conversationId == nil ? "Lista de chats" : "Chat abierto")
+        }
         visibleConversationId = conversationId
     }
 
@@ -491,6 +494,7 @@ final class CoreChannelsStore {
     }
 
     func signOut() {
+        DiagnosticsReporter.shared.breadcrumb("Cierre de sesión")
         refreshTask?.cancel()
         refreshTask = nil
         sessionRefreshTask?.cancel()
@@ -549,6 +553,7 @@ final class CoreChannelsStore {
         do {
             let refreshedConfiguration = try await task.value
             sessionRefreshTask = nil
+            DiagnosticsReporter.shared.breadcrumb("Sesión renovada")
             guard configuration.userId == originalConfiguration.userId else {
                 return configuration
             }
@@ -571,6 +576,7 @@ final class CoreChannelsStore {
             return refreshedConfiguration
         } catch {
             sessionRefreshTask = nil
+            DiagnosticsReporter.shared.breadcrumb("Falló renovar sesión: \(error.localizedDescription)")
             // Sesión muerta en Supabase: sin esto la app seguía mostrando la
             // caché vieja y fallando cada envío sin pedir login.
             if case CoreAuthError.sessionExpired = error,
@@ -584,28 +590,22 @@ final class CoreChannelsStore {
 
     func startSessionMaintenance() {
         guard configuration.isUsable, !Self.isDemo, sessionMaintenanceTask == nil else { return }
+        // La espera (hasta ~55 min) no retiene al store: una referencia fuerte
+        // aquí mantenía vivo cualquier store descartado hasta su refresco, que
+        // además reutilizaba el refresh token del store en uso.
+        let delay = configuration.accessTokenRefreshDelay()
         sessionMaintenanceTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self else { return }
-                let delay = await MainActor.run {
-                    self.configuration.accessTokenRefreshDelay()
-                }
-                if delay > 0 {
-                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                }
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.sessionMaintenanceTask = nil
+            do {
+                _ = try await self.ensureFreshSession(force: true)
+            } catch {
                 guard !Task.isCancelled else { return }
-                await MainActor.run {
-                    self.sessionMaintenanceTask = nil
-                }
-                do {
-                    _ = try await self.ensureFreshSession(force: true)
-                } catch {
-                    await MainActor.run {
-                        self.lastError = error.localizedDescription
-                        self.startSessionMaintenance(after: 30)
-                    }
-                }
-                return
+                self.lastError = error.localizedDescription
+                self.startSessionMaintenance(after: 30)
             }
         }
     }
@@ -835,8 +835,10 @@ final class CoreChannelsStore {
     }
 
     private func applyDirectMessages(_ loaded: [CoreDirectMessage]) {
+        // `uniqueKeysWithValues` cierra la app si el servidor repite un DM.
         let cachedByID = Dictionary(
-            uniqueKeysWithValues: directMessages.map { ($0.id, $0) }
+            directMessages.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
         )
         let merged = loaded.map { incoming in
             var merged = ConvexCoreClient.applyingCachedPeerProfile(incoming)
@@ -2284,6 +2286,7 @@ final class CoreChannelsStore {
         guard sceneIsActive, configuration.isUsable else { return }
         pendingRealtimeConversationId = conversationId ?? pendingRealtimeConversationId
         guard realtimeRetryTask == nil else { return }
+        DiagnosticsReporter.shared.breadcrumb("Reconexión de tiempo real programada")
         let delay = realtimeRetryDelay * Double.random(in: 0.8...1.25)
         realtimeRetryDelay = min(realtimeRetryDelay * 2, 30)
         realtimeRetryTask = Task { [weak self] in
@@ -2477,7 +2480,7 @@ final class CoreChannelsStore {
     private func mergeMessagePage(_ page: [CoreMessage], conversationId: String, isLatestPage: Bool = true) {
         guard !page.isEmpty else { return }
         let current = messages[conversationId, default: []]
-        var byID = Dictionary(uniqueKeysWithValues: current.map { ($0.id, $0) })
+        var byID = Dictionary(current.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
 
         if isLatestPage, let oldest = page.first?.createdAt {
             let pageIds = Set(page.map(\.id))

@@ -97,14 +97,6 @@ struct CoreAppConfiguration: Codable, Equatable {
         return Date(timeIntervalSince1970: expiration.doubleValue)
     }
 
-    /// Correo de la sesión de Supabase (claim `email` del JWT). Sirve para
-    /// vincular al usuario con su perfil del portal de AuthCode (WhatsApp).
-    nonisolated var sessionEmail: String? {
-        guard let email = accessTokenClaims?["email"] as? String else { return nil }
-        let trimmed = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
     nonisolated private var accessTokenClaims: [String: Any]? {
         let parts = accessToken.split(separator: ".")
         guard parts.count > 1 else { return nil }
@@ -160,7 +152,14 @@ enum CoreConfigurationStore {
         if configuration.supabaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             configuration.supabaseURL = environmentDefaults.supabaseURL
         }
-        if configuration.anonKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let storedAnonKey = configuration.anonKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Las sesiones guardadas antes del 7-nov-2026 traen la llave heredada
+        // (JWT `anon`) del proyecto, que Supabase ya rechaza: sin cambiarla
+        // por la de la app, ninguna sesión guardada podría refrescarse.
+        let storedKeyIsLegacyProjectKey = storedAnonKey.hasPrefix("eyJ")
+            && storedAnonKey != environmentDefaults.supabaseAnonKey
+            && normalizedURL(configuration.supabaseURL) == normalizedURL(environmentDefaults.supabaseURL)
+        if storedAnonKey.isEmpty || storedKeyIsLegacyProjectKey {
             configuration.anonKey = environmentDefaults.supabaseAnonKey
         }
         if configuration.convexURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
